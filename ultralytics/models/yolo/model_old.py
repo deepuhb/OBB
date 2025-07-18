@@ -10,7 +10,6 @@ from ultralytics.nn.tasks import (
     ClassificationModel,
     DetectionModel,
     OBBModel,
-    OBB_KPTModel,
     PoseModel,
     SegmentationModel,
     WorldModel,
@@ -120,11 +119,11 @@ class YOLO(Model):
                 "predictor": yolo.obb.OBBPredictor,
             },
             # added by dbasavegowda
-            'obb_kpt': {
-                'model': 'ultralytics.nn.tasks.OBB_KPTModel',
-                'trainer': 'ultralytics.models.yolo.obb_kpt.OBBKeypointTrainer',
-                'validator': 'ultralytics.models.yolo.obb_kpt.OBBKeypointValidator',
-                'predictor': 'ultralytics.models.yolo.obb_kpt.OBBKeypointPredictor',
+            "obb_kpt": {
+                "model": "ultralytics.nn.tasks.OBB_KPTModel",
+                "trainer": "ultralytics.models.yolo.obb_kpt.OBBKeypointTrainer",
+                "validator": "ultralytics.models.yolo.obb_kpt.OBBKeypointValidator",
+                "predictor": "ultralytics.models.yolo.obb_kpt.OBBKeypointPredictor",
             },
         }
 

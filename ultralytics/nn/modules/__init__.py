@@ -81,6 +81,7 @@ from .head import (
     Classify,
     Detect,
     LRPCHead,
+    OBBKeypointDetect,
     Pose,
     RTDETRDecoder,
     Segment,
@@ -88,7 +89,6 @@ from .head import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
-    OBBKeypointDetect,
 )
 from .transformer import (
     AIFI,

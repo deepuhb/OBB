@@ -1,7 +1,9 @@
 # In ultralytics/models/yolo/obb_kpt/val.py
 import numpy as np
+
 from ultralytics.models.yolo.detect.val import DetectionValidator
 from ultralytics.utils.metrics import OBBMetrics, PoseMetrics
+
 
 class OBBKeypointValidator(DetectionValidator):
     def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
@@ -11,7 +13,7 @@ class OBBKeypointValidator(DetectionValidator):
 
     def init_metrics(self, model):
         super().init_metrics(model)
-        self.kpt_metrics.kpt_shape = self.data['kpt_shape']
+        self.kpt_metrics.kpt_shape = self.data["kpt_shape"]
         nkpt = self.kpt_metrics.kpt_shape
         self.kpt_metrics.sigma = np.ones(nkpt) / nkpt
 

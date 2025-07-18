@@ -5,33 +5,24 @@
 # These provide the necessary functions like yaml_load, check_yaml, and RANK.
 import os
 from pathlib import Path
-from typing import Union
 
-from ultralytics.nn.tasks import yaml_model_load
-from ultralytics.utils import checks
 # ++++++++++++++++++++++ END OF MODIFICATION (Imports) ++++++++++++++++++++++
-
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from ultralytics.data.build import load_inference_source
 from ultralytics.engine.model import Model
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import (
-    ClassificationModel,
-    DetectionModel,
-    OBBModel,
-    OBB_KPTModel,
-    PoseModel,
-    SegmentationModel,
     WorldModel,
     YOLOEModel,
     YOLOESegModel,
+    yaml_model_load,
 )
-from ultralytics.utils import ROOT, YAML
+from ultralytics.utils import ROOT, YAML, checks
 
 # added by dbasavegowda
 # Replace the entire existing 'YOLO' class with this one.
+
 
 class YOLO(Model):
     """
@@ -39,6 +30,7 @@ class YOLO(Model):
     This version has a modified constructor to correctly handle new model
     creation from custom YAML files.
     """
+
     def __init__(self, model: Union[str, Path] = "yolo11n.pt", task: Optional[str] = None, verbose: bool = False):
         """
         Initialize a YOLO model.
@@ -75,7 +67,7 @@ class YOLO(Model):
                 new_instance = RTDETR(self)
                 self.__class__ = type(new_instance)
                 self.__dict__ = new_instance.__dict__
-    
+
     # added by dbasavegowda
     # +++++++++++++++++++++ START OF MODIFICATION (_new method) +++++++++++++++++++++
     # --- Rationale for Change ---
@@ -83,77 +75,74 @@ class YOLO(Model):
     # The base Model._new() method fails because it doesn't know about our custom task_map.
     # This overridden method intercepts the process, looks up our custom model class
     # from the task_map, and builds it correctly before the base logic can fail.
-    
+
     def _new(self, cfg: Union[str, Path], task=None, verbose=True):
-        """
-        Initializes a new model and infers the task type from the model head.
-        """
+        """Initializes a new model and infers the task type from the model head."""
         cfg_dict = yaml_model_load(checks.check_yaml(cfg))
-        self.task = cfg_dict.get('task') or task
+        self.task = cfg_dict.get("task") or task
 
         # Look up the correct model class from our task_map
-        model_class_path = self.task_map[self.task]['model']
-        
+        model_class_path = self.task_map[self.task]["model"]
+
         if isinstance(model_class_path, str):
-            parts = model_class_path.split('.')
-            module_path, class_name = '.'.join(parts[:-1]), parts[-1]
+            parts = model_class_path.split(".")
+            module_path, class_name = ".".join(parts[:-1]), parts[-1]
             module = __import__(module_path, fromlist=[class_name])
             model_class = getattr(module, class_name)
         else:
             model_class = model_class_path
 
-        RANK = int(os.getenv('RANK', -1))
+        RANK = int(os.getenv("RANK", -1))
 
         # Build the model instance using the locally defined RANK
         self.model = model_class(cfg_dict, verbose=verbose and RANK == -1)
-        self.overrides['model'] = str(cfg)
+        self.overrides["model"] = str(cfg)
 
     # ++++++++++++++++++++++ END OF MODIFICATION (_new method) ++++++++++++++++++++++
-    
+
     @property
     def task_map(self):
-        """
-        Returns a dictionary mapping tasks to their corresponding model classes.
-        """
+        """Returns a dictionary mapping tasks to their corresponding model classes."""
         return {
-            'detect': {
-                'model': 'ultralytics.nn.tasks.DetectionModel',
-                'trainer': 'ultralytics.models.yolo.detect.DetectionTrainer',
-                'validator': 'ultralytics.models.yolo.detect.DetectionValidator',
-                'predictor': 'ultralytics.models.yolo.detect.DetectionPredictor',
+            "detect": {
+                "model": "ultralytics.nn.tasks.DetectionModel",
+                "trainer": "ultralytics.models.yolo.detect.DetectionTrainer",
+                "validator": "ultralytics.models.yolo.detect.DetectionValidator",
+                "predictor": "ultralytics.models.yolo.detect.DetectionPredictor",
             },
-            'segment': {
-                'model': 'ultralytics.nn.tasks.SegmentationModel',
-                'trainer': 'ultralytics.models.yolo.segment.SegmentationTrainer',
-                'validator': 'ultralytics.models.yolo.segment.SegmentationValidator',
-                'predictor': 'ultralytics.models.yolo.segment.SegmentationPredictor',
+            "segment": {
+                "model": "ultralytics.nn.tasks.SegmentationModel",
+                "trainer": "ultralytics.models.yolo.segment.SegmentationTrainer",
+                "validator": "ultralytics.models.yolo.segment.SegmentationValidator",
+                "predictor": "ultralytics.models.yolo.segment.SegmentationPredictor",
             },
-            'pose': {
-                'model': 'ultralytics.nn.tasks.PoseModel',
-                'trainer': 'ultralytics.models.yolo.pose.PoseTrainer',
-                'validator': 'ultralytics.models.yolo.pose.PoseValidator',
-                'predictor': 'ultralytics.models.yolo.pose.PosePredictor',
+            "pose": {
+                "model": "ultralytics.nn.tasks.PoseModel",
+                "trainer": "ultralytics.models.yolo.pose.PoseTrainer",
+                "validator": "ultralytics.models.yolo.pose.PoseValidator",
+                "predictor": "ultralytics.models.yolo.pose.PosePredictor",
             },
-            'classify': {
-                'model': 'ultralytics.nn.tasks.ClassificationModel',
-                'trainer': 'ultralytics.models.yolo.classify.ClassificationTrainer',
-                'validator': 'ultralytics.models.yolo.classify.ClassificationValidator',
-                'predictor': 'ultralytics.models.yolo.classify.ClassificationPredictor',
+            "classify": {
+                "model": "ultralytics.nn.tasks.ClassificationModel",
+                "trainer": "ultralytics.models.yolo.classify.ClassificationTrainer",
+                "validator": "ultralytics.models.yolo.classify.ClassificationValidator",
+                "predictor": "ultralytics.models.yolo.classify.ClassificationPredictor",
             },
-            'obb': {
-                'model': 'ultralytics.nn.tasks.OBBModel',
-                'trainer': 'ultralytics.models.yolo.obb.OBBTrainer',
-                'validator': 'ultralytics.models.yolo.obb.OBBValidator',
-                'predictor': 'ultralytics.models.yolo.obb.OBBPredictor',
+            "obb": {
+                "model": "ultralytics.nn.tasks.OBBModel",
+                "trainer": "ultralytics.models.yolo.obb.OBBTrainer",
+                "validator": "ultralytics.models.yolo.obb.OBBValidator",
+                "predictor": "ultralytics.models.yolo.obb.OBBPredictor",
             },
             # Our new, complete task definition
-            'obb_kpt': {
-                'model': 'ultralytics.nn.tasks.OBB_KPTModel',
-                'trainer': 'ultralytics.models.yolo.obb_kpt.OBBKeypointTrainer',
-                'validator': 'ultralytics.models.yolo.obb_kpt.OBBKeypointValidator',
-                'predictor': 'ultralytics.models.yolo.obb_kpt.OBBKeypointPredictor',
-            }
+            "obb_kpt": {
+                "model": "ultralytics.nn.tasks.OBB_KPTModel",
+                "trainer": "ultralytics.models.yolo.obb_kpt.OBBKeypointTrainer",
+                "validator": "ultralytics.models.yolo.obb_kpt.OBBKeypointValidator",
+                "predictor": "ultralytics.models.yolo.obb_kpt.OBBKeypointPredictor",
+            },
         }
+
 
 class YOLOWorld(Model):
     """

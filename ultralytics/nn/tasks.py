@@ -54,6 +54,7 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    OBBKeypointDetect,  # added by dbasavegowda
     Pose,
     RepC3,
     RepConv,
@@ -68,7 +69,6 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
-    OBBKeypointDetect, # added by dbasavegowda
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -542,7 +542,8 @@ class OBB_KPTModel(DetectionModel):
     A custom YOLO model for simultaneous OBB and Keypoint detection.
     It correctly handles keypoint configuration from the model YAML.
     """
-    def __init__(self, cfg='yolo11n-obb-kpt.yaml', ch=3, nc=None,  verbose=True):
+
+    def __init__(self, cfg="yolo11n-obb-kpt.yaml", ch=3, nc=None, verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         # After the model is built, inspect the head to get its kpt_shape attribute.
         # This makes the keypoint structure available to all other components.
@@ -551,8 +552,9 @@ class OBB_KPTModel(DetectionModel):
     def init_criterion(self):
         """Initializes and returns the custom loss function for this task."""
         from ultralytics.utils.loss import OBBKeypointLoss
-        
+
         return OBBKeypointLoss(self)
+
 
 class SegmentationModel(DetectionModel):
     """
@@ -1734,7 +1736,18 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, OBBKeypointDetect, ImagePoolingAttn, v10Detect}
+            {
+                Detect,
+                WorldDetect,
+                YOLOEDetect,
+                Segment,
+                YOLOESegment,
+                Pose,
+                OBB,
+                OBBKeypointDetect,
+                ImagePoolingAttn,
+                v10Detect,
+            }
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:

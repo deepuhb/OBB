@@ -1,13 +1,12 @@
-
 train: images/train
-val: images/val  
-test: images/train 
+val: images/val
+test: images/train
 
 # number of classes
 nc: 1
 
 # class names
-names: ['plants']
+names: ["plants"]
 
 # This line is critical for the model to understand the data
 kpt_shape: [1, 2]

@@ -849,6 +849,7 @@ class TVPSegmentLoss(TVPDetectLoss):
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
 
+
 # added by dbasavegowda
 # In ultralytics/utils/loss.py
 # This class should be added after other loss class definitions.
@@ -859,12 +860,14 @@ from ultralytics.utils.ops import xywhr2xyxyxyxy
 # In ultralytics/utils/loss.py
 # Add this class after other loss class definitions.
 
+
 class OBBKeypointLoss:
     """A composite loss function for OBB and XY-Keypoint detection."""
+
     def __init__(self, model):
         device = next(model.parameters()).device
         h = model.hyp
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.hyp = h
         self.stride = model.stride
         self.nc = model.nc
@@ -872,14 +875,15 @@ class OBBKeypointLoss:
         self.reg_max = model.reg_max
         self.device = device
         self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(self.reg_max - 1, use_dfl=True, iou_type='ciou').to(device)
-        self.kpt_L1_loss = nn.L1Loss(reduction='none')
+        self.bbox_loss = BboxLoss(self.reg_max - 1, use_dfl=True, iou_type="ciou").to(device)
+        self.kpt_L1_loss = nn.L1Loss(reduction="none")
 
     def __call__(self, preds, batch):
         loss = torch.zeros(3, device=self.device)
         feats = preds[1]
-        pred_distri, pred_kpts = torch.cat([xi.view(feats.shape, -1, xi.shape[2] * xi.shape[6]) for xi in feats], 2).split(
-            (self.reg_max * 4 + 1 + self.nc, self.nk * 2), 1)
+        pred_distri, pred_kpts = torch.cat(
+            [xi.view(feats.shape, -1, xi.shape[2] * xi.shape[6]) for xi in feats], 2
+        ).split((self.reg_max * 4 + 1 + self.nc, self.nk * 2), 1)
         pred_scores, pred_dist_obb = pred_distri.split((self.nc, self.reg_max * 4 + 1), 1)
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
@@ -887,7 +891,7 @@ class OBBKeypointLoss:
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
-        targets = torch.cat((batch['batch_idx'].view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
         targets = self.preprocess(targets.to(self.device), batch_size)
         gt_labels, gt_bboxes = targets.split((1, 5), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
@@ -895,13 +899,18 @@ class OBBKeypointLoss:
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (xywhr2xyxyxyxy(pred_bboxes.detach()) * stride_tensor).type(gt_bboxes.dtype),
-            gt_labels, gt_bboxes, mask_gt)
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
         target_scores_sum = max(target_scores.sum(), 1)
         loss = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
         if fg_mask.sum():
-            loss[1] = self.bbox_loss(pred_dist_obb, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask)
-            if self.nk > 0 and 'keypoints' in batch:
-                gt_kpts = batch['keypoints'].to(self.device)
+            loss[1] = self.bbox_loss(
+                pred_dist_obb, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+            if self.nk > 0 and "keypoints" in batch:
+                gt_kpts = batch["keypoints"].to(self.device)
                 target_kpts = gt_kpts[targets[..., 0].long(), target_gt_idx]
                 pred_kpts_fg = pred_kpts[fg_mask]
                 loss[2] = self.kpt_L1_loss(pred_kpts_fg, target_kpts.view(-1, self.nk * 2)).mean()
@@ -916,14 +925,17 @@ class OBBKeypointLoss:
         return torch.cat((box_xywh, pred_rot), 2)
 
     def preprocess(self, targets, batch_size):
-        if targets.shape == 0: return torch.zeros(batch_size, 0, 6, device=self.device)
+        if targets.shape == 0:
+            return torch.zeros(batch_size, 0, 6, device=self.device)
         i = targets[:, 0]
         _, counts = i.unique(return_counts=True)
         out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
         for j in range(batch_size):
             matches = i == j
             n = matches.sum()
-            if n: out[j, :n] = targets[matches, 1:]
+            if n:
+                out[j, :n] = targets[matches, 1:]
         return out
+
 
 # ++++++++++++++++++++++ END OF MODIFICATION ++++++++++++++++++++++

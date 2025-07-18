@@ -413,6 +413,7 @@ class Pose(Detect):
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
 
+
 # +++++++++++++++++++++ START OF MODIFICATION +++++++++++++++++++++
 # added by dbasavegowda
 from ultralytics.utils.ops import xywhr2xyxyxyxy
@@ -424,6 +425,7 @@ class OBBKeypointDetect(Detect):
     This version correctly implements a decoupled head architecture, inheriting the base
     box and class branches and adding new branches for angle and keypoints.
     """
+
     def __init__(self, nc=80, kpt_shape=(1, 2), ch=()):
         # Initialize the parent 'Detect' class. This will create the base
         # self.cv2 (for box) and self.cv3 (for class) branches.
@@ -433,10 +435,10 @@ class OBBKeypointDetect(Detect):
         # --- Keypoint-Specific Attributes ---
         self.kpt_shape = kpt_shape
         self.nk = kpt_shape  # Number of keypoints
-        self.kp_param = 2 # (x, y) only
+        self.kp_param = 2  # (x, y) only
 
         # --- Rationale for Change: Define separate output channels for new branches ---
-        self.no_angle = 1              # For OBB angle (r)
+        self.no_angle = 1  # For OBB angle (r)
         self.no_kpt = self.nk * self.kp_param  # For keypoints (nk * 2)
 
         # --- Rationale for Change: Create two new, separate convolutional branches ---
@@ -444,10 +446,14 @@ class OBBKeypointDetect(Detect):
         # We add a branch for the angle (cv4) and a branch for the keypoints (cv5).
         # The intermediate channel size is based on ch, the channels of the smallest feature map.
         c4 = max(ch[0] // 4, self.no_angle)  # Angle branch channels
-        c5 = max(ch[0] // 4, self.no_kpt)    # Keypoint branch channels
+        c5 = max(ch[0] // 4, self.no_kpt)  # Keypoint branch channels
 
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.no_angle, 1)) for x in ch)
-        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.no_kpt, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.no_angle, 1)) for x in ch
+        )
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.no_kpt, 1)) for x in ch
+        )
 
     def forward(self, x):
         """
@@ -472,12 +478,15 @@ class OBBKeypointDetect(Detect):
         # --- Inference-time decoding remains largely the same ---
         # The concatenated tensor has the same final structure as before.
         box, rot, cls, kpts = torch.cat([xi.view(shape, self.no, -1) for xi in x], 2).split(
-            (self.reg_max * 4, 1, self.nc, self.nk * self.kp_param), 1)
+            (self.reg_max * 4, 1, self.nc, self.nk * self.kp_param), 1
+        )
 
         anchor_points, stride_tensor = make_anchors(x, self.stride, 0.5)
 
         # Decode OBB
-        box_xywh = self.dfl(box.view(shape, self.reg_max * 4, -1).permute(0, 2, 1).contiguous().view(-1, 4, self.reg_max)).view(shape, -1, 4)
+        box_xywh = self.dfl(
+            box.view(shape, self.reg_max * 4, -1).permute(0, 2, 1).contiguous().view(-1, 4, self.reg_max)
+        ).view(shape, -1, 4)
         box_xywh = dist2bbox(box_xywh, anchor_points.unsqueeze(0), xywh=True, dim=1) * stride_tensor
         box_xywhr = torch.cat((box_xywh, rot.permute(0, 2, 1).contiguous()), 2)
 
@@ -495,7 +504,9 @@ class OBBKeypointDetect(Detect):
         y[..., :2] = (y[..., :2] * 2.0 - 1.0 + anchors.unsqueeze(2)) * stride
         return y.view(y.shape, y.shape[1], -1)
 
+
 # ++++++++++++++++++++++ END OF MODIFICATION ++++++++++++++++++++++
+
 
 class Classify(nn.Module):
     """

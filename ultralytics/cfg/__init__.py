@@ -48,7 +48,7 @@ SOLUTION_MAP = {
 
 # Define valid tasks and modes
 MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
-TASKS = frozenset({"detect", "segment", "classify", "pose", "obb", "obb_kpt"}) # modified by dbasavegowda
+TASKS = frozenset({"detect", "segment", "classify", "pose", "obb", "obb_kpt"})  # modified by dbasavegowda
 TASK2DATA = {
     "detect": "coco8.yaml",
     "segment": "coco8-seg.yaml",
@@ -62,7 +62,7 @@ TASK2MODEL = {
     "classify": "yolo11n-cls.pt",
     "pose": "yolo11n-pose.pt",
     "obb": "yolo11n-obb.pt",
-    'obb_kpt': 'yolov11n-obb-kpt.yaml', # added by dbasavegowda
+    "obb_kpt": "yolov11n-obb-kpt.yaml",  # added by dbasavegowda
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
