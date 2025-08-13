@@ -13,8 +13,10 @@ from src.engine.evaluator import Evaluator
 import torch.distributed as dist
 
 # import model and loss
-from src.models.obbpose_model import OBBPoseModel
-from src.models.losses.obb_kpt1_loss import OBBKpt1Criterion
+from src.models.yolo11_obbpose_td import YOLO11_OBBPOSE_TD
+from src.models.losses.td_obb_kpt1_loss import TDOBBWKpt1Criterion
+
+
 
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -49,23 +51,26 @@ def main():
         print(f"Val  : images={len(va_ds)}")
 
     # Model + Loss
-    model = OBBPoseModel(
+    model = YOLO11_OBBPOSE_TD(
         num_classes=int(cfg.model.num_classes),
         width=float(cfg.model.width),
         depth=float(cfg.model.depth),
+        kpt_crop=int(getattr(cfg.topdown, "crop_size", 64)),
+        kpt_expand=float(getattr(cfg.topdown, "expand", 1.25)),
     )
-    criterion = OBBKpt1Criterion(
+    criterion = TDOBBWKpt1Criterion(
         strides=tuple(cfg.model.strides),
         num_classes=int(cfg.model.num_classes),
         lambda_box=float(cfg.loss.lambda_box),
         lambda_obj=float(cfg.loss.lambda_obj),
         lambda_ang=float(cfg.loss.lambda_ang),
+        lambda_cls=1.0,
         lambda_kpt=float(cfg.loss.lambda_kpt),
-        lambda_kc=float(cfg.loss.lambda_kc),
-        pos_obj_weight=float(cfg.loss.pos_obj_weight),
-        soft_obj_warmup_epochs=int(cfg.loss.soft_obj_warmup_epochs),
-        assign_4_neighbors=bool(cfg.loss.assign_4_neighbors),
-        box_loss_type=str(cfg.loss.box_loss_type),
+        kpt_crop=int(getattr(cfg.topdown, "crop_size", 64)),
+        kpt_expand=float(getattr(cfg.topdown, "expand", 1.25)),
+        kpt_freeze_epochs=int(getattr(cfg.loss, "kpt_freeze_epochs", 0)),
+        kpt_warmup_epochs=int(getattr(cfg.loss, "kpt_loss_warmup_epochs", 0)),
+        kpt_iou_gate=float(getattr(cfg.loss, "kpt_iou_gate", 0.0)),
     )
 
     # Evaluator

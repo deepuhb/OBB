@@ -31,6 +31,7 @@ decode:
   max_det: 300
   topk: 1000
   apply_nms: true       # eval without NMS (standard); tighten later
+  rotated_nms: true
 
 eval:
   score_thresh: 0.0
@@ -39,6 +40,7 @@ eval:
   max_det: 300
   topk: 1000
   rank_by: "score"
+  iou_thrs: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 
 train:
   epochs: 10
@@ -57,5 +59,7 @@ ddp:
   backend: "nccl"
   find_unused_parameters: false
   broadcast_buffers: true
-  # set by torchrun:
-  # world_size, rank, local_rank
+
+topdown:
+  crop_size: 64   # size of rotated crop given to the keypoint head
+  expand: 1.25    # enlarge the OBB before cropping (helps context)

@@ -60,18 +60,19 @@ class Trainer:
 
             self.model.train()
             bar = tqdm(total=len(train_loader), ncols=120, ascii=True, desc=f"{epoch+1}/{epochs}") if is_main_process() else None
-            agg = {"loss":0.0, "box":0.0, "obj":0.0, "ang":0.0, "kpt":0.0, "kc":0.0, "pos":0.0}
+            agg = {"loss":0.0, "box":0.0, "obj":0.0, "ang":0.0, "kpt":0.0, "pos":0.0}
 
             for it, batch in enumerate(train_loader):
                 imgs = batch["image"].to(self.device, non_blocking=True)
                 outs = self.model(imgs)
-                det_maps, kpt_maps = outs["det"], outs["kpt"]
+                det_maps = outs["det"]
+                feats = outs["feats"]
                 b2 = {k: ([t.to(self.device, non_blocking=True) for t in v] if isinstance(v, list) else v.to(self.device, non_blocking=True))
                       for k, v in batch.items() if k != "image"}
 
                 with autocast(device_type='cuda', enabled=self.use_amp):
-                    loss, logs = self.criterion(det_maps, kpt_maps, {"image": imgs, **b2},
-                                                epoch=epoch, soft_warmup_epochs=soft_warmup)
+                    loss, logs = self.criterion(det_maps, feats, {"image": imgs, **b2}, model=self._maybe_ddp_module(),
+                                                epoch=epoch)
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
@@ -80,7 +81,7 @@ class Trainer:
                 if is_main_process():
                     agg["loss"] += logs["loss"]; agg["box"] += logs["loss_box"]
                     agg["obj"] += logs["loss_obj"]; agg["ang"] += logs["loss_ang"]
-                    agg["kpt"] += logs["loss_kpt"]; agg["kc"]  += logs["loss_kc"]
+                    agg["kpt"] += logs["loss_kpt"]
                     agg["pos"] += logs.get("num_pos", 0.0)
                     if bar:
                         bar.set_postfix({
@@ -104,7 +105,7 @@ class Trainer:
                 print(f"{epoch+1:>5}/{epochs:<5}  GPU_mem {gpu_mem:5.2f}G  "
                       f"box_loss {agg['box']/n:.4f}  obj_loss {agg['obj']/n:.4f}  "
                       f"ang_loss {agg['ang']/n:.4f}  kpt_loss {agg['kpt']/n:.4f}  "
-                      f"kc_loss {agg['kc']/n:.4f}  Pos {agg['pos']/n:.1f}")
+                      f"Pos {agg['pos']/n:.1f}")
 
                 # ---- EVAL (rank 0 only)
                 metrics = evaluator.evaluate(self._maybe_ddp_module(), val_loader, device=self.device)
