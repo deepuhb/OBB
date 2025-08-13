@@ -1,0 +1,61 @@
+# configs/obbpose11.yaml
+
+experiment: "obbpose11"
+
+data:
+  root: "datasets"
+  img_size: 768
+  workers: 4
+  pin_memory: true
+
+model:
+  num_classes: 1
+  width: 0.5
+  depth: 0.33
+  strides: [4, 8, 16]
+
+loss:
+  lambda_box: 7.5
+  lambda_obj: 3.0
+  lambda_ang: 1.0
+  lambda_kpt: 2.0
+  lambda_kc: 0.5
+  pos_obj_weight: 1.0
+  soft_obj_warmup_epochs: 2
+  assign_4_neighbors: true
+  box_loss_type: "giou"   # "iou" or "giou"
+
+decode:
+  score_thresh: 0.0
+  nms_iou: 0.50
+  max_det: 300
+  topk: 1000
+  apply_nms: true       # eval without NMS (standard); tighten later
+
+eval:
+  score_thresh: 0.0
+  iou_thr: 0.3           # start loose; raise to 0.5 later
+  pck_tau: 0.10          # start loose; tighten to 0.05 later
+  max_det: 300
+  topk: 1000
+  rank_by: "score"
+
+train:
+  epochs: 10
+  batch: 8
+  lr: 0.001
+  weight_decay: 0.0005
+  amp: true
+  seed: 42
+  save_dir: "runs/exp"
+  monitor: "map50"
+  monitor_mode: "max"
+
+
+ddp:
+  distributed: true
+  backend: "nccl"
+  find_unused_parameters: false
+  broadcast_buffers: true
+  # set by torchrun:
+  # world_size, rank, local_rank
