@@ -11,7 +11,6 @@ import torch
 from torch.backends import cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import GradScaler
 import yaml
 
@@ -30,7 +29,7 @@ from src.utils.distrib import (
     LOCAL_RANK,
 )
 
-# Model + loss (adjust names if your paths differ)
+# Model + loss (adjust names if paths differ)
 from src.models.yolo11_obbpose_td import YOLO11_OBBPOSE_TD
 from src.models.losses.td_obb_kpt1_loss import TDOBBWKpt1Criterion
 
@@ -73,7 +72,6 @@ def load_cfg(path: str) -> SimpleNamespace:
 
 
 def merge_overrides(cfg: SimpleNamespace, args: argparse.Namespace) -> SimpleNamespace:
-    # ensure groups
     if not hasattr(cfg, "train"):
         cfg.train = SimpleNamespace()
     if not hasattr(cfg, "data"):
@@ -128,7 +126,6 @@ def dataset_summary(logger, train_loader, val_loader):
 
 
 def per_device_batch(cfg_batch: int, world_size: int, mode: str) -> int:
-    """Compute per-process batch size."""
     if str(mode) == "total":
         return max(1, math.ceil(int(cfg_batch) / max(1, int(world_size))))
     return int(cfg_batch)
@@ -155,7 +152,6 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
     loss_cfg = getattr(cfg, "loss", SimpleNamespace())
     td = getattr(cfg, "topdown", SimpleNamespace())
 
-    # allow both lambda_* and legacy w_* names
     def pick(obj, *names, default=None, cast=float):
         for n in names:
             if hasattr(obj, n):
@@ -168,7 +164,6 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
     lambda_cls = pick(loss_cfg, "lambda_cls", "w_cls", default=1.0)
     lambda_kpt = pick(loss_cfg, "lambda_kpt", "w_kpt", default=2.0)
 
-    # ROI crop params for the TD keypoint head
     kpt_crop   = int(getattr(td, "crop_size", getattr(loss_cfg, "kpt_crop", 64)))
     kpt_expand = float(getattr(td, "expand", getattr(loss_cfg, "kpt_expand", 1.25)))
 
@@ -195,24 +190,23 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
 # ---------------------------- main ----------------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser("OBB-Pose11 training (YOLO11-style LR)")
+    ap = argparse.ArgumentParser("OBB-Pose11 training (YOLO11-style LR, no torch schedulers)")
     ap.add_argument("--cfg", type=str, default="src/configs/obbpose11.yaml", help="YAML config path")
     ap.add_argument("--batch", type=int, default=None, help="batch size (interpreted by --batch_mode)")
-    ap.add_argument("--batch_mode", type=str, default=None, choices=["per_device", "total"],
-                    help="per_device: value is per GPU; total: global, split across GPUs")
+    ap.add_argument("--batch_mode", type=str, default=None, choices=["per_device", "total"])
     ap.add_argument("--accum", type=int, default=None, help="grad accumulation steps")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--weight_decay", type=float, default=None)
-    ap.add_argument("--amp", type=int, default=None, help="1/0 to enable/disable AMP")
+    ap.add_argument("--amp", type=int, default=None, help="1/0")
     ap.add_argument("--save_dir", type=str, default=None)
     ap.add_argument("--lrf", type=float, default=None, help="final LR fraction (cosine), e.g. 0.01")
     ap.add_argument("--warmup_epochs", type=float, default=None, help="warmup length in epochs (optimizer updates)")
     ap.add_argument("--warmup_lr_init", type=float, default=None, help="init LR as a fraction of base, e.g. 0.2")
-    ap.add_argument("--overfit_n", type=int, default=None, help="first N images of train/val (debug)")
-    ap.add_argument("--eval_interval", type=int, default=None, help="run eval every K epochs")
-    ap.add_argument("--eval_subset", type=float, default=None, help="fraction (0-1] of val to evaluate")
+    ap.add_argument("--overfit_n", type=int, default=None)
+    ap.add_argument("--eval_interval", type=int, default=None)
+    ap.add_argument("--eval_subset", type=float, default=None)
     return ap.parse_args()
 
 
@@ -220,10 +214,10 @@ def main():
     args = parse_args()
     logger = setup_logger()
 
-    # ---- distributed init (safe for single process) ----
+    # ---- distributed init ----
     use_cuda = torch.cuda.is_available()
     backend = "nccl" if use_cuda else "gloo"
-    _, _, _ = dist_init(backend=backend)  # sets IS_DISTRIBUTED/RANK/WORLD_SIZE/LOCAL_RANK
+    dist_init(backend=backend)
 
     # device
     if use_cuda:
@@ -236,8 +230,7 @@ def main():
     # ---- config & seed ----
     cfg = merge_overrides(load_cfg(args.cfg), args)
     tr = getattr(cfg, "train", SimpleNamespace())
-    seed = int(getattr(tr, "seed", 0))
-    seed_everything(seed, rank=RANK)
+    seed_everything(int(getattr(tr, "seed", 0)), rank=RANK)
 
     # ---- batch/loader params ----
     batch_mode = str(getattr(tr, "batch_mode", "per_device"))
@@ -247,7 +240,6 @@ def main():
     overfit_n = int(getattr(getattr(cfg, "data", SimpleNamespace()), "overfit_n", 0)) or None
 
     if is_main_process():
-        eff_global_batch = batch_per_proc * max(1, WORLD_SIZE)
         logger.info(f"[DDP] world={WORLD_SIZE} | per_gpu_batch={batch_per_proc} | accum_steps={int(getattr(tr,'accum',1))}")
 
     # ---- data ----
@@ -264,17 +256,10 @@ def main():
     # ---- model & loss ----
     model = build_model(cfg, device)
     if IS_DISTRIBUTED and use_cuda:
-        model = DDP(
-            model,
-            device_ids=[LOCAL_RANK],
-            output_device=LOCAL_RANK,
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True,
-        )
-
+        model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, find_unused_parameters=False, gradient_as_bucket_view=True)
     criterion = build_criterion(cfg, device)
 
-    # ---- optim / sched / amp (YOLO-style) ----
+    # ---- optim / amp ----
     lr = float(getattr(tr, "lr", 1e-3))
     wd = float(getattr(tr, "weight_decay", 5e-2))
     epochs = int(getattr(tr, "epochs", 100))
@@ -284,28 +269,20 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=wd)
-
-    # store base_lr per param group (used by warmup & cosine)
+    # record base lr for manual warmup/cosine
     for pg in optimizer.param_groups:
         pg.setdefault("base_lr", pg["lr"])
-        pg.setdefault("initial_lr", pg["lr"])  # for safety
 
-    # cosine over epochs: factor in [lrf..1]
-    lrf = float(getattr(tr, "lrf", 0.01))
-    def lf(epoch: int):
+    # cosine params
+    lrf = float(getattr(tr, "lrf", 0.01))                # final LR fraction
+    def cosine_factor(epoch: int) -> float:
         return ((1 + math.cos(math.pi * epoch / max(1, epochs))) / 2) * (1 - lrf) + lrf
 
-    # Build a FACTORY so Trainer creates the scheduler after first optimizer.step()
-    def scheduler_factory(opt):
-        return LambdaLR(opt, lr_lambda=lf, last_epoch=-1)
-
-    # Warmup settings (optimizer updates, not raw batches)
+    # warmup params (in optimizer updates)
     warmup_epochs = float(getattr(tr, "warmup_epochs", 3.0))
-    warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))  # as a fraction of base_lr
+    warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))  # as a fraction of base
 
     scaler = GradScaler(enabled=use_amp)
-
-    # ---- evaluator & trainer ----
     evaluator = Evaluator(cfg, debug=False)
 
     trainer = Trainer(
@@ -316,21 +293,19 @@ def main():
         device=str(device),
         epochs=epochs,
         use_amp=use_amp,
-        scheduler=scheduler_factory,   # epoch scheduler, created lazily
         grad_accum=accum,
         max_grad_norm=getattr(tr, "max_grad_norm", None),
         logger=logger if is_main_process() else None,
         cfg=cfg,
         ckpt_dir=save_dir,
-        # warmup params to the trainer
+        # manual LR controls
+        cosine_factor=cosine_factor,
         warmup_epochs=warmup_epochs,
         warmup_lr_init=warmup_lr_init,
     )
 
-    # ---- train ----
     trainer.fit(train_loader, val_loader, evaluator, train_sampler=train_sampler)
 
-    # ---- cleanup ----
     maybe_barrier()
     cleanup()
 

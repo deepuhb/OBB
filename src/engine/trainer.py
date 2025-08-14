@@ -1,7 +1,7 @@
 # src/engine/trainer.py
 from __future__ import annotations
 import math, os, logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -43,9 +43,9 @@ def _gpu_mem_str(device: str) -> str:
 
 class Trainer:
     """
-    YOLO11-style trainer:
-      - manual per-iteration warmup (optimizer updates)
-      - epoch-stepped scheduler (LambdaLR), created after the first optimizer step
+    YOLO-style trainer with **no torch schedulers**:
+      - per-update warmup (manual)
+      - cosine decay per epoch (manual)
       - AMP + grad accumulation + DDP-safe
     Expects:
       - model(images) -> dict: {'det': det_maps, 'feats': feats}
@@ -62,12 +62,13 @@ class Trainer:
         device: str = "cuda",
         epochs: int = 100,
         use_amp: bool = True,
-        scheduler: Optional[object] = None,  # may be a factory (callable) OR a built instance
         grad_accum: int = 1,
         max_grad_norm: Optional[float] = None,
         logger: Optional[logging.Logger] = None,
         cfg: Optional[Any] = None,
         ckpt_dir: Optional[str] = None,
+        # manual LR controls
+        cosine_factor: Optional[Callable[[int], float]] = None,
         warmup_epochs: float = 3.0,
         warmup_lr_init: float = 0.2,   # as a fraction of base_lr
     ):
@@ -79,11 +80,6 @@ class Trainer:
         self.epochs = int(epochs)
         self.use_amp = bool(use_amp)
 
-        # --- scheduler: support lazy factory ---
-        self._sched_factory = scheduler if callable(scheduler) else None
-        self.scheduler = None if callable(scheduler) else scheduler
-        self._sched_ready = self.scheduler is not None
-
         self.grad_accum = max(1, int(grad_accum))
         self.max_grad_norm = max_grad_norm if (max_grad_norm is None) else float(max_grad_norm)
         self.logger = logger or logging.getLogger("obbpose11.trainer")
@@ -93,10 +89,13 @@ class Trainer:
         self.ckpt_dir = ckpt_dir or getattr(getattr(cfg, "train", object()), "save_dir", "runs/train/exp")
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
-        # warmup config
+        # LR controls
+        self.cosine_factor = cosine_factor
         self.warmup_epochs = float(warmup_epochs)
         self.warmup_lr_init = float(warmup_lr_init)
         self.global_update = 0  # counts optimizer updates across epochs
+        # cache base LRs
+        self.base_lrs = [pg.get("base_lr", pg["lr"]) for pg in self.optimizer.param_groups]
 
         trns = getattr(cfg, "train", None)
         self.sel_metric = getattr(trns, "selection_metric", "map50") if trns is not None else "map50"
@@ -121,12 +120,9 @@ class Trainer:
         fast_mode_default = bool(getattr(evcfg, "fast", False)) if evcfg else False
         full_every = int(getattr(evcfg, "full_every", 0)) if evcfg else 0
 
-        # warmup in terms of optimizer updates (respecting grad accumulation)
-        updates_per_epoch = math.ceil(len(train_loader) / self.grad_accum)
+        # warmup measured in optimizer updates (respecting grad accumulation)
+        updates_per_epoch = max(1, math.ceil(len(train_loader) / self.grad_accum))
         warmup_updates = int(max(1, round(self.warmup_epochs * updates_per_epoch)))
-
-        # cache base_lrs from the optimizer (set earlier in train.py)
-        base_lrs = [pg.get("base_lr", pg["lr"]) for pg in self.optimizer.param_groups]
 
         for epoch in range(self.epochs):
             if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
@@ -166,20 +162,19 @@ class Trainer:
                 # optimizer update?
                 do_step = ((it + 1) % self.grad_accum == 0) or ((it + 1) == len(train_loader))
                 if do_step:
-                    # --- per-iteration WARMUP (on optimizer updates) ---
+                    # --- per-update warmup (manual) ---
                     if self.global_update < warmup_updates:
                         wu = (self.global_update + 1) / warmup_updates  # (0,1]
                         warm_factor = self.warmup_lr_init + (1.0 - self.warmup_lr_init) * wu
-                        for (pg, base_lr) in zip(self.optimizer.param_groups, base_lrs):
+                        for (pg, base_lr) in zip(self.optimizer.param_groups, self.base_lrs):
                             pg["lr"] = base_lr * warm_factor
 
-                    # clip before stepping
+                    # clip & step
                     if self.max_grad_norm is not None:
                         if self.use_amp:
                             scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
 
-                    # OPTIMIZER STEP
                     if self.use_amp:
                         scaler.step(self.optimizer)
                         scaler.update()
@@ -187,15 +182,7 @@ class Trainer:
                         self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
 
-                    # LAZY-CREATE EPOCH SCHEDULER AFTER FIRST STEP
-                    if not self._sched_ready and self._sched_factory is not None:
-                        # seed initial_lr for safety
-                        for pg in self.optimizer.param_groups:
-                            pg.setdefault("initial_lr", pg.get("base_lr", pg["lr"]))
-                        self.scheduler = self._sched_factory(self.optimizer)
-                        self._sched_ready = True
-
-                    self.global_update += 1  # count optimizer updates
+                    self.global_update += 1
 
                 # aggregate logs
                 agg["loss"] += float(logs.get("loss", loss.item() * self.grad_accum))
@@ -219,16 +206,18 @@ class Trainer:
 
             pbar.close()
 
-            # average (reduce if DDP)
+            # reduce/average
             for k in agg:
                 tensor_val = torch.tensor(agg[k], device=device, dtype=torch.float32)
                 tensor_val = reduce_tensor(tensor_val, op=dist.ReduceOp.SUM) if is_dist() else tensor_val
                 agg[k] = float(tensor_val.item()) / self.world_size
             agg_avg = {k: v / max(1, n_steps) for k, v in agg.items()}
 
-            # --- epoch scheduler step (once per epoch, AFTER many optimizer steps) ---
-            if self.scheduler is not None:
-                self.scheduler.step()
+            # --- cosine per-epoch (manual), start after warmup finishes ---
+            if self.cosine_factor is not None and self.global_update >= warmup_updates:
+                factor = float(self.cosine_factor(epoch + 1))  # next epoch's factor
+                for (pg, base_lr) in zip(self.optimizer.param_groups, self.base_lrs):
+                    pg["lr"] = base_lr * factor
 
             if self.rank == 0:
                 self.logger.info(
@@ -238,7 +227,7 @@ class Trainer:
                     f"Pos {agg_avg['pos']:.1f}"
                 )
 
-            # ---------------------- evaluation cadence ---------------------- #
+            # ---------------- evaluation cadence ---------------- #
             do_eval = True
             if (epoch + 1) <= warmup_noeval:
                 do_eval = False
@@ -247,11 +236,6 @@ class Trainer:
 
             metrics = {}
             if do_eval and self.rank == 0:
-                # (optional) fast/full toggles
-                use_fast = fast_mode_default
-                if full_every > 0 and ((epoch + 1) % full_every == 0):
-                    use_fast = False
-
                 with torch.inference_mode(), autocast(device_type="cuda", enabled=self.use_amp):
                     metrics = evaluator.evaluate(ddp_module(model), val_loader, device=device, max_images=None)
 
