@@ -1,5 +1,17 @@
-torch>=2.1
-torchvision>=0.16
-numpy
-opencv-python
-tqdm
+# Core
+torch>=2.3.0     # PyTorch 2.3+ supports Python 3.12 well
+torchvision>=0.18.0
+torchaudio>=2.3.0 ; sys_platform != "win32"
+numpy>=1.26
+opencv-python>=4.8
+tqdm>=4.66
+pyyaml>=6.0
+matplotlib>=3.8
+
+# Geometry / OBB
+shapely>=2.0
+pycocotools>=2.0.7 ; platform_system != "Windows"
+
+# Dev (optional)
+rich>=13.7
+

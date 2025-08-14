@@ -1,12 +1,12 @@
 # scripts/smoke.py
 import os, torch, sys
 sys.path.insert(0, ".")
-from src.data.build import build_loaders_splits
+from src.data.build import build_dataloaders
 from src.models.obbpose_model import OBBPoseModel
 from src.models.losses.obb_kpt1_loss import OBBKpt1Criterion
 
 def main():
-    ds, dl = build_loaders_splits("datasets", img_size=768, batch_size=1, workers=0)
+    ds, dl = build_dataloaders("datasets", img_size=768, batch_size=1, workers=0)
     print(f"Dataset size: {len(ds)}")
     batch = next(iter(dl))
     device = "cpu"

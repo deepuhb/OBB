@@ -3,8 +3,7 @@ from __future__ import annotations
 import math
 import os
 import time
-import copy
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Any
 
 import torch
 import torch.distributed as dist
@@ -59,30 +58,25 @@ class Trainer:
 
     Expects:
       - model(images) -> dict with keys: 'det' (list of maps), 'feats' (neck feats)
-      - criterion(det_maps, batch) -> (loss, logs_dict)
-        logs_dict may include keys: loss, loss_box, loss_obj, loss_ang, loss_kpt, loss_cls, num_pos, etc.
+      - criterion(det_maps, feats, batch, model=None, epoch=0) -> (loss, logs_dict)
       - evaluator.evaluate(model, val_loader, device, max_images=None) -> metrics dict
-
-    Checkpointing:
-      - Saves 'last.pt' every epoch and 'best.pt' when selection metric improves.
-      - Selection metric default: 'map50' (configurable).
     """
 
     def __init__(
-        self,
-        model: torch.nn.Module,
-        criterion: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scaler: GradScaler,
-        device: str = "cuda",
-        epochs: int = 100,
-        use_amp: bool = True,
-        scheduler: Optional[Any] = None,
-        grad_accum: int = 1,
-        max_grad_norm: Optional[float] = None,
-        logger: Optional[logging.Logger] = None,
-        cfg: Optional[Any] = None,
-        ckpt_dir: Optional[str] = None,
+            self,
+            model: torch.nn.Module,
+            criterion: torch.nn.Module,
+            optimizer: torch.optim.Optimizer,
+            scaler: GradScaler,
+            device: str = "cuda",
+            epochs: int = 100,
+            use_amp: bool = True,
+            scheduler: Optional[object] = None,
+            grad_accum: int = 1,
+            max_grad_norm: Optional[float] = None,
+            logger: Optional[logging.Logger] = None,
+            cfg: Optional[Any] = None,
+            ckpt_dir: Optional[str] = None,
     ):
         self.model = model.to(device)
         self.criterion = criterion
@@ -91,7 +85,7 @@ class Trainer:
         self.device = device
         self.epochs = int(epochs)
         self.use_amp = bool(use_amp)
-        self.scheduler = scheduler
+        self.scheduler = scheduler  # will be stepped per-iteration after optimizer.step()
         self.grad_accum = max(1, int(grad_accum))
         self.max_grad_norm = max_grad_norm if (max_grad_norm is None) else float(max_grad_norm)
         self.logger = logger or logging.getLogger("obbpose11.trainer")
@@ -99,6 +93,11 @@ class Trainer:
         self.rank = get_rank()
         self.world_size = get_world_size()
         self.ckpt_dir = ckpt_dir or getattr(getattr(cfg, "train", object()), "save_dir", "runs/train/exp")
+
+        # Accept either a factory (callable) or a prebuilt instance.
+        self._sched_factory = scheduler if callable(scheduler) else None
+        self.scheduler = None if callable(scheduler) else scheduler
+        self._sched_ready = self.scheduler is not None
 
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
@@ -110,26 +109,23 @@ class Trainer:
 
         # logging header
         if self.rank == 0:
+            per_gpu_batch = getattr(getattr(cfg, "train", object()), "batch", "NA")
             self.logger.info(
-                f"[DDP] world={self.world_size} | per_gpu_batch={getattr(cfg.train, 'batch', 'NA')}"
-                f" | accum_steps={self.grad_accum}"
+                f"[DDP] world={self.world_size} | per_gpu_batch={per_gpu_batch} | accum_steps={self.grad_accum}"
             )
 
-    # --------------------------------------------------------------------- #
-    # core loop
-    # --------------------------------------------------------------------- #
     def fit(self, train_loader, val_loader, evaluator, train_sampler=None):
         device = self.device
         model = self.model
         scaler = self.scaler
 
-        # evaluation pacing knobs from cfg.eval
+        # evaluation pacing knobs from cfg.eval  (fixed typo)
         evcfg = getattr(self.cfg, "eval", None)
-        eval_interval = int(getattr(evcfg, "interval", 1)) if evcfg else 1
-        warmup_noeval = int(getattr(evcfg, "warmup_noeval_epochs", 0)) if evcfg else 0
-        subset_frac = float(getattr(evcfg, "subset", 1.0)) if evcfg else 1.0
+        eval_interval   = int(getattr(evcfg, "interval", 1)) if evcfg else 1
+        warmup_noeval   = int(getattr(evcfg, "warmup_noeval_epochs", 0)) if evcfg else 0
+        subset_frac     = float(getattr(evcfg, "subset", 1.0)) if evcfg else 1.0
         fast_mode_default = bool(getattr(evcfg, "fast", False)) if evcfg else False
-        full_every = int(getattr(evcfg, "full_every", 0)) if evcfg else 0
+        full_every      = int(getattr(evcfg, "full_every", 0)) if evcfg else 0
 
         for epoch in range(self.epochs):
             if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
@@ -139,16 +135,11 @@ class Trainer:
             if device.startswith("cuda"):
                 torch.cuda.reset_peak_memory_stats()
 
-            # epoch aggregations
-            agg = {
-                "loss": 0.0, "box": 0.0, "obj": 0.0, "ang": 0.0, "kpt": 0.0, "kc": 0.0, "cls": 0.0, "pos": 0.0
-            }
+            # epoch aggregations (added 'kc' key)
+            agg = {"loss": 0.0, "box": 0.0, "obj": 0.0, "ang": 0.0, "kpt": 0.0, "kc": 0.0, "cls": 0.0, "pos": 0.0}
             n_steps = 0
-            t0 = time.time()
 
-            pbar = None
-            if self.rank == 0:
-                pbar = tqdm(total=len(train_loader), ncols=100, desc=f"{epoch+1}/{self.epochs}")
+            pbar = tqdm(total=len(train_loader), ncols=110, desc=f"{epoch+1}/{self.epochs}", disable=(self.rank != 0))
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -158,29 +149,50 @@ class Trainer:
                 # forward + loss
                 with autocast(device_type="cuda", enabled=self.use_amp):
                     outs = model(imgs)
-                    loss, logs = self.criterion(outs["det"], batch)
+                    if isinstance(outs, dict):
+                        det_maps = outs.get("det") or outs.get("pred") or outs.get("yolo")
+                        feats    = outs.get("feats") or outs.get("features")
+                    else:
+                        det_maps, feats = outs[0], outs[1]
 
-                # scale loss by grad_accum
+                    if det_maps is None or feats is None:
+                        raise RuntimeError("Model must return detection maps and feature maps (feats).")
+
+                    model_for_loss = self.model.module if hasattr(self.model, "module") else self.model
+                    loss, logs = self.criterion(det_maps, feats, batch, model=model_for_loss, epoch=epoch)
+
                 loss = loss / self.grad_accum
-
                 if self.use_amp:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
-                # step if needed
-                if (it + 1) % self.grad_accum == 0:
+                do_step = ((it + 1) % self.grad_accum == 0) or ((it + 1) == len(train_loader))
+                if do_step:
+                    # unscale & clip
                     if self.max_grad_norm is not None:
                         if self.use_amp:
                             scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
+                    # OPTIMIZER STEP FIRST
                     if self.use_amp:
                         scaler.step(self.optimizer)
                         scaler.update()
                     else:
                         self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
+
+                    # LAZY-CREATE SCHEDULER AFTER FIRST OPTIMIZER STEP
+                    created_now = False
+                    if not self._sched_ready and self._sched_factory is not None:
+                        self.scheduler = self._sched_factory(self.optimizer)
+                        self._sched_ready = True
+                        created_now = True
+
+                    # SCHEDULER STEP AFTER OPTIMIZER STEP
+                    if self.scheduler is not None and not created_now:
+                        self.scheduler.step()
 
                 # aggregate logs (defensive)
                 agg["loss"] += float(logs.get("loss", loss.item() * self.grad_accum))
@@ -193,12 +205,12 @@ class Trainer:
                 agg["pos"]  += float(logs.get("num_pos", 0.0))
                 n_steps += 1
 
-                if pbar is not None:
-                    # live IoU/Pos indications if provided by criterion
+                if self.rank == 0:
+                    lr_now = self.optimizer.param_groups[0]["lr"]
                     iou_dbg = logs.get("mean_iou", None)
                     pos_dbg = logs.get("num_pos", None)
                     pbar.set_postfix_str(
-                        f"GPU_mem {_gpu_mem_str(device)}  "
+                        f"GPU_mem {_gpu_mem_str(device)}  lr {lr_now:.3e}  "
                         f"box={logs.get('loss_box', 0.0):.3f}, obj={logs.get('loss_obj', 0.0):.3f}, "
                         f"ang={logs.get('loss_ang', 0.0):.3f}, kpt={logs.get('loss_kpt', 0.0):.3f}"
                         + (f", IoU={iou_dbg:.3f}" if iou_dbg is not None else "")
@@ -206,8 +218,7 @@ class Trainer:
                     )
                     pbar.update(1)
 
-            if pbar is not None:
-                pbar.close()
+            pbar.close()
 
             # average (reduce if DDP)
             for k in agg:
@@ -216,26 +227,16 @@ class Trainer:
                 agg[k] = float(tensor_val.item()) / self.world_size
             agg_avg = {k: v / max(1, n_steps) for k, v in agg.items()}
 
-            # scheduler step (per-epoch)
-            if self.scheduler is not None:
-                try:
-                    self.scheduler.step()
-                except TypeError:
-                    # some schedulers require val loss; skip gracefully
-                    self.scheduler.step(epoch + 1)
-
             # epoch log
             if self.rank == 0:
                 self.logger.info(
                     f"{epoch+1:>4}/{self.epochs:<4}    GPU_mem {_gpu_mem_str(device)}  "
                     f"box_loss {agg_avg['box']:.4f}  obj_loss {agg_avg['obj']:.4f}  "
                     f"ang_loss {agg_avg['ang']:.4f}  kpt_loss {agg_avg['kpt']:.4f}  "
-                    f"kc_loss {agg_avg['kc']:.4f}  Pos {agg_avg['pos']:.1f}"
+                    f"kc_loss {agg_avg['kc']:.4f}   Pos {agg_avg['pos']:.1f}"
                 )
 
-            # ------------------------------------------------------------- #
-            # evaluation (interval / warmup / fast vs full / subset)
-            # ------------------------------------------------------------- #
+            # ---------------------- evaluation (intervals) ---------------------- #
             do_eval = True
             if (epoch + 1) <= warmup_noeval:
                 do_eval = False
@@ -264,7 +265,6 @@ class Trainer:
                     evaluator.dec_args["score_thresh"] = max(0.20, old_thresh if old_thresh is not None else 0.0)
                 else:
                     evaluator.iou_type = "obb"
-                    # leave rotated_nms as is (evaluator already falls back if missing)
 
                 # compute subset budget
                 max_images = None
@@ -275,12 +275,11 @@ class Trainer:
                     except Exception:
                         max_images = None
 
-                # run eval on rank 0 only (metrics are not reduced across ranks here)
+                # run eval on rank 0 only
                 if self.rank == 0:
                     with torch.inference_mode(), autocast(device_type="cuda", enabled=self.use_amp):
                         metrics = evaluator.evaluate(ddp_module(model), val_loader, device=device, max_images=max_images)
 
-                    # safe metric read
                     tp   = int(metrics.get("tp_count", metrics.get("tp_count@base", 0)))
                     ppi  = float(metrics.get("pred_per_img_avg", 0.0))
                     map50= float(metrics.get("map50", 0.0))
@@ -308,24 +307,15 @@ class Trainer:
                 evaluator.dec_args["topk_per_level"] = old_topk_lvl
                 evaluator.dec_args["score_thresh"] = old_thresh
 
-            # ------------------------------------------------------------- #
-            # checkpointing (rank 0)
-            # ------------------------------------------------------------- #
+            # -------------------------- checkpointing -------------------------- #
             if self.rank == 0:
-                # last
                 self._save_checkpoint(os.path.join(self.ckpt_dir, "last.pt"), metrics)
-
-                # best (by selection metric)
                 sel_val = self._selection_value(metrics)
-                is_better = False
                 if sel_val is not None:
-                    if self.sel_mode == "max":
-                        is_better = sel_val > self.best_metric
-                    else:
-                        is_better = sel_val < self.best_metric
-                if is_better:
-                    self.best_metric = sel_val
-                    self._save_checkpoint(os.path.join(self.ckpt_dir, "best.pt"), metrics)
+                    is_better = (sel_val > self.best_metric) if self.sel_mode == "max" else (sel_val < self.best_metric)
+                    if is_better:
+                        self.best_metric = sel_val
+                        self._save_checkpoint(os.path.join(self.ckpt_dir, "best.pt"), metrics)
 
             barrier()
 
@@ -335,11 +325,9 @@ class Trainer:
     def _selection_value(self, metrics: Dict[str, float]) -> Optional[float]:
         if not metrics:
             return None
-        # common aliases
         key = self.sel_metric
         if key in metrics:
             return float(metrics[key])
-        # some alternate spellings
         aliases = {
             "map@.50": "map50",
             "map50": "map50",

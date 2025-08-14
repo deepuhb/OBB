@@ -19,7 +19,7 @@ loss:
   lambda_obj: 3.0
   lambda_ang: 1.0
   lambda_kpt: 2.0
-  lambda_kc: 0.5
+  lambda_cls: 1.0
   pos_obj_weight: 1.0
   soft_obj_warmup_epochs: 2
   assign_4_neighbors: true

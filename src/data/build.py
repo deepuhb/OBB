@@ -7,10 +7,7 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler, Subset
-
-# Your dataset + collate
 from src.data.datasets import YoloObbKptDataset
-
 
 # ------------------------- DDP helpers -------------------------
 
