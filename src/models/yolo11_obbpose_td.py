@@ -142,7 +142,8 @@ class KptTDHead(nn.Module):
 
 
 class YOLO11_OBBPOSE_TD(nn.Module):
-    def __init__(self, num_classes=1, width=0.5, depth=0.33, kpt_crop=64, kpt_expand=1.25):
+    def __init__(self, num_classes=1, width=0.5, depth=0.33, kpt_crop=64, kpt_expand=1.25,
+                 kpt_topk=128, roi_chunk=128, score_thresh_kpt=0.25):
         super().__init__()
         self.backbone = Backbone(w=width, d=depth)
 
@@ -161,6 +162,10 @@ class YOLO11_OBBPOSE_TD(nn.Module):
         # Top-down keypoint crops come from P3-like feature (n3), stride=8
         self.roi = RotatedROIPool(out_size=kpt_crop, expand=kpt_expand, feat_down=8)
         self.kpt_head = KptTDHead(in_ch=c2, S=kpt_crop)
+        # stash for kpt_from_obbs
+        self.kpt_topk = int(kpt_topk)
+        self.roi_chunk = int(roi_chunk)
+        self.score_thresh_kpt = float(score_thresh_kpt)
 
     def forward(self, x):
         p3, p4, p5 = self.backbone(x)       # (c2, c3, c5)
@@ -169,10 +174,22 @@ class YOLO11_OBBPOSE_TD(nn.Module):
         return {"det": det, "feats": [n3, d4, d5]}
 
     @torch.no_grad()
-    def kpt_from_obbs(self, feats, obb_list):
-        p3_like = feats[0]  # n3
-        crops, metas = self.roi(p3_like, obb_list)
+    def kpt_from_obbs(self, feats, obb_list, scores_list=None, topk=None, chunk=None, score_thresh=None):
+        # Use P3-like feature (first from neck outputs)
+        p3_like = feats[0]
+        # Defaults from config baked into the module (set these in __init__ when you build self.roi)
+        if topk is None:        topk = getattr(self, "kpt_topk", 128)
+        if chunk is None:       chunk = getattr(self, "roi_chunk", 128)
+        if score_thresh is None: score_thresh = getattr(self, "score_thresh_kpt", 0.0)
+        crops, metas = self.roi(
+            p3_like, obb_list,
+            scores_list=scores_list,
+            topk=int(topk),
+            chunk=int(chunk),
+            score_thresh=float(score_thresh),
+        )
         if crops.numel() == 0:
             return torch.empty(0, 2, device=p3_like.device), []
-        uv = self.kpt_head(crops)
+        uv = self.kpt_head(crops)  # (N,2) in [0,1]
         return uv, metas
+

@@ -50,3 +50,4 @@ def transform_sample(sample, img_size):
         'labels': torch.from_numpy(labels).long() if isinstance(labels, _np.ndarray) else labels,
         'orig_size': torch.tensor([img.shape[0], img.shape[1]])
     }
+

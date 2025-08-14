@@ -1,4 +1,4 @@
-# src/data/yolo_obb_kpt_dataset.py
+# src/data/datasets.py
 import os, cv2, numpy as np, torch
 from .transforms import transform_sample
 from ..utils.box_ops import quad_to_cxcywh_angle

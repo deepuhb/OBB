@@ -43,6 +43,28 @@ def _class_names_from_cfg(cfg, nc: int):
         pass
     return [f"c{i}" for i in range(nc)]
 
+def _has_rotated_ops():
+    has_nms = hasattr(torchvision.ops, "nms_rotated") or hasattr(torch.ops.torchvision, "nms_rotated")
+    has_iou = hasattr(torchvision.ops, "box_iou_rotated") or hasattr(torch.ops.torchvision, "box_iou_rotated")
+    return has_nms and has_iou
+
+def _box_iou_rotated_tv(obb_a: torch.Tensor, obb_b: torch.Tensor) -> torch.Tensor:
+    if hasattr(torchvision.ops, "box_iou_rotated"):
+        return torchvision.ops.box_iou_rotated(obb_a, obb_b)
+    if hasattr(torch.ops.torchvision, "box_iou_rotated"):
+        return torch.ops.torchvision.box_iou_rotated(obb_a, obb_b)
+    # fallback
+    return box_iou_rotated_fallback(obb_a, obb_b)
+
+def _nms_rotated_tv(obb: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torch.Tensor:
+    if hasattr(torchvision.ops, "nms_rotated"):
+        return torchvision.ops.nms_rotated(obb, scores, float(iou_thr))
+    if hasattr(torch.ops.torchvision, "nms_rotated"):
+        return torch.ops.torchvision.nms_rotated(obb, scores, float(iou_thr))
+    # fallback
+    return nms_rotated_fallback(obb, scores, float(iou_thr))
+
+
 
 # ================================================================
 # Geometry helpers (pure PyTorch) — rotated IoU & NMS
@@ -199,16 +221,10 @@ def nms_rotated_fallback(obb: torch.Tensor, scores: torch.Tensor, iou_thr: float
 #   [tx,ty,tw,th,sin,cos,obj, cls[0..nc-1]]
 # ================================================================
 @torch.no_grad()
-def _decode_det(det_maps: List[torch.Tensor],
-                strides: Tuple[int, int, int],
-                score_thresh: float = 0.0,
-                nms_iou: float = 0.5,
-                max_det: int = 5000,
-                topk: int = 10000,
-                apply_nms: bool = False,
-                rotated_nms: bool = True,
-                multiclass_mode: str = "argmax",
-                num_classes: int = 1) -> List[Dict[str, torch.Tensor]]:
+def _decode_det(det_maps, strides, score_thresh=0.0, nms_iou=0.5, max_det=5000,
+                topk=10000, apply_nms=False, rotated_nms=True, multiclass_mode="argmax",
+                num_classes=1, topk_per_level=None):
+
     device = det_maps[0].device
     B = det_maps[0].shape[0]
     outs = []
@@ -218,19 +234,16 @@ def _decode_det(det_maps: List[torch.Tensor],
         boxes_all, obb_all, scores_all, labels_all = [], [], [], []
 
         for dm, s in zip(det_maps, strides):
-            logits = dm[b]              # (C,H,W)
+            logits = dm[b]  # (C,H,W)
             H, W = logits.shape[1], logits.shape[2]
 
-            tx = logits[0].sigmoid()
-            ty = logits[1].sigmoid()
-            tw = logits[2].exp()
-            th = logits[3].exp()
-            si = logits[4].tanh()
-            co = logits[5].tanh()
-            obj = logits[6].sigmoid()
+            tx = logits[0].sigmoid(); ty = logits[1].sigmoid()
+            tw = logits[2].exp();     th = logits[3].exp()
+            si = logits[4].tanh();    co = logits[5].tanh()
+            obj= logits[6].sigmoid()
 
             if has_cls:
-                cls_prob = logits[7:7 + num_classes].permute(1, 2, 0).contiguous().sigmoid()  # (H,W,nc)
+                cls_prob = logits[7:7+num_classes].permute(1,2,0).contiguous().sigmoid()  # (H,W,nc)
             else:
                 cls_prob = None
 
@@ -239,63 +252,52 @@ def _decode_det(det_maps: List[torch.Tensor],
                 torch.arange(W, device=device),
                 indexing="ij"
             )
-            cx = (tx + xs) * s
-            cy = (ty + ys) * s
-            w  = tw.clamp_min(_EPS) * s
-            h  = th.clamp_min(_EPS) * s
+            cx = (tx + xs) * s; cy = (ty + ys) * s
+            w  = tw.clamp_min(1e-6) * s; h = th.clamp_min(1e-6) * s
+            x1 = cx - 0.5*w; y1 = cy - 0.5*h; x2 = cx + 0.5*w; y2 = cy + 0.5*h
+            ang = torch.atan2(si, co) * (180.0 / torch.pi)
 
-            x1 = cx - 0.5 * w
-            y1 = cy - 0.5 * h
-            x2 = cx + 0.5 * w
-            y2 = cy + 0.5 * h
-
-            ang = torch.atan2(si, co)  # radians
-            ang_deg = ang * (180.0 / torch.pi)
-
-            if not has_cls:
+            if has_cls:
+                # score map for per-level ranking
+                maxp, arg = cls_prob.max(dim=2)  # (H,W)
+                sc = obj * maxp
+                lab = arg
+            else:
                 sc = obj
                 lab = torch.zeros_like(sc, dtype=torch.long)
-                keep = sc > score_thresh
-                if keep.any():
-                    boxes_all.append(torch.stack([x1[keep], y1[keep], x2[keep], y2[keep]], dim=-1))
-                    obb_all.append(torch.stack([cx[keep], cy[keep], w[keep], h[keep], ang_deg[keep]], dim=-1))
-                    scores_all.append(sc[keep])
-                    labels_all.append(lab[keep])
-            else:
-                if multiclass_mode == "argmax":
-                    maxp, arg = cls_prob.max(dim=2)  # (H,W)
-                    sc = obj * maxp
-                    lab = arg
-                    keep = sc > score_thresh
-                    if keep.any():
-                        boxes_all.append(torch.stack([x1[keep], y1[keep], x2[keep], y2[keep]], dim=-1))
-                        obb_all.append(torch.stack([cx[keep], cy[keep], w[keep], h[keep], ang_deg[keep]], dim=-1))
-                        scores_all.append(sc[keep])
-                        labels_all.append(lab[keep])
-                else:
-                    N = H * W
-                    objv = obj.view(N, 1)
-                    clsv = cls_prob.view(N, num_classes)
-                    scores = objv * clsv
-                    cxv, cyv, wv, hv = cx.view(N), cy.view(N), w.view(N), h.view(N)
-                    x1v, y1v, x2v, y2v = x1.view(N), y1.view(N), x2.view(N), y2.view(N)
-                    angv = ang_deg.view(N)
-                    for c in range(num_classes):
-                        sc_c = scores[:, c]
-                        keep = sc_c > score_thresh
-                        if keep.any():
-                            boxes_all.append(torch.stack([x1v[keep], y1v[keep], x2v[keep], y2v[keep]], dim=-1))
-                            obb_all.append(torch.stack([cxv[keep], cyv[keep], wv[keep], hv[keep], angv[keep]], dim=-1))
-                            scores_all.append(sc_c[keep])
-                            labels_all.append(torch.full((int(keep.sum().item()),), c, dtype=torch.long, device=device))
+
+            # pre-threshold
+            keep = sc > float(score_thresh)
+            if keep.any():
+                # OPTIONAL: per-level topk
+                if topk_per_level is not None:
+                    k = min(int(topk_per_level), int(keep.sum().item()))
+                    if k > 0:
+                        flat_sc = sc[keep]
+                        idx_k = torch.topk(flat_sc, k=k, largest=True, sorted=False).indices
+                        # Build a mask limited to the top-k positions
+                        mask = torch.zeros_like(flat_sc, dtype=torch.bool)
+                        mask[idx_k] = True
+                        # Remap to full keep mask
+                        # get indices of keep
+                        keep_idx = keep.nonzero(as_tuple=False)  # (M,2) [y,x]
+                        # select those in idx_k
+                        sel_idx = keep_idx[mask]
+                        # build a final mask same shape as sc
+                        final_keep = torch.zeros_like(sc, dtype=torch.bool)
+                        final_keep[sel_idx[:,0], sel_idx[:,1]] = True
+                        keep = final_keep
+
+                boxes_all.append(torch.stack([x1[keep], y1[keep], x2[keep], y2[keep]], dim=-1))
+                obb_all.append(torch.stack([cx[keep], cy[keep], w[keep], h[keep], ang[keep]], dim=-1))
+                scores_all.append(sc[keep])
+                labels_all.append(lab[keep])
 
         if not scores_all:
-            outs.append({
-                "boxes": torch.zeros((0, 4), device=device),
-                "obb": torch.zeros((0, 5), device=device),
-                "scores": torch.zeros((0,), device=device),
-                "labels": torch.zeros((0,), dtype=torch.long, device=device),
-            })
+            outs.append({"boxes": torch.zeros((0,4), device=device),
+                         "obb": torch.zeros((0,5), device=device),
+                         "scores": torch.zeros((0,), device=device),
+                         "labels": torch.zeros((0,), dtype=torch.long, device=device)})
             continue
 
         boxes = torch.cat(boxes_all, 0)
@@ -303,18 +305,14 @@ def _decode_det(det_maps: List[torch.Tensor],
         scores= torch.cat(scores_all, 0)
         labels= torch.cat(labels_all, 0)
 
-        # Pre-cap
-        if topk is not None and scores.numel() > topk:
-            idx = torch.topk(scores, k=topk, largest=True, sorted=True).indices
+        # global pre-cap
+        if topk is not None and scores.numel() > int(topk):
+            idx = torch.topk(scores, k=int(topk), largest=True, sorted=True).indices
             boxes, obb, scores, labels = boxes[idx], obb[idx], scores[idx], labels[idx]
 
         if apply_nms:
             if rotated_nms:
-                nms_rot = getattr(torchvision.ops, "nms_rotated", None)
-                if nms_rot is not None:
-                    keep = nms_rot(obb, scores, float(nms_iou))
-                else:
-                    keep = nms_rotated_fallback(obb, scores, float(nms_iou))
+                keep = _nms_rotated_tv(obb, scores, float(nms_iou))
             else:
                 keep = torchvision.ops.nms(boxes, scores, float(nms_iou))
             if keep.numel() > max_det:
@@ -327,7 +325,6 @@ def _decode_det(det_maps: List[torch.Tensor],
 
         outs.append({"boxes": boxes, "obb": obb, "scores": scores, "labels": labels})
     return outs
-
 
 # ================================================================
 # Evaluator
@@ -387,18 +384,31 @@ class Evaluator:
             nms_iou=float(_get(dc, "nms_iou", 0.50)),
             max_det=int(_get(dc, "max_det", 5000)),
             topk=int(_get(dc, "topk", 10000)),
+            topk_per_level=int(_get(dc, "topk_per_level", 400)),
             apply_nms=_to_bool(_get(dc, "apply_nms", False)),
             rotated_nms=_to_bool(_get(dc, "rotated_nms", True)),
             multiclass_mode=str(_get(dc, "multiclass_mode", "argmax")),
             num_classes=self.nc,
         )
+        if not _has_rotated_ops():
+            self.dec_args["rotated_nms"] = False  # use fast AABB NMS
+            self.dec_args["topk"] = min(self.dec_args["topk"], 600)
 
         self.crop_size = int(_get(td, "crop_size", 64))
         self.feat_down = int(self.strides[0])  # crop from P3
 
     @torch.no_grad()
-    def evaluate(self, model, loader, device: str = "cpu") -> Dict[str, float]:
+    def evaluate(self, model, loader, device: str = "cpu", max_images: int = None) -> Dict[str, float]:
         model.eval()
+
+        images_seen = 0
+        use_amp = torch.cuda.is_available()
+        with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=use_amp):
+            for batch in loader:
+                if (max_images is not None) and (images_seen >= max_images):
+                    break
+                images_seen += len(batch["image"])
+
         T = len(self.iou_thrs)
         cls_scores = [[[] for _ in range(self.nc)] for __ in range(T)]
         cls_matches = [[[] for _ in range(self.nc)] for __ in range(T)]
@@ -415,10 +425,16 @@ class Evaluator:
             outs = model(imgs)
 
             preds = _decode_det(outs["det"], **self.dec_args)
-
-            # Top-down keypoints
             obb_list = [p["obb"] for p in preds]
-            uv_all, metas = model.kpt_from_obbs(outs["feats"], obb_list)
+            scores_list = [p["scores"] for p in preds]
+
+            uv_all, metas = model.kpt_from_obbs(
+                outs["feats"], obb_list,
+                scores_list=scores_list,
+                topk=int(getattr(self.cfg.topdown, "kpt_topk", 128)),
+                chunk=int(getattr(self.cfg.topdown, "roi_chunk", 128)),
+                score_thresh=float(getattr(self.cfg.topdown, "score_thresh_kpt", 0.0)),
+            )
 
             pred_kpts_img = [[] for _ in range(len(imgs))]
             for j, meta in enumerate(metas):
@@ -475,14 +491,11 @@ class Evaluator:
                 # Global recall diagnostics
                 if self.iou_type == "obb":
                     if po.numel() and gt_obb is not None and gt_obb.numel():
-                        if hasattr(torchvision.ops, "box_iou_rotated"):
-                            ious_full = torchvision.ops.box_iou_rotated(po, gt_obb)
-                        else:
-                            ious_full = box_iou_rotated_fallback(po, gt_obb)
+                        ious_full = _box_iou_rotated_tv(po, gt_obb)
                     else:
                         ious_full = torch.zeros((po.shape[0], gt_boxes.shape[0]), device=device)
                 else:
-                    ious_full = torchvision.ops.box_iou(pb, gt_boxes) if (pb.numel() and gt_boxes.numel()) else torch.zeros((pb.shape[0], gt_boxes.shape[0]), device=device)
+                    ious_full = torchvision.ops.box_iou(pb, gt_boxes) if (pb.numel() and gt_boxes.numel()) else ...
 
                 if ious_full.numel() and ious_full.shape[1] > 0:
                     best_iou_per_gt = ious_full.max(dim=0).values

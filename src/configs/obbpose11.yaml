@@ -26,20 +26,24 @@ loss:
   box_loss_type: "giou"   # "iou" or "giou"
 
 decode:
-  score_thresh: 0.0
-  nms_iou: 0.50
-  max_det: 300
-  topk: 1000
-  apply_nms: true       # eval without NMS (standard); tighten later
-  rotated_nms: true
+  score_thresh: 0.25      # prefilter by score
+  topk_per_level: 200     # keep per FPN level (P3,P4,P5)
+  topk: 600               # global cap after concat
+  apply_nms: true
+  rotated_nms: false      # FAST mode (set true only if you have the kernels)
+  nms_iou: 0.5
+  max_det: 300            # final per-image cap after NMS
+
 
 eval:
-  score_thresh: 0.0
-  iou_thr: 0.3           # start loose; raise to 0.5 later
+  interval: 1
+  score_thresh: 0.25
+  iou_thr: 0.5           # start loose; raise to 0.5 later
   pck_tau: 0.10          # start loose; tighten to 0.05 later
   max_det: 300
-  topk: 1000
+  topk: 100
   rank_by: "score"
+  print_table: true
   iou_thrs: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 
 train:
@@ -53,7 +57,6 @@ train:
   monitor: "map50"
   monitor_mode: "max"
 
-
 ddp:
   distributed: true
   backend: "nccl"
@@ -61,5 +64,9 @@ ddp:
   broadcast_buffers: true
 
 topdown:
-  crop_size: 64   # size of rotated crop given to the keypoint head
-  expand: 1.25    # enlarge the OBB before cropping (helps context)
+  crop_size: 64          # crop side fed to kpt head
+  expand: 1.25           # enlarge OBB before crop
+  kpt_topk: 128          # cap ROIs per image (key!)
+  score_thresh_kpt: 0.3 # drop very low-score boxes before cropping
+  roi_chunk: 128         # process ROIs in chunks to bound memory
+
