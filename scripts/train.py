@@ -11,7 +11,7 @@ import torch
 from torch.backends import cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import GradScaler
 import yaml
 
@@ -30,7 +30,7 @@ from src.utils.distrib import (
     LOCAL_RANK,
 )
 
-# Top-down OBB + 1KP model and loss
+# Model + loss (adjust names if your paths differ)
 from src.models.yolo11_obbpose_td import YOLO11_OBBPOSE_TD
 from src.models.losses.td_obb_kpt1_loss import TDOBBWKpt1Criterion
 
@@ -96,6 +96,12 @@ def merge_overrides(cfg: SimpleNamespace, args: argparse.Namespace) -> SimpleNam
         cfg.train.amp = bool(args.amp)
     if args.save_dir is not None:
         cfg.train.save_dir = str(args.save_dir)
+    if args.lrf is not None:
+        cfg.train.lrf = float(args.lrf)
+    if args.warmup_epochs is not None:
+        cfg.train.warmup_epochs = float(args.warmup_epochs)
+    if args.warmup_lr_init is not None:
+        cfg.train.warmup_lr_init = float(args.warmup_lr_init)
 
     # data overrides
     if args.overfit_n is not None:
@@ -122,11 +128,7 @@ def dataset_summary(logger, train_loader, val_loader):
 
 
 def per_device_batch(cfg_batch: int, world_size: int, mode: str) -> int:
-    """
-    Compute per-process batch size.
-    mode == "per_device": value used as-is on each process
-    mode == "total": value is global and will be split across processes
-    """
+    """Compute per-process batch size."""
     if str(mode) == "total":
         return max(1, math.ceil(int(cfg_batch) / max(1, int(world_size))))
     return int(cfg_batch)
@@ -170,7 +172,6 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
     kpt_crop   = int(getattr(td, "crop_size", getattr(loss_cfg, "kpt_crop", 64)))
     kpt_expand = float(getattr(td, "expand", getattr(loss_cfg, "kpt_expand", 1.25)))
 
-    # optional curriculum knobs (the class supports these)
     kpt_freeze_epochs  = int(getattr(loss_cfg, "kpt_freeze_epochs", 0))
     kpt_warmup_epochs  = int(getattr(loss_cfg, "kpt_warmup_epochs", 0))
     kpt_iou_gate       = float(getattr(loss_cfg, "kpt_iou_gate", 0.0))
@@ -191,11 +192,10 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
     return criterion
 
 
-
 # ---------------------------- main ----------------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser("OBB-Pose11 training (DDP-safe)")
+    ap = argparse.ArgumentParser("OBB-Pose11 training (YOLO11-style LR)")
     ap.add_argument("--cfg", type=str, default="src/configs/obbpose11.yaml", help="YAML config path")
     ap.add_argument("--batch", type=int, default=None, help="batch size (interpreted by --batch_mode)")
     ap.add_argument("--batch_mode", type=str, default=None, choices=["per_device", "total"],
@@ -207,6 +207,9 @@ def parse_args():
     ap.add_argument("--weight_decay", type=float, default=None)
     ap.add_argument("--amp", type=int, default=None, help="1/0 to enable/disable AMP")
     ap.add_argument("--save_dir", type=str, default=None)
+    ap.add_argument("--lrf", type=float, default=None, help="final LR fraction (cosine), e.g. 0.01")
+    ap.add_argument("--warmup_epochs", type=float, default=None, help="warmup length in epochs (optimizer updates)")
+    ap.add_argument("--warmup_lr_init", type=float, default=None, help="init LR as a fraction of base, e.g. 0.2")
     ap.add_argument("--overfit_n", type=int, default=None, help="first N images of train/val (debug)")
     ap.add_argument("--eval_interval", type=int, default=None, help="run eval every K epochs")
     ap.add_argument("--eval_subset", type=float, default=None, help="fraction (0-1] of val to evaluate")
@@ -226,17 +229,17 @@ def main():
     if use_cuda:
         torch.cuda.set_device(LOCAL_RANK if IS_DISTRIBUTED else 0)
         device = torch.device(f"cuda:{LOCAL_RANK}" if IS_DISTRIBUTED else "cuda:0")
-        cudnn.benchmark = True  # variable input size => faster
+        cudnn.benchmark = True
     else:
         device = torch.device("cpu")
 
     # ---- config & seed ----
     cfg = merge_overrides(load_cfg(args.cfg), args)
-    seed = int(getattr(getattr(cfg, "train", SimpleNamespace()), "seed", 0))
+    tr = getattr(cfg, "train", SimpleNamespace())
+    seed = int(getattr(tr, "seed", 0))
     seed_everything(seed, rank=RANK)
 
     # ---- batch/loader params ----
-    tr = getattr(cfg, "train", SimpleNamespace())
     batch_mode = str(getattr(tr, "batch_mode", "per_device"))
     batch_cfg = int(getattr(tr, "batch", 8))
     batch_per_proc = per_device_batch(batch_cfg, WORLD_SIZE, batch_mode)
@@ -245,10 +248,7 @@ def main():
 
     if is_main_process():
         eff_global_batch = batch_per_proc * max(1, WORLD_SIZE)
-        logger.info(
-            f"[world={WORLD_SIZE} rank={RANK}] per_gpu_batch={batch_per_proc} "
-            f"| accum={int(getattr(tr,'accum',1))} | effective_global_batch={eff_global_batch}"
-        )
+        logger.info(f"[DDP] world={WORLD_SIZE} | per_gpu_batch={batch_per_proc} | accum_steps={int(getattr(tr,'accum',1))}")
 
     # ---- data ----
     train_loader, val_loader, train_sampler = build_dataloaders(
@@ -263,7 +263,6 @@ def main():
 
     # ---- model & loss ----
     model = build_model(cfg, device)
-
     if IS_DISTRIBUTED and use_cuda:
         model = DDP(
             model,
@@ -275,7 +274,7 @@ def main():
 
     criterion = build_criterion(cfg, device)
 
-    # ---- optim / sched / amp ----
+    # ---- optim / sched / amp (YOLO-style) ----
     lr = float(getattr(tr, "lr", 1e-3))
     wd = float(getattr(tr, "weight_decay", 5e-2))
     epochs = int(getattr(tr, "epochs", 100))
@@ -286,28 +285,23 @@ def main():
 
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
-    steps_per_epoch = len(train_loader)  # batches on THIS rank
-    total_steps = epochs * max(steps_per_epoch, 0)
+    # store base_lr per param group (used by warmup & cosine)
+    for pg in optimizer.param_groups:
+        pg.setdefault("base_lr", pg["lr"])
+        pg.setdefault("initial_lr", pg["lr"])  # for safety
 
-    # Build a FACTORY that returns a scheduler when given the optimizer.
-    # The Trainer will call this AFTER the first optimizer.step().
-    from torch.optim.lr_scheduler import ConstantLR, OneCycleLR
-    if total_steps < 2:
-        def scheduler_factory(opt):
-            return ConstantLR(opt, factor=1.0, total_iters=1)
-    else:
-        def scheduler_factory(opt):
-            last = max(0, int(getattr(opt, "_step_count", 0)) - 1)
-            return OneCycleLR(
-                opt,
-                max_lr=lr,
-                epochs=epochs,
-                steps_per_epoch=steps_per_epoch,
-                pct_start=0.1,
-                anneal_strategy="cos",
-                div_factor=10.0,
-                final_div_factor=1e4,
-            )
+    # cosine over epochs: factor in [lrf..1]
+    lrf = float(getattr(tr, "lrf", 0.01))
+    def lf(epoch: int):
+        return ((1 + math.cos(math.pi * epoch / max(1, epochs))) / 2) * (1 - lrf) + lrf
+
+    # Build a FACTORY so Trainer creates the scheduler after first optimizer.step()
+    def scheduler_factory(opt):
+        return LambdaLR(opt, lr_lambda=lf, last_epoch=-1)
+
+    # Warmup settings (optimizer updates, not raw batches)
+    warmup_epochs = float(getattr(tr, "warmup_epochs", 3.0))
+    warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))  # as a fraction of base_lr
 
     scaler = GradScaler(enabled=use_amp)
 
@@ -322,14 +316,18 @@ def main():
         device=str(device),
         epochs=epochs,
         use_amp=use_amp,
-        scheduler=scheduler_factory,
+        scheduler=scheduler_factory,   # epoch scheduler, created lazily
         grad_accum=accum,
         max_grad_norm=getattr(tr, "max_grad_norm", None),
         logger=logger if is_main_process() else None,
         cfg=cfg,
         ckpt_dir=save_dir,
+        # warmup params to the trainer
+        warmup_epochs=warmup_epochs,
+        warmup_lr_init=warmup_lr_init,
     )
 
+    # ---- train ----
     trainer.fit(train_loader, val_loader, evaluator, train_sampler=train_sampler)
 
     # ---- cleanup ----
