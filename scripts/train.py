@@ -16,7 +16,7 @@ import yaml
 
 # --- project imports ---
 from src.engine.trainer import Trainer
-from src.engine.evaluator import Evaluator
+from src.engine.evaluator_full import EvaluatorFull
 from src.data.build import build_dataloaders
 from src.utils.distrib import (
     init as dist_init,
@@ -190,7 +190,7 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
 # ---------------------------- main ----------------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser("OBB-Pose11 training (YOLO11-style LR, no torch schedulers)")
+    ap = argparse.ArgumentParser("OBB-Pose11 training")
     ap.add_argument("--cfg", type=str, default="src/configs/obbpose11.yaml", help="YAML config path")
     ap.add_argument("--batch", type=int, default=None, help="batch size (interpreted by --batch_mode)")
     ap.add_argument("--batch_mode", type=str, default=None, choices=["per_device", "total"])
@@ -205,7 +205,7 @@ def parse_args():
     ap.add_argument("--warmup_epochs", type=float, default=None, help="warmup length in epochs (optimizer updates)")
     ap.add_argument("--warmup_lr_init", type=float, default=None, help="init LR as a fraction of base, e.g. 0.2")
     ap.add_argument("--overfit_n", type=int, default=None)
-    ap.add_argument("--eval_interval", type=int, default=None)
+    ap.add_argument("--eval_interval", type=int, default=1)
     ap.add_argument("--eval_subset", type=float, default=None)
     return ap.parse_args()
 
@@ -283,7 +283,11 @@ def main():
     warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))  # as a fraction of base
 
     scaler = GradScaler(enabled=use_amp)
-    evaluator = Evaluator(cfg, debug=False)
+    evaluator = EvaluatorFull(
+        cfg={"eval": {"score_thresh": 0.3, "nms_iou": 0.5, "iou_thr": 0.5,
+                      "pck_tau": 0.05, "max_det": 100},
+             "model": {"strides": (4, 8, 16)}},
+        debug=False)
 
     trainer = Trainer(
         model=model,

@@ -50,7 +50,10 @@ class Trainer:
     Expects:
       - model(images) -> dict: {'det': det_maps, 'feats': feats}
       - criterion(det_maps, feats, batch, model=None, epoch=0) -> (loss, logs)
-      - evaluator.evaluate(model, val_loader, device, max_images=None) -> metrics
+      - evaluator.evaluate(model, val_loader, device, max_images=None) -> metrics dict
+        REQUIRED standard keys for logging: mAP50, mAP
+        Optional (recommended): pck@0.05, pck_any@0.05, recall@0.1, recall@0.3, recall@0.5,
+                                best_iou, tps, pred_per_img, images
     """
 
     def __init__(
@@ -94,11 +97,12 @@ class Trainer:
         self.warmup_epochs = float(warmup_epochs)
         self.warmup_lr_init = float(warmup_lr_init)
         self.global_update = 0  # counts optimizer updates across epochs
-        # cache base LRs
+        # cache base LRs from optimizer (trainer assumes set in train.py)
         self.base_lrs = [pg.get("base_lr", pg["lr"]) for pg in self.optimizer.param_groups]
 
         trns = getattr(cfg, "train", None)
-        self.sel_metric = getattr(trns, "selection_metric", "map50") if trns is not None else "map50"
+        # Selection metric uses exact key (no aliases)
+        self.sel_metric = getattr(trns, "selection_metric", "mAP50") if trns is not None else "mAP50"
         self.sel_mode = getattr(trns, "selection_mode", "max") if trns is not None else "max"
         self.best_metric = -float("inf") if self.sel_mode == "max" else float("inf")
 
@@ -116,9 +120,6 @@ class Trainer:
         evcfg = getattr(self.cfg, "eval", None)
         eval_interval = int(getattr(evcfg, "interval", 1)) if evcfg else 1
         warmup_noeval = int(getattr(evcfg, "warmup_noeval_epochs", 0)) if evcfg else 0
-        subset_frac = float(getattr(evcfg, "subset", 1.0)) if evcfg else 1.0
-        fast_mode_default = bool(getattr(evcfg, "fast", False)) if evcfg else False
-        full_every = int(getattr(evcfg, "full_every", 0)) if evcfg else 0
 
         # warmup measured in optimizer updates (respecting grad accumulation)
         updates_per_epoch = max(1, math.ceil(len(train_loader) / self.grad_accum))
@@ -234,12 +235,35 @@ class Trainer:
             if eval_interval > 1 and ((epoch + 1) % eval_interval != 0):
                 do_eval = False
 
-            metrics = {}
+            metrics: Dict[str, float] = {}
             if do_eval and self.rank == 0:
                 with torch.inference_mode(), autocast(device_type="cuda", enabled=self.use_amp):
                     metrics = evaluator.evaluate(ddp_module(model), val_loader, device=device, max_images=None)
 
-            # checkpointing
+                # STRICT: use only standard keys (no aliases)
+                # These two are REQUIRED; raise if missing
+                m50 = float(metrics["mAP50"])
+                m_  = float(metrics["mAP"])
+
+                # The rest are optional (no aliases, default 0/0.0 if absent)
+                pck  = float(metrics.get("pck@0.05", 0.0))
+                pcka = float(metrics.get("pck_any@0.05", 0.0))
+                r01  = float(metrics.get("recall@0.1", 0.0))
+                r03  = float(metrics.get("recall@0.3", 0.0))
+                r05  = float(metrics.get("recall@0.5", 0.0))
+                biou = float(metrics.get("best_iou", 0.0))
+                tps  = int(metrics.get("tps", 0))
+                ppi  = float(metrics.get("pred_per_img", 0.0))
+                nimg = int(metrics.get("images", 0))
+
+                self.logger.info(
+                    f"{'':>17} EVAL  images {nimg:>5}  mAP50 {m50:.6f}  mAP {m_:.6f}  "
+                    f"PCK@0.05 {pck:.6f}  PCK_any@0.05 {pcka:.6f}  "
+                    f"TPs {tps}  pred/img {ppi:.1f}  "
+                    f"R@0.1 {r01:.2f}  R@0.3 {r03:.2f}  R@0.5 {r05:.2f}  bestIoU {biou:.3f}"
+                )
+
+            # checkpointing (uses exact selection key; no aliases)
             if self.rank == 0:
                 self._save_checkpoint(os.path.join(self.ckpt_dir, "last.pt"), metrics)
                 sel_val = self._selection_value(metrics)
@@ -253,11 +277,11 @@ class Trainer:
 
     # --------------------------------------------------------------------- #
     def _selection_value(self, metrics: Dict[str, float]) -> Optional[float]:
+        """Return selection value using EXACT key; no aliases."""
         if not metrics:
             return None
-        key = getattr(self, "sel_metric", "map50")
-        aliases = {"map@.50":"map50","map50":"map50","map":"map","pck":"pck@0.05","pck@0.05":"pck@0.05"}
-        return float(metrics.get(key, metrics.get(aliases.get(key,""), None))) if (key in metrics or aliases.get(key,"") in metrics) else None
+        key = getattr(self, "sel_metric", "mAP50")
+        return float(metrics[key]) if key in metrics else None
 
     def _save_checkpoint(self, path: str, metrics: Dict[str, float]):
         state = {
