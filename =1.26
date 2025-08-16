@@ -1,0 +1,82 @@
+Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com
+Collecting opencv-python-headless==4.10.0.84
+  Downloading opencv_python_headless-4.10.0.84-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (20 kB)
+Requirement already satisfied: numpy in /home/sysgen/anaconda3/envs/obbpose11/lib/python3.12/site-packages (2.1.2)
+Collecting pyyaml
+  Downloading PyYAML-6.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (2.1 kB)
+Collecting tqdm
+  Downloading tqdm-4.67.1-py3-none-any.whl.metadata (57 kB)
+Collecting matplotlib
+  Downloading matplotlib-3.10.5-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (11 kB)
+Collecting shapely
+  Downloading shapely-2.1.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.7 kB)
+Collecting albumentations
+  Downloading albumentations-2.0.8-py3-none-any.whl.metadata (43 kB)
+Collecting contourpy>=1.0.1 (from matplotlib)
+  Downloading contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (5.5 kB)
+Collecting cycler>=0.10 (from matplotlib)
+  Downloading cycler-0.12.1-py3-none-any.whl.metadata (3.8 kB)
+Collecting fonttools>=4.22.0 (from matplotlib)
+  Downloading fonttools-4.59.0-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl.metadata (107 kB)
+Collecting kiwisolver>=1.3.1 (from matplotlib)
+  Downloading kiwisolver-1.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (6.3 kB)
+Collecting packaging>=20.0 (from matplotlib)
+  Downloading packaging-25.0-py3-none-any.whl.metadata (3.3 kB)
+Requirement already satisfied: pillow>=8 in /home/sysgen/anaconda3/envs/obbpose11/lib/python3.12/site-packages (from matplotlib) (11.0.0)
+Collecting pyparsing>=2.3.1 (from matplotlib)
+  Downloading pyparsing-3.2.3-py3-none-any.whl.metadata (5.0 kB)
+Collecting python-dateutil>=2.7 (from matplotlib)
+  Downloading python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+Collecting scipy>=1.10.0 (from albumentations)
+  Downloading scipy-1.16.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (61 kB)
+Collecting pydantic>=2.9.2 (from albumentations)
+  Downloading pydantic-2.11.7-py3-none-any.whl.metadata (67 kB)
+Collecting albucore==0.0.24 (from albumentations)
+  Downloading albucore-0.0.24-py3-none-any.whl.metadata (5.3 kB)
+Collecting stringzilla>=3.10.4 (from albucore==0.0.24->albumentations)
+  Downloading stringzilla-3.12.6-cp312-cp312-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_28_x86_64.whl.metadata (80 kB)
+Collecting simsimd>=5.9.2 (from albucore==0.0.24->albumentations)
+  Downloading simsimd-6.5.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (70 kB)
+Collecting annotated-types>=0.6.0 (from pydantic>=2.9.2->albumentations)
+  Downloading annotated_types-0.7.0-py3-none-any.whl.metadata (15 kB)
+Collecting pydantic-core==2.33.2 (from pydantic>=2.9.2->albumentations)
+  Downloading pydantic_core-2.33.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.8 kB)
+Requirement already satisfied: typing-extensions>=4.12.2 in /home/sysgen/anaconda3/envs/obbpose11/lib/python3.12/site-packages (from pydantic>=2.9.2->albumentations) (4.12.2)
+Collecting typing-inspection>=0.4.0 (from pydantic>=2.9.2->albumentations)
+  Downloading typing_inspection-0.4.1-py3-none-any.whl.metadata (2.6 kB)
+Collecting six>=1.5 (from python-dateutil>=2.7->matplotlib)
+  Downloading six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+Downloading opencv_python_headless-4.10.0.84-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (49.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 49.9/49.9 MB 109.5 MB/s  0:00:00
+Downloading PyYAML-6.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (767 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 767.5/767.5 kB 191.3 MB/s  0:00:00
+Downloading tqdm-4.67.1-py3-none-any.whl (78 kB)
+Downloading matplotlib-3.10.5-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (8.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.7/8.7 MB 108.0 MB/s  0:00:00
+Downloading shapely-2.1.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (3.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.1/3.1 MB 112.2 MB/s  0:00:00
+Downloading albumentations-2.0.8-py3-none-any.whl (369 kB)
+Downloading albucore-0.0.24-py3-none-any.whl (15 kB)
+Downloading contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (362 kB)
+Downloading cycler-0.12.1-py3-none-any.whl (8.3 kB)
+Downloading fonttools-4.59.0-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl (4.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.9/4.9 MB 107.6 MB/s  0:00:00
+Downloading kiwisolver-1.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (1.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.5/1.5 MB 106.0 MB/s  0:00:00
+Downloading packaging-25.0-py3-none-any.whl (66 kB)
+Downloading pydantic-2.11.7-py3-none-any.whl (444 kB)
+Downloading pydantic_core-2.33.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (2.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.0/2.0 MB 123.9 MB/s  0:00:00
+Downloading annotated_types-0.7.0-py3-none-any.whl (13 kB)
+Downloading pyparsing-3.2.3-py3-none-any.whl (111 kB)
+Downloading python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
+Downloading scipy-1.16.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (35.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 35.2/35.2 MB 98.4 MB/s  0:00:00
+Downloading simsimd-6.5.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (1.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.1/1.1 MB 131.0 MB/s  0:00:00
+Downloading six-1.17.0-py2.py3-none-any.whl (11 kB)
+Downloading stringzilla-3.12.6-cp312-cp312-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_28_x86_64.whl (308 kB)
+Downloading typing_inspection-0.4.1-py3-none-any.whl (14 kB)
+Installing collected packages: stringzilla, simsimd, typing-inspection, tqdm, six, shapely, scipy, pyyaml, pyparsing, pydantic-core, packaging, opencv-python-headless, kiwisolver, fonttools, cycler, contourpy, annotated-types, python-dateutil, pydantic, albucore, matplotlib, albumentations
+
+Successfully installed albucore-0.0.24 albumentations-2.0.8 annotated-types-0.7.0 contourpy-1.3.3 cycler-0.12.1 fonttools-4.59.0 kiwisolver-1.4.9 matplotlib-3.10.5 opencv-python-headless-4.10.0.84 packaging-25.0 pydantic-2.11.7 pydantic-core-2.33.2 pyparsing-3.2.3 python-dateutil-2.9.0.post0 pyyaml-6.0.2 scipy-1.16.1 shapely-2.1.1 simsimd-6.5.0 six-1.17.0 stringzilla-3.12.6 tqdm-4.67.1 typing-inspection-0.4.1
