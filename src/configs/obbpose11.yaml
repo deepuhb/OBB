@@ -37,7 +37,7 @@ decode:
 
 eval:
   interval: 1
-  score_thresh: 0.25
+  score_thresh: 0.3
   iou_thr: 0.5           # start loose; raise to 0.5 later
   pck_tau: 0.10          # start loose; tighten to 0.05 later
   max_det: 300
