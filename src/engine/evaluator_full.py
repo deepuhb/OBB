@@ -602,7 +602,7 @@ class EvaluatorFull:
             "tps": int(np.sum(all_matches)),
             "pred_per_img": pred_per_img,
             "images": total_images,
-            "best_iou": best_iou_global,
+            "best_iou": min(best_iou_global, 1.0),
         }
         # append recall statistics
         for thr in self.recall_thresholds:

@@ -1,155 +1,115 @@
 # src/data/build.py
 from __future__ import annotations
-import math
-import os
-from typing import Optional, Tuple
+from types import SimpleNamespace
+from typing import Tuple, Optional
 
-import torch
-import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler, Subset
-from src.data.datasets import YoloObbKptDataset
+from torch.utils.data import DataLoader, DistributedSampler
 
-# ------------------------- DDP helpers -------------------------
-
-def is_dist() -> bool:
-    return dist.is_available() and dist.is_initialized()
-
-def get_world_size() -> int:
-    return dist.get_world_size() if is_dist() else 1
-
-def get_rank() -> int:
-    return dist.get_rank() if is_dist() else 0
+from src.data.datasets import YoloObbKptDataset          # your dataset
+from src.data.mosaic_wrapper import AugmentingDataset    # augmentation wrapper
 
 
-# ------------------------- seeding (workers) -------------------------
+def _yaml(cfg, path: str, default=None):
+    """Nested getattr with dot-paths, e.g. _yaml(cfg, 'data.img_size', 768)."""
+    cur = cfg
+    for key in path.split("."):
+        if not hasattr(cur, key):
+            return default
+        cur = getattr(cur, key)
+    return cur
 
-def _seed_worker(worker_id: int):
-    """Make dataloader workers deterministically seeded."""
-    worker_seed = torch.initial_seed() % 2**32
-    import random, numpy as np
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
 
-
-# ------------------------- small utils -------------------------
-
-def _maybe_subset(ds: torch.utils.data.Dataset, n: Optional[int]) -> torch.utils.data.Dataset:
-    """Return first N samples as a Subset if n is set and ds is larger."""
-    if n is None or n <= 0:
-        return ds
-    n = min(n, len(ds))
-    return Subset(ds, list(range(n)))
-
-def _has_split_dirs(root: str, split: str) -> bool:
-    """
-    Check if a YOLO-style split exists under root:
-      images/{split}/..., labels/{split}/...
-    This is a *soft* check; the dataset class still validates paths/files.
-    """
-    img_dir = os.path.join(root, "images", split)
-    lab_dir = os.path.join(root, "labels", split)
-    return os.path.isdir(img_dir) and os.path.isdir(lab_dir)
-
-def collate(batch):
-    imgs = [b["image"] for b in batch]
-    out = {"image": torch.stack(imgs, 0)}
-    for k in ("boxes", "quads", "kpts", "angles", "labels", "orig_size"):
-        out[k] = [b[k] for b in batch]
-    return out
+def _yaml_names(cfg) -> list[str]:
+    n = _yaml(cfg, "data.names", []) or []
+    return list(n)
 
 
 def build_dataloaders(
-    cfg,
+    cfg: SimpleNamespace,
     batch_per_device: int,
     workers: int,
-    overfit_n: Optional[int] = None,
-    rank: int = 0,
-    world_size: int = 1,
-):
+    overfit_n: Optional[int],
+    rank: int,
+    world_size: int,
+) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler]]:
     """
-    Build train/val dataloaders (DDP-friendly) with optional overfit/debug subsetting.
-
-    Args:
-        cfg: SimpleNamespace (loaded YAML)
-        batch_per_device: batch size per *process/GPU*
-        workers: dataloader workers
-        overfit_n: if set, restrict train/val to first N samples (for debugging)
-        rank/world_size: DDP info
-
-    Returns:
-        train_loader, val_loader, train_sampler
+    Build train/val dataloaders. Compatible with datasets that only accept (root, split, img_size).
+    We DO NOT pass unsupported kwargs like overfit_n/mode/pin_memory.
     """
-    root = cfg.data.root
-    img_size = int(cfg.data.img_size)
-    pin = bool(getattr(cfg.data, "pin_memory", True))
+    # ---- config bits ----
+    root = _yaml(cfg, "data.root", "datasets")
+    train_split = _yaml(cfg, "data.train", "train")
+    val_split = _yaml(cfg, "data.val", "val")
+    img_size = int(_yaml(cfg, "data.img_size", 768))
+    pin_memory = bool(_yaml(cfg, "data.pin_memory", True))
+    yaml_names = _yaml_names(cfg)
+    yaml_nc = len(yaml_names) if yaml_names else int(_yaml(cfg, "data.nc", 1))
 
-    # Determine split availability
-    tr_split = "train" if _has_split_dirs(root, "train") else None
-    va_split = "val" if _has_split_dirs(root, "val") else None
+    # ---- construct base datasets with only safe args ----
+    train_base = YoloObbKptDataset(root=root, split=train_split, img_size=img_size)
+    val_ds = YoloObbKptDataset(root=root, split=val_split, img_size=img_size)
 
-    # Datasets
-    tr_ds = YoloObbKptDataset(root, split=tr_split, img_size=img_size)
-    va_ds = YoloObbKptDataset(root, split=va_split, img_size=img_size)
+    # ---- push names/nc onto datasets AFTER construction (if provided) ----
+    if yaml_names:
+        try:
+            train_base.names = list(yaml_names)
+            val_ds.names = list(yaml_names)
+        except Exception:
+            pass
+    try:
+        train_base.nc = yaml_nc
+        val_ds.nc = yaml_nc
+    except Exception:
+        pass
 
-    # Fallbacks if a declared split is empty
-    if len(tr_ds) == 0:
-        tr_ds = YoloObbKptDataset(root, split=None, img_size=img_size)
-    if len(va_ds) == 0:
-        # If val absent, use a small slice of train as "val" to keep pipeline valid.
-        if len(tr_ds) > 0:
-            va_ds = _maybe_subset(tr_ds, min(128, len(tr_ds)))
-        else:
-            va_ds = YoloObbKptDataset(root, split=None, img_size=img_size)
+    # ---- wrap train dataset with augmentations (mosaic + flips + HSV) ----
+    trn = getattr(cfg, "train", SimpleNamespace())
+    train_ds = AugmentingDataset(
+        base=train_base,
+        mosaic=bool(getattr(trn, "mosaic", True)),
+        mosaic_prob=float(getattr(trn, "mosaic_prob", 0.5)),
+        fliplr=float(getattr(trn, "fliplr", 0.5)),
+        flipud=float(getattr(trn, "flipud", 0.0)),
+        hsv_h=float(getattr(trn, "hsv_h", 0.015)),
+        hsv_s=float(getattr(trn, "hsv_s", 0.7)),
+        hsv_v=float(getattr(trn, "hsv_v", 0.4)),
+    )
 
-    # Optional overfit/debug subset (apply *before* creating samplers)
-    if overfit_n is not None and overfit_n > 0:
-        tr_ds = _maybe_subset(tr_ds, overfit_n)
-        va_ds = _maybe_subset(va_ds, max(1, min(overfit_n // 4, len(va_ds))))
-
-    # Samplers
-    if world_size > 1 and is_dist():
-        tr_samp = DistributedSampler(tr_ds, num_replicas=world_size, rank=rank,
-                                     shuffle=True, drop_last=False)
-        va_samp = DistributedSampler(va_ds, num_replicas=world_size, rank=rank,
-                                     shuffle=False, drop_last=False)
-        tr_shuffle = False
+    # ---- optional DistributedSampler ----
+    if world_size > 1:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     else:
-        tr_samp = None
-        va_samp = None
-        tr_shuffle = True
+        train_sampler = None
+        val_sampler = None
 
-    persistent = workers > 0
-    g = torch.Generator()
-    # Use a rank-unique seed so each worker stream is deterministic but disjoint
-    g.manual_seed(3407 + rank)
+    # ---- pick collate_fns if exposed by base datasets ----
+    collate_train = getattr(train_base, "collate_fn", None)
+    collate_val = getattr(val_ds, "collate_fn", None)
 
-    # Loaders
+    # ---- dataloaders ----
     train_loader = DataLoader(
-        tr_ds,
+        train_ds,
         batch_size=batch_per_device,
-        shuffle=tr_shuffle,
-        sampler=tr_samp,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=int(workers),
-        pin_memory=pin,
-        persistent_workers=persistent,
-        collate_fn=collate,
+        pin_memory=pin_memory,
         drop_last=False,
-        worker_init_fn=_seed_worker,
-        generator=g,
-    )
-    # Keep val batch reasonably large but at least 1
-    val_loader = DataLoader(
-        va_ds,
-        batch_size=max(1, batch_per_device),
-        shuffle=False,
-        sampler=va_samp,
-        num_workers=max(0, int(workers) // 2),
-        pin_memory=pin,
-        persistent_workers=persistent,
-        collate_fn=collate,
-        drop_last=False,
-        worker_init_fn=_seed_worker,
-        generator=g,
+        persistent_workers=bool(workers > 0),
+        collate_fn=collate_train,
     )
 
-    return train_loader, val_loader, tr_samp
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_per_device,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=int(workers),
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=bool(workers > 0),
+        collate_fn=collate_val,
+    )
+
+    return train_loader, val_loader, train_sampler

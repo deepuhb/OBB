@@ -129,6 +129,11 @@ class Trainer:
             if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
                 train_sampler.set_epoch(epoch)
 
+            # >>> Disable mosaic in the last 10% of training epochs <<<
+            if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_mosaic_active"):
+                cutoff = int(0.9 * self.epochs)
+                train_loader.dataset.set_mosaic_active(epoch < cutoff)
+
             model.train()
             if device.startswith("cuda"):
                 torch.cuda.reset_peak_memory_stats()

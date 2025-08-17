@@ -11,7 +11,7 @@ import torch
 from torch.backends import cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 import yaml
 
 # --- project imports ---
@@ -190,7 +190,7 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
 # ---------------------------- main ----------------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser("OBB-Pose11 training")
+    ap = argparse.ArgumentParser("OBB-Pose11 training (YOLO11-style LR, no torch schedulers)")
     ap.add_argument("--cfg", type=str, default="src/configs/obbpose11.yaml", help="YAML config path")
     ap.add_argument("--batch", type=int, default=None, help="batch size (interpreted by --batch_mode)")
     ap.add_argument("--batch_mode", type=str, default=None, choices=["per_device", "total"])
@@ -282,7 +282,7 @@ def main():
     warmup_epochs = float(getattr(tr, "warmup_epochs", 3.0))
     warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))  # as a fraction of base
 
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler("cuda", enabled=use_amp)
     evaluator = EvaluatorFull(
         cfg={"eval": {"score_thresh": 0.3, "nms_iou": 0.5, "iou_thr": 0.5,
                       "pck_tau": 0.05, "max_det": 100},
@@ -309,6 +309,9 @@ def main():
     )
 
     trainer.fit(train_loader, val_loader, evaluator, train_sampler=train_sampler)
+
+    metrics = evaluator.evaluate(model, val_loader, device='cuda')
+    print(metrics)
 
     maybe_barrier()
     cleanup()

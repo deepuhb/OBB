@@ -22,6 +22,8 @@ loss:
   lambda_cls: 1.0
   pos_obj_weight: 1.0
   soft_obj_warmup_epochs: 2
+  kpt_freeze_epochs: 5
+  kpt_warmup_epochs: 5
   assign_4_neighbors: true
   box_loss_type: "giou"   # "iou" or "giou"
 
@@ -56,6 +58,13 @@ train:
   save_dir: "runs/exp"
   monitor: "map50"
   monitor_mode: "max"
+  mosaic: true
+  mosaic_prob: 0.5
+  fliplr: 0.5
+  flipud: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
 
 ddp:
   distributed: true
