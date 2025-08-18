@@ -53,207 +53,72 @@ def _split_targets_by_image(t: torch.Tensor, B: int, device: torch.device):
         boxes_list.append(b); labels_list.append(l); kpts_list.append(k)
     return boxes_list, labels_list, kpts_list
 
-def _extract_gt_lists_from_batch(batch: Dict[str, Any], B: int, device: torch.device):
-    """
-    Returns per-image GT (length B):
-      boxes_list[i]  : (Ni,5)  (cx,cy,w,h,ang_rad) in PIXELS
-      labels_list[i] : (Ni,)
-      kpts_list[i]   : (Ni,2)  in PIXELS (1 keypoint supported here)
-
-    Priority:
-      1) use batch['bboxes']/['labels']/['kpts'] if they contain any instances
-      2) else parse batch['targets'] in multiple tolerated formats
-    """
-
-    def empty_boxes():  return torch.zeros((0,5), dtype=torch.float32, device=device)
-    def empty_labels(): return torch.zeros((0,),  dtype=torch.long,   device=device)
-    def empty_kpts():   return torch.zeros((0,2), dtype=torch.float32, device=device)
-
-    # Image size for de-normalization
-    H = W = None
-    imgs = batch.get('image', None)
-    if torch.is_tensor(imgs) and imgs.ndim >= 4:
-        H, W = int(imgs.shape[-2]), int(imgs.shape[-1])
-    elif isinstance(imgs, list) and imgs and torch.is_tensor(imgs[0]):
-        H, W = int(imgs[0].shape[-2]), int(imgs[0].shape[-1])
-
-    boxes_list  = [empty_boxes()  for _ in range(B)]
-    labels_list = [empty_labels() for _ in range(B)]
-    kpts_list   = [empty_kpts()   for _ in range(B)]
-
-    # ---------- 1) prefer per-image lists if they have any instances ----------
-    boxes_in  = batch.get('bboxes', None)
-    labels_in = batch.get('labels', None)
-    kpts_in   = batch.get('kpts',   None)
-
-    def total_instances(lst) -> int:
-        if not isinstance(lst, (list, tuple)): return 0
-        tot = 0
-        for x in lst:
-            if torch.is_tensor(x):         tot += int(x.shape[0]) if x.ndim >= 2 else 0
-            elif isinstance(x, (list,tuple)): tot += len(x)
-        return tot
-
-    use_per_image = (
-        isinstance(boxes_in,  (list,tuple)) and
-        isinstance(labels_in, (list,tuple)) and
-        total_instances(boxes_in) > 0
-    )
-
-    if use_per_image:
-        for i in range(B):
-            bx = boxes_in[i] if i < len(boxes_in) else None
-            lb = labels_in[i] if i < len(labels_in) else None
-            kp = (kpts_in[i] if isinstance(kpts_in,(list,tuple)) and i < len(kpts_in) else None)
-
-            if torch.is_tensor(bx) and bx.numel():
-                bx = bx.to(device=device, dtype=torch.float32).reshape(-1, bx.shape[-1])
-                if   bx.shape[-1] > 5: bx = bx[:, :5]
-                elif bx.shape[-1] < 5:
-                    z = torch.zeros((bx.size(0),5), dtype=torch.float32, device=device)
-                    z[:, :bx.shape[1]] = bx
-                    bx = z
-                boxes_list[i] = bx
-            if torch.is_tensor(lb) and lb.numel():
-                labels_list[i] = lb.to(device=device, dtype=torch.long).reshape(-1)
-            if torch.is_tensor(kp) and kp.numel():
-                kp = kp.to(device=device, dtype=torch.float32).reshape(-1, kp.shape[-1])
-                kpts_list[i] = kp[:, :2] if kp.shape[-1] >= 2 else kpts_list[i]
-        return boxes_list, labels_list, kpts_list
-
-    # ---------- 2) robust fallback: parse batch['targets'] ----------
-    targets = batch.get('targets', None)
-    if targets is None:
-        return boxes_list, labels_list, kpts_list
-
-    # helpers
-    def denorm_xy(x, y):
-        if H is None or W is None:
-            return float(x), float(y)
-        return float(x) * W, float(y) * H
-
-    def poly4_to_obb_deg(pts_px: np.ndarray):
-        (x1,y1),(x2,y2),(x3,y3),(x4,y4) = pts_px.astype(np.float32)
-        cx = (x1 + x2 + x3 + x4) * 0.25
-        cy = (y1 + y2 + y3 + y4) * 0.25
-        w  = float(math.hypot(x2 - x1, y2 - y1))
-        h  = float(math.hypot(x3 - x2, y3 - y2))
-        ang_deg = math.degrees(math.atan2(y2 - y1, x2 - x1))
-        return cx, cy, max(w,1.0), max(h,1.0), ang_deg
-
-    def parse_rows_tensor(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Accept a tensor of shape (N,M).
-        Supported M:
-          11: cls + 8 poly + 2 kpt (normalized)
-          12: img_idx + cls + 8 poly + 2 kpt (normalized)  -> img_idx handled outside
-          6/7: cls + cx,cy,w,h,(ang)  (cxcywh normalized if <=1.5 else pixels; ang rad if |ang|<=~pi*1.5 else deg)
-        Returns boxes(N,5 rad pixels), labels(N,), kpts(N,2 pixels)
-        """
-        t = t.to(device=device, dtype=torch.float32).reshape(-1, t.shape[-1])
-        M = t.shape[-1]
-        if M == 11:
-            cls = t[:, 0].to(torch.long)
-            poly = t[:, 1:9].view(-1, 4, 2)
-            kxy  = t[:, 9:11]
-            obbs, kpts = [], []
-            for P, K in zip(poly, kxy):
-                pts_px = np.array([denorm_xy(P[i,0].item(), P[i,1].item()) for i in range(4)], dtype=np.float32)
-                cx,cy,w,h,ang_deg = poly4_to_obb_deg(pts_px)
-                obbs.append([cx,cy,w,h, math.radians(ang_deg)])
-                kx,ky = denorm_xy(K[0].item(), K[1].item())
-                kpts.append([kx,ky])
-            return (torch.tensor(obbs, dtype=torch.float32, device=device),
-                    cls.reshape(-1),
-                    torch.tensor(kpts, dtype=torch.float32, device=device))
-        elif M == 6 or M == 7:
-            # cls, cx,cy,w,h,(ang). Center/size likely normalized; detect.
-            cls = t[:, 0].to(torch.long)
-            cx, cy, w, h = t[:, 1], t[:, 2], t[:, 3], t[:, 4]
-            # heuristic: if values look normalized, denorm them
-            if torch.max(torch.stack([cx.abs(), cy.abs(), w.abs(), h.abs()])) <= 1.5 and H and W:
-                cx, cy = cx * W, cy * H
-                w,  h  = w * W,  h * H
-            if M == 7:
-                ang = t[:, 5]
-                # detect deg vs rad
-                ang = torch.where(ang.abs() > math.pi * 1.5, torch.deg2rad(ang), ang)
-            else:
-                ang = torch.zeros_like(cx)
-            obb = torch.stack([cx, cy, w.clamp_min(1.0), h.clamp_min(1.0), ang], dim=1)
-            # no kpt provided -> default to box center (ok for loss gating)
-            kpt = torch.stack([cx, cy], dim=1)
-            return obb, cls.reshape(-1), kpt
+def _to_list_of_tensors(seq, device, dtype):
+    out = []
+    for x in seq:
+        if x is None:
+            out.append(torch.zeros(0, dtype=dtype, device=device))
+        elif torch.is_tensor(x):
+            out.append(x.to(device=device, dtype=dtype))
         else:
-            # Unsupported width
-            return empty_boxes(), empty_labels(), empty_kpts()
+            out.append(torch.as_tensor(x, device=device, dtype=dtype))
+    return out
 
-    def parse_maybe_line(line: Union[str, List[float], np.ndarray, torch.Tensor]) -> torch.Tensor:
-        if torch.is_tensor(line):
-            return line
-        if isinstance(line, (list, tuple, np.ndarray)):
-            arr = np.asarray(line, dtype=np.float32).reshape(1, -1)
-            return torch.tensor(arr, dtype=torch.float32, device=device)
-        if isinstance(line, str):
-            vals = [float(v) for v in line.strip().split()]
-            arr = np.asarray(vals, dtype=np.float32).reshape(1, -1)
-            return torch.tensor(arr, dtype=torch.float32, device=device)
-        return torch.zeros((0,11), dtype=torch.float32, device=device)
-
-    # targets can be per-image list OR single big tensor (with img_idx)
-    if isinstance(targets, (list, tuple)):
-        for i in range(min(B, len(targets))):
-            ti = targets[i]
-            if ti is None:
-                continue
-            if isinstance(ti, (list, tuple)) and ti and not torch.is_tensor(ti):
-                # list of rows/lines
-                rows = [parse_maybe_line(r) for r in ti]
-                if len(rows):
-                    T = torch.cat(rows, dim=0)
-                else:
-                    T = torch.zeros((0,11), dtype=torch.float32, device=device)
-            else:
-                T = parse_maybe_line(ti)
-            if T.numel() == 0:
-                continue
-            if T.size(1) == 12:
-                # drop img_idx column for per-image path
-                T = T[:, 1:]
-            bx, lb, kp = parse_rows_tensor(T)
-            boxes_list[i], labels_list[i], kpts_list[i] = bx, lb, kp
+def _extract_gt_lists_from_batch(batch, B, device):
+    """
+    Prefer dataset-prepared keys:
+      - 'bboxes' : (Ni,5) [cx,cy,w,h,theta_rad] in pixels
+      - 'labels' : (Ni,)
+      - 'kpts'   : (Ni,2) in pixels
+    Fallback to 'targets' only if needed.
+    """
+    if "bboxes" in batch and "labels" in batch and "kpts" in batch:
+        boxes_list  = _to_list_of_tensors(batch["bboxes"], device, torch.float32)
+        labels_list = _to_list_of_tensors(batch["labels"], device, torch.long)
+        kpts_list   = _to_list_of_tensors(batch["kpts"],   device, torch.float32)
+        assert len(boxes_list) == B and len(labels_list) == B and len(kpts_list) == B, \
+            "GT lists must match batch size"
         return boxes_list, labels_list, kpts_list
 
-    if torch.is_tensor(targets):
-        T = targets.to(device=device, dtype=torch.float32)
-        if T.ndim == 2 and T.size(1) >= 12:
-            # img_idx + rest (normalized)
-            bix = T[:, 0].to(torch.long).clamp_(0, B-1)
-            rows = T[:, 1:]
-            for i in range(B):
-                sel = (bix == i)
-                if sel.any():
-                    bx, lb, kp = parse_rows_tensor(rows[sel])
-                    boxes_list[i], labels_list[i], kpts_list[i] = bx, lb, kp
-            return boxes_list, labels_list, kpts_list
-        elif T.ndim == 2 and (T.size(1) in (11,6,7)):
-            bx, lb, kp = parse_rows_tensor(T)
-            boxes_list[0], labels_list[0], kpts_list[0] = bx, lb, kp
-            return boxes_list, labels_list, kpts_list
+    # Fallback: parse 'targets' here if you still want to support it
+    if "targets" in batch and batch["targets"] is not None:
+        raise RuntimeError("Loss fell back to 'targets'. Either provide bboxes/labels/kpts or implement this branch.")
 
-    # final fallback: still nothing -> one-time concise debug
-    if not hasattr(_extract_gt_lists_from_batch, "_dbg_once"):
-        _extract_gt_lists_from_batch._dbg_once = True
-        try:
-            t0 = targets[0] if isinstance(targets,(list,tuple)) and len(targets) else targets
-            tinfo = f"type={type(t0)}"
-            if torch.is_tensor(t0): tinfo += f" shape={tuple(t0.shape)}"
-        except Exception:
-            tinfo = "uninspectable targets"
-        print(f"[extractor] could not parse targets; first item {tinfo}. "
-              f"Expected: 11 cols (cls+8poly+2kpt) or 12 (img_idx+...).")
-    return boxes_list, labels_list, kpts_list
+    # No GT available
+    z5 = torch.zeros(0, 5, device=device)
+    zc = torch.zeros(0,    device=device, dtype=torch.long)
+    zk = torch.zeros(0, 2, device=device)
+    return [z5]*B, [zc]*B, [zk]*B
 
+def _invert_affine_2x3(M: torch.Tensor) -> torch.Tensor:
+    # M: (2,3) mapping [u,v,1] (crop px) -> [x_feat,y_feat] (feature px)
+    # Return Minv: (2,3) mapping [x_feat,y_feat,1] -> [u,v] (crop px)
+    A = M[:, :2]   # (2,2)
+    t = M[:, 2:]   # (2,1)
+    det = A[0,0]*A[1,1] - A[0,1]*A[1,0]
+    if abs(float(det)) < 1e-12:
+        # degenerate; fall back to identity on SxS center
+        I = torch.tensor([[1.,0.,0.],[0.,1.,0.]], device=M.device, dtype=M.dtype)
+        return I
+    invA00 =  A[1,1]/det
+    invA01 = -A[0,1]/det
+    invA10 = -A[1,0]/det
+    invA11 =  A[0,0]/det
+    invA = torch.stack([torch.stack([invA00, invA01]),
+                        torch.stack([invA10, invA11])])
+    invt = -invA @ t
+    return torch.cat([invA, invt], dim=1)  # (2,3)
+
+def _img_kpts_to_crop_uv(kpt_xy_img: torch.Tensor,
+                         M_crop_to_feat: torch.Tensor,
+                         feat_down: float) -> torch.Tensor:
+    # kpt_xy_img: (N,2) in image px; M maps crop px → feature px
+    # Convert image px → feature px, then apply inverse M to get crop px (u,v)
+    xy_feat = kpt_xy_img / float(feat_down)
+    Minv = _invert_affine_2x3(M_crop_to_feat)
+    # [u,v]^T = Minv[:,:2] @ [x,y]^T + Minv[:,2]
+    uv = (Minv[:, :2] @ xy_feat.T + Minv[:, 2:]).T  # (N,2)
+    return uv
 
 
 class TDOBBWKpt1Criterion(nn.Module):
@@ -471,9 +336,6 @@ class TDOBBWKpt1Criterion(nn.Module):
 
         return total_box, total_ang, total_obj, total_cls
 
-    # ---------------------------------------------------------
-    # Keypoint loss hook (optional)
-    # ---------------------------------------------------------
 
     def _predict_kpts_from_feats(self, model, feats, pos_meta):
         """
@@ -486,40 +348,79 @@ class TDOBBWKpt1Criterion(nn.Module):
             return preds
         return out
 
-    def _loss_kpt(
-        self,
-        model: Optional[nn.Module],
-        feats: Optional[List[torch.Tensor]],
-        pos_meta: List[Tuple[int, int, int, int, float, float, float, float, float]],
-        kpts_list: List[torch.Tensor],   # per-image (Ni,2) targets in absolute pixels
-    ):
+    def _loss_kpt(self, model, feats, pos_meta, kpts_list):
         """
-        Compute L1 loss between predicted kpts and GT for positives (if model head available).
-        Returns (loss, n_pos).
+        Compute keypoint loss. If no detection-based ROIs exist,
+        fall back to GT boxes so kpt head still trains.
         """
-        device = feats[0].device if (feats and len(feats)) else \
-                 (kpts_list[0].device if len(kpts_list) else torch.device("cpu"))
-        preds = self._predict_kpts_from_feats(model, feats, pos_meta)
-        if preds is None:
+        device = feats[0].device if isinstance(feats, (list, tuple)) else feats.device
+        S = getattr(model.roi, "S", 64)  # crop size
+        feat_down = getattr(model.roi, "feat_down", 8)  # stride used by ROI
+        kpt_weight = getattr(self, "lambda_kpt", 1.0)
+
+        # 1) Try detection positives → ROIs
+        uv_pred, metas = model.kpt_from_obbs(feats, pos_meta)  # should return (N,2), [dict{bix,M}, ...]
+        num_rois = uv_pred.shape[0] if torch.is_tensor(uv_pred) else 0
+
+        # 2) Fallback: build GT OBBs (in IMAGE px, ANGLE IN DEGREES) and crop
+        if num_rois == 0:
+            obb_list = []
+            for b, (boxes_b, kpts_b) in enumerate(zip(self._boxes_list, kpts_list)):
+                if boxes_b is None or boxes_b.numel() == 0:
+                    obb_list.append(torch.zeros((0, 5), device=device))
+                    continue
+                obb_b = boxes_b.clone().to(device)  # (Ni,5) cx,cy,w,h,theta_rad
+                obb_b[:, 4] = obb_b[:, 4] * (180.0 / math.pi)  # rad → deg **important**
+                obb_list.append(obb_b)
+            uv_pred, metas = model.kpt_from_obbs(feats, obb_list)
+            num_rois = uv_pred.shape[0] if torch.is_tensor(uv_pred) else 0
+
+        if num_rois == 0:
+            # Nothing to train on this step
             return torch.zeros((), device=device), 0
 
-        total = torch.zeros((), device=device)
-        npos = 0
-
-        # Group by image index (pos_meta is appended in order)
-        # We simply compare per-image in given order; if counts mismatch, align by min(N_gt, N_pred)
-        for i, (gt_k, pred_k) in enumerate(zip(kpts_list, preds)):
-            if gt_k.numel() == 0 or pred_k is None or pred_k.numel() == 0:
+        # 3) Build GT uv targets per ROI
+        # metas: list of dicts {'bix': int, 'M': (2,3)}
+        uv_tgt = torch.zeros_like(uv_pred, device=device)
+        valid = torch.zeros((num_rois,), dtype=torch.bool, device=device)
+        idx = 0
+        for m in metas:
+            b = int(m.get('b', m.get('bix', 0)))
+            M = m['M'].to(device=device, dtype=uv_pred.dtype)
+            # choose the first kpt for that object (dataset has 1 kpt per OBB)
+            # If you have multiple objs per image, align via the same index order:
+            # here we use a nearest match by center for simplicity.
+            if b >= len(kpts_list) or kpts_list[b].numel() == 0:
+                idx += 1
                 continue
-            n = min(gt_k.shape[0], pred_k.shape[0])
-            if n <= 0:
-                continue
-            total = total + F.l1_loss(pred_k[:n], gt_k[:n], reduction="mean")
-            npos += n
+            kpts_b = kpts_list[b]  # (Ni,2) in image px
+            # nearest by center from M center (optional improvement)
+            # Map all GT kpts to crop uv and take the closest to crop center
+            uv_all = _img_kpts_to_crop_uv(kpts_b, M, feat_down)  # (Ni,2) in crop px
+            # Clamp inside crop
+            uv_all = torch.clamp(uv_all, 0, S - 1)
+            # Pick the closest GT to the crop center (S/2,S/2)
+            d2 = (uv_all[:, 0] - (S / 2)) ** 2 + (uv_all[:, 1] - (S / 2)) ** 2
+            j = int(torch.argmin(d2).item())
+            uv_tgt[idx] = uv_all[j]
+            valid[idx] = True
+            idx += 1
 
-        if npos == 0:
+        if not valid.any():
             return torch.zeros((), device=device), 0
-        return total, npos
+
+        uv_pred_v = uv_pred[valid]
+        uv_tgt_v = uv_tgt[valid]
+
+        l_kpt = F.smooth_l1_loss(uv_pred_v, uv_tgt_v, reduction='mean')
+
+        if not hasattr(self, "_kpt_dbg_once"):
+            self._kpt_dbg_once = True
+            print(f"[kpt] ROIs {num_rois}, valid {int(valid.sum())}, "
+                  f"l_kpt_raw {float(l_kpt.detach().item()):.4f}, weight {kpt_weight}")
+
+        # Return raw loss (weighting applied at caller)
+        return l_kpt, int(valid.sum())
 
     def forward(
         self,
@@ -529,8 +430,6 @@ class TDOBBWKpt1Criterion(nn.Module):
         model: Optional[nn.Module] = None,
         epoch: Optional[int] = None
     ):
-
-
         """Compute total loss and a dict of logs."""
         # ensure list of levels
         if isinstance(det_maps, torch.Tensor):
@@ -545,16 +444,23 @@ class TDOBBWKpt1Criterion(nn.Module):
 
         # Extract GT lists (robust to presence/absence of 'kpts')
         boxes_list, labels_list, kpts_list = _extract_gt_lists_from_batch(batch, B, device)
-
-        # sanity check-----
-        gt_total = sum(b.size(0) for b in boxes_list)
-        if epoch == 0 and gt_total == 0:
-            print("[loss] no GT after extractor — check 'targets' format (expect 11 cols: cls + 8 poly + 2 kpt)")
-
-
+        self._boxes_list = boxes_list  # for GT fallback in _loss_kpt
 
         # Build multi-scale targets
         targets, pos_meta = self._build_targets(det_maps, boxes_list, labels_list)
+
+        # --- count positives across all levels ---
+        pos_total = 0
+        for T in targets:  # each T has T["mask"] : (B,1,H,W) bool
+            pos_total += int(T["mask"].sum().item())
+
+        # batch size
+        if isinstance(batch.get("image", None), torch.Tensor):
+            B = int(batch["image"].shape[0])
+        else:
+            B = len(boxes_list)
+
+        pos_per_img = pos_total / max(B, 1)
 
         # Detection losses
         l_box, l_ang, l_obj, l_cls = self._loss_det(det_maps, targets)
@@ -577,25 +483,24 @@ class TDOBBWKpt1Criterion(nn.Module):
 
         # Weighted sum
         total = (
-            self.lambda_box * l_box +
-            self.lambda_ang * l_ang +
-            self.lambda_obj * l_obj +
-            self.lambda_cls * l_cls +
-            self.lambda_kpt * kpt_scale * l_kpt
+                self.lambda_box * l_box +
+                self.lambda_ang * l_ang +
+                self.lambda_obj * l_obj +
+                self.lambda_cls * l_cls +
+                self.lambda_kpt * kpt_scale * l_kpt
         )
 
         # Logs
         logs = {
-            "box_loss": float(l_box.detach().item()),
-            "obj_loss": float(l_obj.detach().item()),
-            "ang_loss": float(l_ang.detach().item()),
-            "kpt_loss": float((kpt_scale * l_kpt).detach().item()),
-            "kc_loss": 0.0,
-            "Pos": ...,
-            "box_loss_raw": l_box,
-            "obj_loss_raw": l_obj,
-            "ang_loss_raw": l_ang,
+            "loss_box": float(l_box.detach().item()),
+            "loss_obj": float(l_obj.detach().item()),
+            "loss_ang": float(l_ang.detach().item()),
+            "loss_kpt": float((kpt_scale * l_kpt).detach().item()),
+            "loss_kc": 0.0,
+            "loss_cls": float(l_cls.detach().item()) if isinstance(l_cls, torch.Tensor) else float(l_cls),
+            "num_pos": float(pos_per_img),
+
             "kpt_loss_raw": l_kpt * kpt_scale,
-            "kc_loss_raw": torch.tensor(0.0, device=device),
-            }
+        }
+
         return total, logs

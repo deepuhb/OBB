@@ -1,78 +1,120 @@
-# src/data/collate.py
-from typing import Any, Dict, List, Tuple, Union
-import torch
+import torch, numpy as np
+from typing import Any, Dict, List, Union
+from ..utils.box_ops import quad_to_cxcywh_angle
 
-def _can_stack(ts: List[torch.Tensor]) -> bool:
-    if not ts or not all(torch.is_tensor(t) for t in ts):
-        return False
-    s0, d0, dev0 = ts[0].shape, ts[0].dtype, ts[0].device
-    return all((t.shape == s0 and t.dtype == d0 and t.device == dev0) for t in ts[1:])
 
-def _empty(shape, dtype, device):
-    return torch.zeros(shape, dtype=dtype, device=device)
+def _to_tensor(x, dtype=None):
+    if torch.is_tensor(x):
+        return x if dtype is None else x.to(dtype=dtype)
+    if isinstance(x, np.ndarray):
+        t = torch.from_numpy(x)
+        return t if dtype is None else t.to(dtype=dtype)
+    if isinstance(x, (list, tuple)):
+        try:
+            return torch.tensor(x, dtype=dtype if dtype is not None else torch.float32)
+        except Exception:
+            return x  # leave as-is if heterogeneous
+    return x
 
-def collate_obbdet(batch: List[Union[Tuple[Any, Any], Dict[str, Any]]]) -> Dict[str, Any]:
-    # --- normalise to dict-per-sample ---
-    samples: List[Dict[str, Any]] = []
-    first = batch[0]
-    if isinstance(first, (tuple, list)) and len(first) == 2:
-        for img, tgt in batch:
-            d = {'image': img}
-            if isinstance(tgt, dict): d.update(tgt)
-            else: d['targets'] = tgt
-            samples.append(d)
-    elif isinstance(first, dict):
-        for d in batch:
-            d = dict(d)
-            if 'img' in d and 'image' not in d:
-                d['image'] = d.pop('img')
-            samples.append(d)
-    else:
-        samples = [{'image': x} for x in batch]
+def _ensure_targets(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Guarantee 'bboxes','labels','kpts' exist as tensors.
+       If 'bboxes' missing or not tensor, synthesize from 'quads' else 'boxes+angles'.
+    """
+    s = sample
 
-    # --- stack images ---
-    images = [s['image'] for s in samples]
-    images = torch.stack(images, 0) if _can_stack(images) else images  # expect stacked
-    device = images.device if torch.is_tensor(images) else torch.device('cpu')
-    out: Dict[str, Any] = {'image': images}
+    # Coerce common fields to tensors (if present)
+    if "labels" in s and not torch.is_tensor(s["labels"]):
+        s["labels"] = _to_tensor(s["labels"], dtype=torch.long)
+    if "kpts" in s and not torch.is_tensor(s["kpts"]):
+        s["kpts"] = _to_tensor(s["kpts"], dtype=torch.float32)
+    if "bboxes" in s and not torch.is_tensor(s["bboxes"]):
+        s["bboxes"] = _to_tensor(s["bboxes"], dtype=torch.float32)
 
-    # helper to pull a list and replace missing with empty tensors
-    def pull_list(name: str, empty_shape, dtype):
-        vals = []
-        for s in samples:
-            v = s.get(name, None)
-            if v is None:
-                vals.append(_empty(empty_shape, dtype, device))
-            else:
-                if torch.is_tensor(v):
-                    vals.append(v)
-                elif isinstance(v, (list, tuple)):
-                    # allow per-sample tensors or already empty
-                    if len(v) == 0:
-                        vals.append(_empty(empty_shape, dtype, device))
-                    else:
-                        # keep as is; extractor will tensorise
-                        vals.append(v)
+    # Synthesize bboxes if missing or empty/non-tensor
+    need_bboxes = ("bboxes" not in s) or (not torch.is_tensor(s["bboxes"]))
+    if not need_bboxes:
+        if s["bboxes"].ndim != 2 or s["bboxes"].shape[-1] != 5:
+            need_bboxes = True
+
+    if need_bboxes:
+        bboxes = None
+        # Prefer quads -> OBB
+        if "quads" in s:
+            q = s["quads"]
+            if not torch.is_tensor(q):
+                q = _to_tensor(q, dtype=torch.float32)
+            if torch.is_tensor(q) and q.numel() > 0:
+                q = q.view(-1, 4, 2).float()
+                obb = []
+                for i in range(q.shape[0]):
+                    cx, cy, w, h, th = quad_to_cxcywh_angle(q[i])  # th in radians
+                    obb.append([float(cx), float(cy), max(float(w),1.0), max(float(h),1.0), float(th)])
+                bboxes = torch.tensor(obb, dtype=torch.float32)
+
+        # Fallback: boxes + angles -> OBB
+        if bboxes is None and "boxes" in s:
+            bx = s["boxes"]
+            if not torch.is_tensor(bx):
+                bx = _to_tensor(bx, dtype=torch.float32)
+            if torch.is_tensor(bx) and bx.numel() > 0:
+                bx = bx.float()
+                cx = 0.5 * (bx[:, 0] + bx[:, 2])
+                cy = 0.5 * (bx[:, 1] + bx[:, 3])
+                w  = (bx[:, 2] - bx[:, 0]).clamp_min_(1.0)
+                h  = (bx[:, 3] - bx[:, 1]).clamp_min_(1.0)
+                ang = s.get("angles", None)
+                if ang is None or (not torch.is_tensor(ang)) or ang.numel() == 0:
+                    th = torch.zeros_like(cx)
                 else:
-                    vals.append(_empty(empty_shape, dtype, device))
-        return vals
+                    th = _to_tensor(ang, dtype=torch.float32).reshape(-1)
+                bboxes = torch.stack([cx, cy, w, h, th], dim=1)
 
-    # Provide per-image lists; use empty tensors when absent
-    out['bboxes'] = pull_list('bboxes', (0, 5), torch.float32)  # (cx,cy,w,h,ang) expected by loss (ang in radians)
-    out['labels'] = pull_list('labels', (0,),  torch.long)
-    out['kpts']   = pull_list('kpts',   (0, 2), torch.float32)  # 1 keypoint -> (Ni,2)
+        if bboxes is None:
+            bboxes = torch.zeros((0, 5), dtype=torch.float32)
 
-    # Keep optional raw YOLO-style 'targets' if your dataset provides it
+        s["bboxes"] = bboxes
 
-    tlist = []
-    for s in samples:
-        t = s.get('targets', None)
-        if t is None:
-            t = torch.zeros((0, 11), dtype=torch.float32)  # cls + 8 poly + 2 kpt
-        elif not torch.is_tensor(t):
-            t = torch.as_tensor(t, dtype=torch.float32)
-        tlist.append(t)
-    out['targets'] = tlist
-    out['paths']   = [s.get('paths', None) for s in samples]
-    out['meta']    = [s.get('meta',  None) for s in samples]
-    return out
+    # Final dtype guarantees
+    if "labels" not in s or not torch.is_tensor(s["labels"]):
+        s["labels"] = torch.zeros((0,), dtype=torch.long)
+    if "kpts" not in s or not torch.is_tensor(s["kpts"]):
+        s["kpts"] = torch.zeros((0, 2), dtype=torch.float32)
+
+    return s
+
+def _can_stack(lst):
+    if not lst or not all(torch.is_tensor(x) for x in lst):
+        return False
+    s0 = tuple(lst[0].shape)
+    return all(tuple(x.shape) == s0 for x in lst)
+
+def collate_obbdet(batch: List[Union[Dict[str, Any], tuple]]):
+    # Dict samples (your case)
+    if isinstance(batch[0], dict):
+        # --- New: pre-normalize each sample so targets are present and tensors ---
+        for i in range(len(batch)):
+            batch[i] = _ensure_targets(batch[i])
+
+        out: Dict[str, Any] = {}
+        keys = set().union(*(b.keys() for b in batch))
+        for k in keys:
+            vals = [b[k] for b in batch if k in b]
+            if k == "image":
+                out[k] = torch.stack(vals, dim=0)
+                continue
+            # AFTER — 'targets' is intentionally omitted
+            if k in ("bboxes", "boxes", "quads", "kpts", "labels", "angles",
+                     "paths", "meta", "metas", "pos_meta"):
+                out[k] = vals
+                continue
+            # If some wrapper insists on adding 'targets', drop it here:
+            if k == "targets":
+                continue
+
+            out[k] = torch.stack(vals, dim=0) if _can_stack(vals) else vals
+        return out
+
+    # Tuple fallback
+    imgs = [b[0] for b in batch]
+    tars = [b[1] for b in batch]
+    return torch.stack(imgs, dim=0), tars

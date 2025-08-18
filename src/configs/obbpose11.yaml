@@ -22,8 +22,8 @@ loss:
   lambda_cls: 1.0
   pos_obj_weight: 1.0
   soft_obj_warmup_epochs: 2
-  kpt_freeze_epochs: 5
-  kpt_warmup_epochs: 5
+  kpt_freeze_epochs: 0
+  kpt_warmup_epochs: 0
   assign_4_neighbors: true
   box_loss_type: "giou"   # "iou" or "giou"
 
@@ -40,7 +40,7 @@ decode:
 eval:
   interval: 1
   score_thresh: 0.3
-  iou_thr: 0.5           # start loose; raise to 0.5 later
+  iou_thr: 0.2           # start loose; raise to 0.5 later
   pck_tau: 0.10          # start loose; tighten to 0.05 later
   max_det: 300
   topk: 100
@@ -58,8 +58,8 @@ train:
   save_dir: "runs/exp"
   monitor: "map50"
   monitor_mode: "max"
-  mosaic: false
-  mosaic_prob: 0
+  mosaic: true
+  mosaic_prob: 0.5
   fliplr: 0.5
   flipud: 0.0
   hsv_h: 0.015

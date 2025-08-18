@@ -148,20 +148,6 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             for it, batch in enumerate(train_loader):
-                # in the first iteration of the train loop
-                if epoch == 0 and it == 0:
-                    print("batch keys:", batch.keys())
-                    print("image:", batch['image'].shape if torch.is_tensor(batch['image']) else type(batch['image']))
-                    print("bboxes lens:",
-                          [(None if x is None else (x.shape if torch.is_tensor(x) else len(x))) for x in
-                           batch['bboxes']])
-                    print("labels lens:",
-                          [(None if x is None else (x.shape if torch.is_tensor(x) else len(x))) for x in
-                           batch['labels']])
-                    print("kpts lens:",
-                          [(None if x is None else (x.shape if torch.is_tensor(x) else len(x))) for x in batch['kpts']])
-
-                # src/engine/trainer.py (inside the training loop)
                 batch = batch  # already dict from collate
                 imgs = batch['image']
                 if not torch.is_tensor(imgs):

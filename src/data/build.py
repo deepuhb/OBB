@@ -84,11 +84,6 @@ def build_dataloaders(
         train_sampler = None
         val_sampler   = None
 
-    # ---- choose collate_fns ----
-    # Prefer collate on the wrapper, else base dataset; fallback to robust default.
-    collate_train = getattr(train_ds,  "collate_fn", None) or getattr(train_base, "collate_fn", None) or collate_obbdet
-    collate_val   = getattr(val_ds,   "collate_fn", None) or collate_obbdet
-
     # ---- dataloaders ----
     train_loader = DataLoader(
         train_ds,
@@ -99,8 +94,9 @@ def build_dataloaders(
         pin_memory=pin_memory,
         drop_last=False,
         persistent_workers=bool(workers > 0),
-        collate_fn=collate_train,
+        collate_fn=collate_obbdet,
     )
+    print()
 
     val_loader = DataLoader(
         val_ds,
@@ -111,7 +107,7 @@ def build_dataloaders(
         pin_memory=pin_memory,
         drop_last=False,
         persistent_workers=bool(workers > 0),
-        collate_fn=collate_val,
+        collate_fn=collate_obbdet,
     )
 
     return train_loader, val_loader, train_sampler
