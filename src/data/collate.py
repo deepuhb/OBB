@@ -63,7 +63,16 @@ def collate_obbdet(batch: List[Union[Tuple[Any, Any], Dict[str, Any]]]) -> Dict[
     out['kpts']   = pull_list('kpts',   (0, 2), torch.float32)  # 1 keypoint -> (Ni,2)
 
     # Keep optional raw YOLO-style 'targets' if your dataset provides it
-    out['targets'] = [s.get('targets', None) for s in samples]
+
+    tlist = []
+    for s in samples:
+        t = s.get('targets', None)
+        if t is None:
+            t = torch.zeros((0, 11), dtype=torch.float32)  # cls + 8 poly + 2 kpt
+        elif not torch.is_tensor(t):
+            t = torch.as_tensor(t, dtype=torch.float32)
+        tlist.append(t)
+    out['targets'] = tlist
     out['paths']   = [s.get('paths', None) for s in samples]
     out['meta']    = [s.get('meta',  None) for s in samples]
     return out
