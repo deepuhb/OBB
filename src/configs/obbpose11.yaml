@@ -58,8 +58,8 @@ train:
   save_dir: "runs/exp"
   monitor: "map50"
   monitor_mode: "max"
-  mosaic: true
-  mosaic_prob: 0.5
+  mosaic: false
+  mosaic_prob: 0
   fliplr: 0.5
   flipud: 0.0
   hsv_h: 0.015

@@ -10,6 +10,7 @@ from torch.cuda.amp import GradScaler
 from torch.amp import autocast
 from tqdm import tqdm
 
+from src.models.losses.multi_noise_loss import MultiNoiseLoss
 
 def is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -50,10 +51,7 @@ class Trainer:
     Expects:
       - model(images) -> dict: {'det': det_maps, 'feats': feats}
       - criterion(det_maps, feats, batch, model=None, epoch=0) -> (loss, logs)
-      - evaluator.evaluate(model, val_loader, device, max_images=None) -> metrics dict
-        REQUIRED standard keys for logging: mAP50, mAP
-        Optional (recommended): pck@0.05, pck_any@0.05, recall@0.1, recall@0.3, recall@0.5,
-                                best_iou, tps, pred_per_img, images
+      - evaluator.evaluate(model, val_loader, device, max_images=None) -> metrics
     """
 
     def __init__(
@@ -97,14 +95,20 @@ class Trainer:
         self.warmup_epochs = float(warmup_epochs)
         self.warmup_lr_init = float(warmup_lr_init)
         self.global_update = 0  # counts optimizer updates across epochs
-        # cache base LRs from optimizer (trainer assumes set in train.py)
+        # cache base LRs
         self.base_lrs = [pg.get("base_lr", pg["lr"]) for pg in self.optimizer.param_groups]
 
         trns = getattr(cfg, "train", None)
-        # Selection metric uses exact key (no aliases)
-        self.sel_metric = getattr(trns, "selection_metric", "mAP50") if trns is not None else "mAP50"
+        self.sel_metric = getattr(trns, "selection_metric", "map50") if trns is not None else "map50"
         self.sel_mode = getattr(trns, "selection_mode", "max") if trns is not None else "max"
         self.best_metric = -float("inf") if self.sel_mode == "max" else float("inf")
+
+        # Dynamic loss weighting via multi-task uncertainty (if enabled in cfg)
+        use_multi_noise = bool(getattr(getattr(cfg, "train", object()), "multi_noise", False))
+        self.use_multi_noise = use_multi_noise
+        if self.use_multi_noise:
+            # number of tasks: box, obj, ang, kpt, kc
+            self.multi_noise = MultiNoiseLoss(num_losses=5).to(device)
 
         if self.rank == 0:
             per_gpu_batch = getattr(getattr(cfg, "train", object()), "batch", "NA")
@@ -120,19 +124,18 @@ class Trainer:
         evcfg = getattr(self.cfg, "eval", None)
         eval_interval = int(getattr(evcfg, "interval", 1)) if evcfg else 1
         warmup_noeval = int(getattr(evcfg, "warmup_noeval_epochs", 0)) if evcfg else 0
+        subset_frac = float(getattr(evcfg, "subset", 1.0)) if evcfg else 1.0
+        fast_mode_default = bool(getattr(evcfg, "fast", False)) if evcfg else False
+        full_every = int(getattr(evcfg, "full_every", 0)) if evcfg else 0
 
         # warmup measured in optimizer updates (respecting grad accumulation)
         updates_per_epoch = max(1, math.ceil(len(train_loader) / self.grad_accum))
         warmup_updates = int(max(1, round(self.warmup_epochs * updates_per_epoch)))
 
         for epoch in range(self.epochs):
+
             if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
                 train_sampler.set_epoch(epoch)
-
-            # >>> Disable mosaic in the last 10% of training epochs <<<
-            if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_mosaic_active"):
-                cutoff = int(0.9 * self.epochs)
-                train_loader.dataset.set_mosaic_active(epoch < cutoff)
 
             model.train()
             if device.startswith("cuda"):
@@ -145,7 +148,25 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             for it, batch in enumerate(train_loader):
-                imgs = batch["image"].to(device, non_blocking=True)
+                # in the first iteration of the train loop
+                if epoch == 0 and it == 0:
+                    print("batch keys:", batch.keys())
+                    print("image:", batch['image'].shape if torch.is_tensor(batch['image']) else type(batch['image']))
+                    print("bboxes lens:",
+                          [(None if x is None else (x.shape if torch.is_tensor(x) else len(x))) for x in
+                           batch['bboxes']])
+                    print("labels lens:",
+                          [(None if x is None else (x.shape if torch.is_tensor(x) else len(x))) for x in
+                           batch['labels']])
+                    print("kpts lens:",
+                          [(None if x is None else (x.shape if torch.is_tensor(x) else len(x))) for x in batch['kpts']])
+
+                # src/engine/trainer.py (inside the training loop)
+                batch = batch  # already dict from collate
+                imgs = batch['image']
+                if not torch.is_tensor(imgs):
+                    imgs = torch.stack(imgs, 0)
+                imgs = imgs.to(device, non_blocking=True)
 
                 with autocast(device_type="cuda", enabled=self.use_amp):
                     outs = model(imgs)
@@ -157,7 +178,26 @@ class Trainer:
                     if det_maps is None or feats is None:
                         raise RuntimeError("Model must return detection maps and feature maps (feats).")
                     model_for_loss = self.model.module if hasattr(self.model, "module") else self.model
+                    # compute criterion loss and logs
                     loss, logs = self.criterion(det_maps, feats, batch, model=model_for_loss, epoch=epoch)
+                    # if using dynamic loss weighting, recompute loss via MultiNoiseLoss
+                    if self.use_multi_noise:
+                        try:
+                            # Collect raw tensor losses in fixed order: box, obj, ang, kpt, kc
+                            raw_losses = [
+                                logs.get("box_loss_raw"),
+                                logs.get("obj_loss_raw"),
+                                logs.get("ang_loss_raw"),
+                                logs.get("kpt_loss_raw"),
+                                logs.get("kc_loss_raw"),
+                            ]
+                            # Some raw losses may be None if missing; replace with zero tensor
+                            raw_losses = [l if isinstance(l, torch.Tensor) else torch.tensor(0.0, device=self.device) for l in raw_losses]
+                            loss = self.multi_noise(raw_losses)
+                        except Exception as e:
+                            # fallback to original loss if raw tensors unavailable
+                            if self.logger and self.rank == 0:
+                                self.logger.warning(f"MultiNoiseLoss fallback due to: {e}")
 
                 loss = loss / self.grad_accum
                 if self.use_amp:
@@ -240,35 +280,12 @@ class Trainer:
             if eval_interval > 1 and ((epoch + 1) % eval_interval != 0):
                 do_eval = False
 
-            metrics: Dict[str, float] = {}
+            metrics = {}
             if do_eval and self.rank == 0:
                 with torch.inference_mode(), autocast(device_type="cuda", enabled=self.use_amp):
                     metrics = evaluator.evaluate(ddp_module(model), val_loader, device=device, max_images=None)
 
-                # STRICT: use only standard keys (no aliases)
-                # These two are REQUIRED; raise if missing
-                m50 = float(metrics["mAP50"])
-                m_  = float(metrics["mAP"])
-
-                # The rest are optional (no aliases, default 0/0.0 if absent)
-                pck  = float(metrics.get("pck@0.05", 0.0))
-                pcka = float(metrics.get("pck_any@0.05", 0.0))
-                r01  = float(metrics.get("recall@0.1", 0.0))
-                r03  = float(metrics.get("recall@0.3", 0.0))
-                r05  = float(metrics.get("recall@0.5", 0.0))
-                biou = float(metrics.get("best_iou", 0.0))
-                tps  = int(metrics.get("tps", 0))
-                ppi  = float(metrics.get("pred_per_img", 0.0))
-                nimg = int(metrics.get("images", 0))
-
-                self.logger.info(
-                    f"{'':>17} EVAL  images {nimg:>5}  mAP50 {m50:.6f}  mAP {m_:.6f}  "
-                    f"PCK@0.05 {pck:.6f}  PCK_any@0.05 {pcka:.6f}  "
-                    f"TPs {tps}  pred/img {ppi:.1f}  "
-                    f"R@0.1 {r01:.2f}  R@0.3 {r03:.2f}  R@0.5 {r05:.2f}  bestIoU {biou:.3f}"
-                )
-
-            # checkpointing (uses exact selection key; no aliases)
+            # checkpointing
             if self.rank == 0:
                 self._save_checkpoint(os.path.join(self.ckpt_dir, "last.pt"), metrics)
                 sel_val = self._selection_value(metrics)
@@ -282,11 +299,11 @@ class Trainer:
 
     # --------------------------------------------------------------------- #
     def _selection_value(self, metrics: Dict[str, float]) -> Optional[float]:
-        """Return selection value using EXACT key; no aliases."""
         if not metrics:
             return None
-        key = getattr(self, "sel_metric", "mAP50")
-        return float(metrics[key]) if key in metrics else None
+        key = getattr(self, "sel_metric", "map50")
+        aliases = {"map@.50":"map50","map50":"map50","map":"map","pck":"pck@0.05","pck@0.05":"pck@0.05"}
+        return float(metrics.get(key, metrics.get(aliases.get(key,""), None))) if (key in metrics or aliases.get(key,"") in metrics) else None
 
     def _save_checkpoint(self, path: str, metrics: Dict[str, float]):
         state = {

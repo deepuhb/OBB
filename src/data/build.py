@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from src.data.datasets import YoloObbKptDataset          # your dataset
 from src.data.mosaic_wrapper import AugmentingDataset    # augmentation wrapper
+from src.data.collate import collate_obbdet              # <-- robust collate
 
 
 def _yaml(cfg, path: str, default=None):
@@ -47,7 +48,7 @@ def build_dataloaders(
 
     # ---- construct base datasets with only safe args ----
     train_base = YoloObbKptDataset(root=root, split=train_split, img_size=img_size)
-    val_ds = YoloObbKptDataset(root=root, split=val_split, img_size=img_size)
+    val_ds     = YoloObbKptDataset(root=root, split=val_split,   img_size=img_size)
 
     # ---- push names/nc onto datasets AFTER construction (if provided) ----
     if yaml_names:
@@ -78,14 +79,15 @@ def build_dataloaders(
     # ---- optional DistributedSampler ----
     if world_size > 1:
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
-        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     else:
         train_sampler = None
-        val_sampler = None
+        val_sampler   = None
 
-    # ---- pick collate_fns if exposed by base datasets ----
-    collate_train = getattr(train_base, "collate_fn", None)
-    collate_val = getattr(val_ds, "collate_fn", None)
+    # ---- choose collate_fns ----
+    # Prefer collate on the wrapper, else base dataset; fallback to robust default.
+    collate_train = getattr(train_ds,  "collate_fn", None) or getattr(train_base, "collate_fn", None) or collate_obbdet
+    collate_val   = getattr(val_ds,   "collate_fn", None) or collate_obbdet
 
     # ---- dataloaders ----
     train_loader = DataLoader(
@@ -113,3 +115,4 @@ def build_dataloaders(
     )
 
     return train_loader, val_loader, train_sampler
+

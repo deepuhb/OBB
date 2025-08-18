@@ -4,6 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .layers.rot_roi import RotatedROIPool
 
+
+
+
 # ---- Tiny YOLO11-ish blocks (you can swap with your existing backbone/neck) ----
 class Conv(nn.Module):
     def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=True):
@@ -173,23 +176,123 @@ class YOLO11_OBBPOSE_TD(nn.Module):
         det = self.det_head([n3, d4, d5])
         return {"det": det, "feats": [n3, d4, d5]}
 
-    @torch.no_grad()
-    def kpt_from_obbs(self, feats, obb_list, scores_list=None, topk=None, chunk=None, score_thresh=None):
-        # Use P3-like feature (first from neck outputs)
-        p3_like = feats[0]
-        # Defaults from config baked into the module (set these in __init__ when you build self.roi)
-        if topk is None:        topk = getattr(self, "kpt_topk", 128)
-        if chunk is None:       chunk = getattr(self, "roi_chunk", 128)
-        if score_thresh is None: score_thresh = getattr(self, "score_thresh_kpt", 0.0)
-        crops, metas = self.roi(
-            p3_like, obb_list,
-            scores_list=scores_list,
-            topk=int(topk),
-            chunk=int(chunk),
-            score_thresh=float(score_thresh),
-        )
-        if crops.numel() == 0:
-            return torch.empty(0, 2, device=p3_like.device), []
-        uv = self.kpt_head(crops)  # (N,2) in [0,1]
-        return uv, metas
+    def _select_kpt_feat(self, feats):
+        # robustly pick a single feature map (finest resolution)
+        if torch.is_tensor(feats):
+            return feats
+        if isinstance(feats, (list, tuple)):
+            feats = [f for f in feats if torch.is_tensor(f)]
+            return max(feats, key=lambda t: t.shape[-1] * t.shape[-2])
+        if isinstance(feats, dict):
+            for k in ("kpt", "p3", "P3"):
+                v = feats.get(k)
+                if torch.is_tensor(v):
+                    return v
+            feats = [v for v in feats.values() if torch.is_tensor(v)]
+            return max(feats, key=lambda t: t.shape[-1] * t.shape[-2])
+        raise TypeError(f"Unsupported feats type: {type(feats)}")
 
+    @torch.inference_mode()
+    def kpt_from_obbs(self,
+                      feats,
+                      pos_meta,
+                      chunk: int = 128,
+                      **kwargs):
+        """
+        Normalize pos_meta to the per-image OBB list that RotatedROIPool expects.
+        Accepts:
+          • list of dicts {'b'|'bix', 'obb'| 'obb_abs'|'obb_norm'}
+          • list/tuple of length B where each item is (Ni,5) Tensor or None
+          • flat list of Tensors (various shapes)
+          • single Tensor (N,5) or (N,6) (first col may be batch index)
+        Returns:
+          (kpred, metas)
+        """
+        feat = self._select_kpt_feat(feats)  # robustly pick one map
+        device, dtype = feat.device, feat.dtype
+        B, C, Hf, Wf = feat.shape
+
+        def to_tensor(x):
+            if torch.is_tensor(x):
+                return x.to(device=device, dtype=dtype)
+            return torch.tensor(x, device=device, dtype=dtype)
+
+        # --- Build obb_list: list length B, each item is (Ni,5) Tensor or None ---
+        obb_list = [None] * B
+
+        if isinstance(pos_meta, (list, tuple)):
+            # Case 1: evaluator-style per-image list
+            if len(pos_meta) == B and all((x is None) or (torch.is_tensor(x) and x.ndim == 2 and x.shape[1] >= 5)
+                                          for x in pos_meta):
+                obb_list = [(to_tensor(x) if x is not None else None) for x in pos_meta]
+
+            else:
+                # Case 2: training/other — list of dicts OR flat list of tensors
+                grouped = [[] for _ in range(B)]
+                for m in pos_meta:
+                    if isinstance(m, dict):
+                        b = int(m.get('b', m.get('bix', 0)))
+                        obb = m.get('obb') or m.get('obb_abs') or m.get('obb_norm')
+                        if obb is None:
+                            continue
+                        grouped[b].append(to_tensor(obb).reshape(-1, 5))
+                    elif torch.is_tensor(m):
+                        t = to_tensor(m)
+                        if t.ndim == 2 and t.shape[1] >= 6:
+                            bix = t[:, 0].long().clamp_(0, B - 1)
+                            obb = t[:, 1:6]
+                            for b in range(B):
+                                sel = bix == b
+                                if sel.any():
+                                    grouped[b].append(obb[sel])
+                        elif t.ndim == 2 and t.shape[1] >= 5:
+                            # no batch info; assign to image 0
+                            grouped[0].append(t[:, :5])
+                        elif t.ndim == 1 and t.numel() >= 5:
+                            grouped[0].append(t[:5].unsqueeze(0))
+                        # else: ignore malformed
+                    # else: ignore other element types
+
+                for b in range(B):
+                    if len(grouped[b]):
+                        obb_list[b] = torch.cat(grouped[b], dim=0)
+                    else:
+                        obb_list[b] = None
+
+        elif torch.is_tensor(pos_meta):
+            # Case 3: single tensor
+            t = to_tensor(pos_meta)
+            if t.ndim == 2 and t.shape[1] >= 6:
+                bix = t[:, 0].long().clamp_(0, B - 1)
+                obb = t[:, 1:6]
+                for b in range(B):
+                    sel = bix == b
+                    if sel.any():
+                        obb_list[b] = obb[sel]
+            elif t.ndim == 2 and t.shape[1] >= 5:
+                obb_list[0] = t[:, :5]
+            else:
+                raise ValueError("pos_meta tensor must be (N,5) or (N,6).")
+        else:
+            raise TypeError(f"Unsupported pos_meta type: {type(pos_meta)}")
+
+        # --- Optional evaluator knobs ---
+        scores_list = kwargs.get("scores_list", None)
+        topk = kwargs.get("topk", None)
+        score_thresh = kwargs.get("score_thresh", None)
+
+        # --- ROI crop (your RotatedROIPool.forward signature already matches this) ---
+        crops, metas = self.roi(
+            feat,
+            obb_list=obb_list,
+            scores_list=scores_list,
+            topk=topk,
+            chunk=chunk,
+            score_thresh=score_thresh,
+        )
+
+        if crops.numel() == 0:
+            return crops, metas
+
+        kpred = self.kpt_head(crops)
+        return kpred, metas

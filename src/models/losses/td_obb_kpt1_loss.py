@@ -2,11 +2,13 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from typing import Any, Dict, List, Tuple
 import math
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # -------------------------------------------------------------
 # Utilities: robust GT extraction for both formats
@@ -52,65 +54,200 @@ def _split_targets_by_image(t: torch.Tensor, B: int, device: torch.device):
     return boxes_list, labels_list, kpts_list
 
 
-def _extract_gt_lists_from_batch(batch: dict, B: int, device: torch.device):
+def _extract_gt_lists_from_batch(batch: Dict[str, Any], B: int, device: torch.device):
     """
-    Robustly extract per-image GT lists from either:
-      - lists: batch['bboxes'], batch['labels'], optional batch['kpts']
-      - YOLO targets tensor: batch['targets']
-    Ensures boxes are (cx,cy,w,h,ang) and keypoints are (N,2) or empty.
+    Returns lists of length B:
+      boxes_list[i]  : Tensor (Ni,5) = (cx,cy,w,h,ang_radians) in pixels
+      labels_list[i] : LongTensor (Ni,)
+      kpts_list[i]   : Tensor (Ni,2) in pixels   (1 keypoint supported here)
+
+    Accepts two sources:
+      1) Per-image lists: batch['bboxes'], batch['labels'], batch['kpts'].
+         Used ONLY if they contain any instances across the batch.
+      2) Fallback: batch['targets'] with rows like:
+           cls, x1,y1,x2,y2,x3,y3,x4,y4, kx,ky   (all NORMALIZED 0..1)
+         We denormalize using batch['image'] size, convert 4-corner polygon
+         to (cx,cy,w,h,angle_radians), and keypoint to pixels.
     """
-    # list format
-    if "bboxes" in batch and isinstance(batch["bboxes"], list):
-        boxes_list, labels_list, kpts_list = [], [], []
-        kpts_in = batch.get("kpts", None)
+
+    # Helper: image size (assumes images are stacked)
+    H, W = None, None
+    imgs = batch.get('image', None)
+    if torch.is_tensor(imgs) and imgs.ndim >= 4:
+        H, W = int(imgs.shape[-2]), int(imgs.shape[-1])
+    elif isinstance(imgs, list) and len(imgs) and torch.is_tensor(imgs[0]):
+        H, W = int(imgs[0].shape[-2]), int(imgs[0].shape[-1])
+
+    def empty_boxes():
+        return torch.zeros((0, 5), dtype=torch.float32, device=device)
+
+    def empty_labels():
+        return torch.zeros((0,), dtype=torch.long, device=device)
+
+    def empty_kpts():
+        return torch.zeros((0, 2), dtype=torch.float32, device=device)
+
+    # Try per-image lists first
+    boxes_in  = batch.get('bboxes', None)
+    labels_in = batch.get('labels', None)
+    kpts_in   = batch.get('kpts',   None)
+
+    def total_instances(lst) -> int:
+        if not isinstance(lst, (list, tuple)):
+            return 0
+        tot = 0
+        for x in lst:
+            if torch.is_tensor(x):      tot += int(x.shape[0]) if x.ndim >= 2 else 0
+            elif isinstance(x, (list, tuple)): tot += len(x)
+            # None or other -> 0
+        return tot
+
+    use_per_image = (
+        isinstance(boxes_in,  (list, tuple)) and
+        isinstance(labels_in, (list, tuple)) and
+        total_instances(boxes_in) > 0
+    )
+
+    boxes_list  : List[torch.Tensor] = [empty_boxes()  for _ in range(B)]
+    labels_list : List[torch.Tensor] = [empty_labels() for _ in range(B)]
+    kpts_list   : List[torch.Tensor] = [empty_kpts()   for _ in range(B)]
+
+    if use_per_image:
+        # Consume per-image lists directly
         for i in range(B):
-            bi = torch.as_tensor(batch["bboxes"][i], dtype=torch.float32, device=device)
-            if bi.numel() == 0:
-                bi = bi.new_zeros((0, 5))
-            elif bi.shape[-1] == 4:  # (cx,cy,w,h) -> append ang=0
-                zeros = torch.zeros((bi.shape[0], 1), dtype=bi.dtype, device=device)
-                bi = torch.cat([bi, zeros], dim=1)
-            li = torch.as_tensor(batch.get("labels", [])[i], dtype=torch.long, device=device) \
-                 if "labels" in batch else torch.zeros((bi.shape[0],), dtype=torch.long, device=device)
-            if kpts_in is not None and i < len(kpts_in) and len(kpts_in[i]):
-                ki = torch.as_tensor(kpts_in[i], dtype=torch.float32, device=device)
-                if ki.ndim == 3:  # (N,1,2) -> (N,2)
-                    ki = ki.squeeze(1)
-            else:
-                ki = torch.empty((0, 2), dtype=torch.float32, device=device)
-            boxes_list.append(bi); labels_list.append(li); kpts_list.append(ki)
+            bx = boxes_in[i] if i < len(boxes_in) else None
+            lb = labels_in[i] if i < len(labels_in) else None
+            kp = (kpts_in[i] if isinstance(kpts_in, (list, tuple)) and i < len(kpts_in) else None)
+
+            if torch.is_tensor(bx) and bx.numel():
+                bx = bx.to(device=device, dtype=torch.float32).reshape(-1, bx.shape[-1])
+                if bx.shape[-1] < 5:
+                    # If only 4 columns present, pad angle=0
+                    z = torch.zeros((bx.size(0), 5), dtype=torch.float32, device=device)
+                    z[:, :4] = bx[:, :4]
+                    bx = z
+                elif bx.shape[-1] > 5:
+                    bx = bx[:, :5]
+                boxes_list[i] = bx
+
+            if torch.is_tensor(lb) and lb.numel():
+                labels_list[i] = lb.to(device=device, dtype=torch.long).reshape(-1)
+
+            if torch.is_tensor(kp) and kp.numel():
+                kp = kp.to(device=device, dtype=torch.float32).reshape(-1, kp.shape[-1])
+                # expect (Ni,2) for single keypoint
+                kpts_list[i] = kp[:, :2] if kp.shape[-1] >= 2 else empty_kpts()
         return boxes_list, labels_list, kpts_list
 
-    # YOLO 'targets'
-    if "targets" in batch:
-        return _split_targets_by_image(batch["targets"], B, device)
+    # -------------------------
+    # Fallback: parse YOLO-style targets (normalized poly + kpt)
+    # -------------------------
+    targets = batch.get('targets', None)
+    if targets is None:
+        return boxes_list, labels_list, kpts_list  # nothing we can do
 
-    # fallback: empty
-    boxes_list = [torch.zeros((0, 5), dtype=torch.float32, device=device) for _ in range(B)]
-    labels_list = [torch.zeros((0,), dtype=torch.long, device=device) for _ in range(B)]
-    kpts_list = [torch.empty((0, 2), dtype=torch.float32, device=device) for _ in range(B)]
+    if H is None or W is None:
+        # Can't denormalize without image size
+        return boxes_list, labels_list, kpts_list
+
+    def denorm_xy(x, y):
+        return float(x) * W, float(y) * H
+
+    def poly4_to_obb_xywha_deg(pxy: np.ndarray) -> Tuple[float,float,float,float,float]:
+        # pxy: (4,2) in pixels
+        (x1,y1), (x2,y2), (x3,y3), (x4,y4) = pxy.astype(np.float32)
+        cx = (x1 + x2 + x3 + x4) * 0.25
+        cy = (y1 + y2 + y3 + y4) * 0.25
+        w  = float(math.hypot(x2 - x1, y2 - y1))
+        h  = float(math.hypot(x3 - x2, y3 - y2))
+        ang_deg = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        w = max(w, 1.0); h = max(h, 1.0)
+        return cx, cy, w, h, ang_deg
+
+    def parse_targets_tensor(t: torch.Tensor):
+        """
+        Accepts per-image tensor (Ni, 11) or list-of-rows.
+        Format: cls, x1,y1,x2,y2,x3,y3,x4,y4, kx,ky   (normalized)
+        """
+        t = t.to(device=device, dtype=torch.float32).reshape(-1, t.shape[-1])
+        if t.shape[-1] < 11:
+            return empty_boxes(), empty_labels(), empty_kpts()
+        cls = t[:, 0].to(torch.long)
+        x1y1x2y2x3y3x4y4 = t[:, 1:9]
+        kxy = t[:, 9:11]
+
+        # denorm + convert poly -> obb (deg -> rad)
+        obbs = []
+        kpts = []
+        for row, k in zip(x1y1x2y2x3y3x4y4, kxy):
+            p = row.view(4, 2)
+            pts_px = np.array([denorm_xy(p[i,0].item(), p[i,1].item()) for i in range(4)], dtype=np.float32)
+            cx, cy, w, h, ang_deg = poly4_to_obb_xywha_deg(pts_px)
+            obbs.append([cx, cy, w, h, math.radians(ang_deg)])  # radians for loss
+            kx, ky = denorm_xy(k[0].item(), k[1].item())
+            kpts.append([kx, ky])
+
+        obbs = torch.tensor(obbs, dtype=torch.float32, device=device)
+        labs = cls.reshape(-1)
+        kpts = torch.tensor(kpts, dtype=torch.float32, device=device)
+        return obbs, labs, kpts
+
+    # targets may be list length B (per-image) OR a single tensor (N, 11 or 12)
+    if isinstance(targets, (list, tuple)):
+        for i in range(min(B, len(targets))):
+            t = targets[i]
+            if t is None:
+                continue
+            if torch.is_tensor(t):
+                bx, lb, kp = parse_targets_tensor(t)
+            elif isinstance(t, (list, tuple, np.ndarray)):
+                t = torch.as_tensor(t, dtype=torch.float32, device=device)
+                bx, lb, kp = parse_targets_tensor(t)
+            else:
+                continue
+            boxes_list[i]  = bx
+            labels_list[i] = lb
+            kpts_list[i]   = kp
+        return boxes_list, labels_list, kpts_list
+
+    if torch.is_tensor(targets):
+        # single big tensor? try to figure out if it has img index
+        T = targets.to(device=device, dtype=torch.float32)
+        if T.ndim == 2 and T.shape[1] >= 12:
+            # likely: img_idx, cls, x1,y1,x2,y2,x3,y3,x4,y4,kx,ky  (normalized)
+            bix = T[:, 0].to(torch.long).clamp_(0, B-1)
+            rows = T[:, 1:]
+            for i in range(B):
+                sel = (bix == i)
+                if sel.any():
+                    bx, lb, kp = parse_targets_tensor(rows[sel])
+                    boxes_list[i]  = bx
+                    labels_list[i] = lb
+                    kpts_list[i]   = kp
+        elif T.ndim == 2 and T.shape[1] == 11:
+            # per-batch without index: send all to image 0
+            bx, lb, kp = parse_targets_tensor(T)
+            boxes_list[0]  = bx
+            labels_list[0] = lb
+            kpts_list[0]   = kp
+        # else: unsupported shape -> leave empty
+        return boxes_list, labels_list, kpts_list
+
+    # default: nothing
     return boxes_list, labels_list, kpts_list
 
 
-# -------------------------------------------------------------
-# Criterion
-# -------------------------------------------------------------
 
 class TDOBBWKpt1Criterion(nn.Module):
     """
     Detection + single-keypoint criterion for YOLO11-style OBB + top-down keypoint.
 
-    Inputs to forward():
-      - det_maps: List[Tensor] per level: (B, 7+nc, H, W)
-          channel order: [tx, ty, tw, th, sin, cos, obj, cls_0..]
-      - feats:    List[Tensor] backbone/FPN features (used by model's kpt head; optional)
-      - batch:    dict with either:
-                    * lists 'bboxes'/'labels' (and optional 'kpts'), or
-                    * YOLO 'targets' tensor [img, cls, cx, cy, w, h, ang, (kpx,kpy)]
-      - model:    model handle (optional) for keypoint head calling
-      - epoch:    int epoch index (for freeze/warmup)
-    Returns:
-      total_loss, logs_dict
+    det_maps: List of detection maps per level, each (B, 7+nc, H, W)
+              channel order: [tx, ty, tw, th, sin, cos, obj, cls_0..]
+    feats   : backbone/FPN features (for keypoint head; optional)
+    batch   : dict with either lists (bboxes/labels[/kpts]) or YOLO 'targets'
+    model   : optional model handle for keypoint head
+    epoch   : int (for kpt freeze/warmup)
     """
 
     def __init__(
@@ -127,7 +264,7 @@ class TDOBBWKpt1Criterion(nn.Module):
         kpt_freeze_epochs: int = 0,
         kpt_warmup_epochs: int = 0,
         # routing thresholds (pixels, based on max(w,h))
-        level_boundaries: Tuple[float, float] = (32.0, 64.0),  # <=32 -> P3, <=64 -> P4, else P5
+        level_boundaries: Tuple[float, float] = (32.0, 64.0),  # <=32 -> P3, <=64 -> P4, else -> P5
         # objectness pos/neg weighting
         obj_pos_weight: float = 1.0,
         obj_neg_weight: float = 1.0,
@@ -149,13 +286,17 @@ class TDOBBWKpt1Criterion(nn.Module):
         self.kpt_freeze_epochs = int(kpt_freeze_epochs)
         self.kpt_warmup_epochs = int(kpt_warmup_epochs)
 
-        # target routing thresholds
+        # routing thresholds
         self.level_boundaries = tuple(float(x) for x in level_boundaries)
         if len(self.level_boundaries) != 2:
             raise ValueError("level_boundaries must be a (low, mid) 2-tuple")
 
         # BCE losses for obj/cls
         self.bce = nn.BCEWithLogitsLoss(reduction="mean")
+
+        # <<< IMPORTANT: define obj weights so _loss_det can use them >>>
+        self.obj_pos_weight = float(obj_pos_weight)
+        self.obj_neg_weight = float(obj_neg_weight)
 
     # ---------------------------------------------------------
     # Target building and losses
@@ -164,11 +305,11 @@ class TDOBBWKpt1Criterion(nn.Module):
     def _route_level(self, max_side: float) -> int:
         """Return level index based on object size (max side in pixels)."""
         low, mid = self.level_boundaries
-        if max_side <= low:  # small -> P3
+        if max_side <= low:      # small -> P3
             return 0
-        elif max_side <= mid:  # medium -> P4
+        elif max_side <= mid:    # medium -> P4
             return 1 if self.num_levels >= 2 else 0
-        else:  # large -> P5
+        else:                    # large -> P5
             return 2 if self.num_levels >= 3 else (1 if self.num_levels >= 2 else 0)
 
     def _build_targets(
@@ -191,11 +332,9 @@ class TDOBBWKpt1Criterion(nn.Module):
         device = det_maps[0].device
         B = det_maps[0].shape[0]
 
-        # shapes/strides per level
-        shapes = [(f.shape[2], f.shape[3]) for f in det_maps]  # (H,W) per level
+        shapes = [(f.shape[2], f.shape[3]) for f in det_maps]  # (H,W)
         s = self.strides
 
-        # allocate targets
         targets = []
         for lvl in range(self.num_levels):
             H, W = shapes[lvl]
@@ -213,7 +352,6 @@ class TDOBBWKpt1Criterion(nn.Module):
 
         pos_meta: List[Tuple[int, int, int, int, float, float, float, float, float]] = []
 
-        # assign GT
         for b in range(B):
             bx = boxes_list[b]  # (N,5)
             if bx.numel() == 0:
@@ -232,36 +370,39 @@ class TDOBBWKpt1Criterion(nn.Module):
 
                 T = targets[lvl]
                 T["mask"][b, 0, gy, gx] = True
-                # offsets in cell space (0..1)
                 T["tx"][b, 0, gy, gx] = (cx[j] / stride) - gx
                 T["ty"][b, 0, gy, gx] = (cy[j] / stride) - gy
-                # log-scale size in stride units
-                # clamp to avoid log(0)
                 T["tw"][b, 0, gy, gx] = torch.log(torch.clamp(w[j] / stride, min=1e-4))
                 T["th"][b, 0, gy, gx] = torch.log(torch.clamp(h[j] / stride, min=1e-4))
-                # angle as sin/cos targets
                 T["sin"][b, 0, gy, gx] = torch.sin(ang[j])
                 T["cos"][b, 0, gy, gx] = torch.cos(ang[j])
-                # objectness
                 T["obj"][b, 0, gy, gx] = 1.0
-                # class if multi-class
                 if self.nc > 1 and labs is not None and j < labs.numel():
                     c = int(labs[j].item())
                     if 0 <= c < self.nc:
                         T["cls"][b, c, gy, gx] = 1.0
 
-                pos_meta.append((b, lvl, gy, gx,
-                                 float(cx[j].item()), float(cy[j].item()),
-                                 float(w[j].item()), float(h[j].item()), float(ang[j].item())))
+                deg = float(torch.rad2deg(ang[j]).item())
+                pos_meta.append((
+                    b, lvl, gy, gx,
+                    float(cx[j].item()),
+                    float(cy[j].item()),
+                    float(w[j].item()),
+                    float(h[j].item()),
+                    deg))
 
         return targets, pos_meta
 
     def _loss_det(self, det_maps: List[torch.Tensor], targets: List[Dict[str, torch.Tensor]]):
         """
         Per-level losses for box (tx/ty/tw/th), angle (sin/cos), objectness, and classification.
-        We expect det_maps[i] shape: (B, 7+nc, H, W).
+        det_maps[i] shape: (B, 7+nc, H, W).
         """
         total_box = total_ang = total_obj = total_cls = det_maps[0].new_tensor(0.0)
+
+        # Safety fallback if class attrs missing for any reason
+        obj_pos_w = getattr(self, "obj_pos_weight", 1.0)
+        obj_neg_w = getattr(self, "obj_neg_weight", 1.0)
 
         for lvl, dm in enumerate(det_maps):
             B, C, H, W = dm.shape
@@ -275,7 +416,6 @@ class TDOBBWKpt1Criterion(nn.Module):
             T = targets[lvl]
             m = T["mask"]  # (B,1,H,W) bool
 
-            # Box losses (L1): tx/ty use sigmoid to [0,1], tw/th compare raw to log-targets
             if m.any():
                 l_tx = F.l1_loss(torch.sigmoid(tx)[m], T["tx"][m], reduction="mean")
                 l_ty = F.l1_loss(torch.sigmoid(ty)[m], T["ty"][m], reduction="mean")
@@ -283,24 +423,22 @@ class TDOBBWKpt1Criterion(nn.Module):
                 l_th = F.l1_loss(th[m], T["th"][m], reduction="mean")
                 l_box = l_tx + l_ty + l_tw + l_th
 
-                # Angle loss (L1) on tanh(si/co) vs sin/cos targets
                 l_ang = F.l1_loss(torch.tanh(si)[m], T["sin"][m], reduction="mean") + \
                         F.l1_loss(torch.tanh(co)[m], T["cos"][m], reduction="mean")
             else:
-                l_box = obj.new_tensor(0.0)
-                l_ang = obj.new_tensor(0.0)
+                z = obj.new_tensor(0.0)
+                l_box = z; l_ang = z
 
-            # Objectness BCE on all locations with pos/neg balance
+            # Objectness on pos and neg
             pos_mask = m
             neg_mask = ~m
             l_obj_pos = self.bce(obj[pos_mask], T["obj"][pos_mask]) if pos_mask.any() else obj.new_tensor(0.0)
             l_obj_neg = self.bce(obj[neg_mask], T["obj"][neg_mask]) if neg_mask.any() else obj.new_tensor(0.0)
-            l_obj = self.obj_pos_weight * l_obj_pos + self.obj_neg_weight * l_obj_neg
+            l_obj = obj_pos_w * l_obj_pos + obj_neg_w * l_obj_neg
 
-            # Classification BCE (multi-class one-vs-rest)
+            # Classification (positives only)
             if self.nc > 1 and cls_logit is not None:
                 if pos_mask.any():
-                    # Only supervise positives for class targets
                     cls_pos_mask = pos_mask.expand_as(cls_logit)
                     l_cls = self.bce(cls_logit[cls_pos_mask], T["cls"][cls_pos_mask])
                 else:
@@ -319,31 +457,16 @@ class TDOBBWKpt1Criterion(nn.Module):
     # Keypoint loss hook (optional)
     # ---------------------------------------------------------
 
-    def _predict_kpts_from_feats(
-        self,
-        model: Optional[nn.Module],
-        feats: Optional[List[torch.Tensor]],
-        pos_meta: List[Tuple[int, int, int, int, float, float, float, float, float]],
-    ) -> Optional[List[torch.Tensor]]:
+    def _predict_kpts_from_feats(self, model, feats, pos_meta):
         """
-        Try calling a model-provided keypoint head with (feats, pos_meta).
-        Supported method names: forward_kpt, predict_kpt, kpt_head(feats, pos_meta).
-        Should return a list of per-image tensors (Ni,2) in absolute pixels.
+        Use model helper (ROI + head). Compatible with both (preds, metas)
+        and preds-only returns.
         """
-        if model is None or feats is None:
-            return None
-        # Try a few common entry points
-        if hasattr(model, "forward_kpt"):
-            return model.forward_kpt(feats, pos_meta)
-        if hasattr(model, "predict_kpt"):
-            return model.predict_kpt(feats, pos_meta)
-        if hasattr(model, "kpt_head"):
-            khead = model.kpt_head
-            if callable(khead):
-                return khead(feats, pos_meta)
-            if hasattr(khead, "forward"):
-                return khead.forward(feats, pos_meta)
-        return None
+        out = model.kpt_from_obbs(feats, pos_meta)  # evaluator also calls with kwargs
+        if isinstance(out, tuple):
+            preds, _ = out
+            return preds
+        return out
 
     def _loss_kpt(
         self,
@@ -353,28 +476,23 @@ class TDOBBWKpt1Criterion(nn.Module):
         kpts_list: List[torch.Tensor],   # per-image (Ni,2) targets in absolute pixels
     ):
         """
-        Compute L1 loss between predicted kpts and GT for positives (if model head is available).
+        Compute L1 loss between predicted kpts and GT for positives (if model head available).
         Returns (loss, n_pos).
         """
-        device = feats[0].device if (feats and len(feats)) else (kpts_list[0].device if len(kpts_list) else torch.device("cpu"))
+        device = feats[0].device if (feats and len(feats)) else \
+                 (kpts_list[0].device if len(kpts_list) else torch.device("cpu"))
         preds = self._predict_kpts_from_feats(model, feats, pos_meta)
         if preds is None:
             return torch.zeros((), device=device), 0
 
-        # preds is list per image (Ni,2). kpts_list is same shape per image.
         total = torch.zeros((), device=device)
         npos = 0
-        # Reconstruct per-image grouping from pos_meta
-        # pos_meta entries are appended in order; we count how many per image
-        per_image_counts: Dict[int, int] = {}
-        for b, *_ in pos_meta:
-            per_image_counts[b] = per_image_counts.get(b, 0) + 1
 
-        # Iterate images by index and compare
+        # Group by image index (pos_meta is appended in order)
+        # We simply compare per-image in given order; if counts mismatch, align by min(N_gt, N_pred)
         for i, (gt_k, pred_k) in enumerate(zip(kpts_list, preds)):
             if gt_k.numel() == 0 or pred_k is None or pred_k.numel() == 0:
                 continue
-            # If counts mismatch, align by min
             n = min(gt_k.shape[0], pred_k.shape[0])
             if n <= 0:
                 continue
@@ -385,10 +503,6 @@ class TDOBBWKpt1Criterion(nn.Module):
             return torch.zeros((), device=device), 0
         return total, npos
 
-    # ---------------------------------------------------------
-    # Forward
-    # ---------------------------------------------------------
-
     def forward(
         self,
         det_maps: List[torch.Tensor] | torch.Tensor,
@@ -397,14 +511,29 @@ class TDOBBWKpt1Criterion(nn.Module):
         model: Optional[nn.Module] = None,
         epoch: Optional[int] = None
     ):
-        """
-        Compute total loss and a dict of logs.
-        """
+        # sanity check-----
+        bxs = batch.get("bboxes") or batch.get("obbs") or batch.get("boxes") or batch.get("targets")
+        gt = 0
+        if isinstance(bxs, list):
+            for t in bxs:
+                if torch.is_tensor(t): gt += int(t.size(0))
+        elif torch.is_tensor(bxs):
+            gt = int(bxs.size(0))
+        if epoch == 0 and gt == 0:
+            print("[loss] no GT boxes in batch — check batch['bboxes'] key and units")
+        # ----------------------------------
+
+        """Compute total loss and a dict of logs."""
         # ensure list of levels
         if isinstance(det_maps, torch.Tensor):
             det_maps = [det_maps]
         device = det_maps[0].device
-        B = batch["image"].shape[0] if isinstance(batch.get("image", None), torch.Tensor) else len(batch.get("bboxes", []))
+
+        # batch size
+        if isinstance(batch.get("image", None), torch.Tensor):
+            B = batch["image"].shape[0]
+        else:
+            B = len(batch.get("bboxes", [])) if "bboxes" in batch else int(batch.get("batch_size", 0) or 0)
 
         # Extract GT lists (robust to presence/absence of 'kpts')
         boxes_list, labels_list, kpts_list = _extract_gt_lists_from_batch(batch, B, device)
@@ -412,10 +541,10 @@ class TDOBBWKpt1Criterion(nn.Module):
         # Build multi-scale targets
         targets, pos_meta = self._build_targets(det_maps, boxes_list, labels_list)
 
-        # Compute detection losses
+        # Detection losses
         l_box, l_ang, l_obj, l_cls = self._loss_det(det_maps, targets)
 
-        # Compute keypoint loss (optional)
+        # Keypoint loss (optional)
         l_kpt, kpt_pos = self._loss_kpt(model, feats, pos_meta, kpts_list)
 
         # Keypoint freeze/warmup schedule
@@ -426,7 +555,6 @@ class TDOBBWKpt1Criterion(nn.Module):
                 kpt_scale = 0.0
             else:
                 if self.kpt_warmup_epochs > 0:
-                    # linearly ramp from 0->1 over warmup epochs
                     t = min(1.0, (ep - self.kpt_freeze_epochs + 1) / float(self.kpt_warmup_epochs))
                     kpt_scale = t
                 else:
@@ -446,8 +574,13 @@ class TDOBBWKpt1Criterion(nn.Module):
             "box_loss": float(l_box.detach().item()),
             "obj_loss": float(l_obj.detach().item()),
             "ang_loss": float(l_ang.detach().item()),
-            "kpt_loss": float((kpt_scale * l_kpt).detach().item()) if isinstance(l_kpt, torch.Tensor) else 0.0,
-            "kc_loss": 0.0,  # reserved for kpt classification if you add it later
-            "Pos": float(sum(int(t["mask"].sum().item()) for t in targets) / max(1, B)),
-        }
+            "kpt_loss": float((kpt_scale * l_kpt).detach().item()),
+            "kc_loss": 0.0,
+            "Pos": ...,
+            "box_loss_raw": l_box,
+            "obj_loss_raw": l_obj,
+            "ang_loss_raw": l_ang,
+            "kpt_loss_raw": l_kpt * kpt_scale,
+            "kc_loss_raw": torch.tensor(0.0, device=device),
+            }
         return total, logs

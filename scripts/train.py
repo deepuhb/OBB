@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 import os
 import random
@@ -11,7 +12,7 @@ import torch
 from torch.backends import cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 import yaml
 
 # --- project imports ---
@@ -150,41 +151,50 @@ def build_model(cfg: SimpleNamespace, device: torch.device):
 
 def build_criterion(cfg: SimpleNamespace, device: torch.device):
     loss_cfg = getattr(cfg, "loss", SimpleNamespace())
-    td = getattr(cfg, "topdown", SimpleNamespace())
+    data_cfg = getattr(cfg, "data", SimpleNamespace())
+    nc = int(getattr(data_cfg, "nc", 1))
 
+    # pick() helper: choose the first present attribute from several names
     def pick(obj, *names, default=None, cast=float):
         for n in names:
             if hasattr(obj, n):
                 return cast(getattr(obj, n))
         return cast(default) if default is not None else default
 
+    # read weights from config
     lambda_box = pick(loss_cfg, "lambda_box", "w_box", default=7.5)
     lambda_obj = pick(loss_cfg, "lambda_obj", "w_obj", default=3.0)
     lambda_ang = pick(loss_cfg, "lambda_ang", "w_ang", default=1.0)
     lambda_cls = pick(loss_cfg, "lambda_cls", "w_cls", default=1.0)
     lambda_kpt = pick(loss_cfg, "lambda_kpt", "w_kpt", default=2.0)
+    kpt_freeze_epochs = int(getattr(loss_cfg, "kpt_freeze_epochs", 0))
+    kpt_warmup_epochs = int(getattr(loss_cfg, "kpt_warmup_epochs", 0))
 
-    kpt_crop   = int(getattr(td, "crop_size", getattr(loss_cfg, "kpt_crop", 64)))
-    kpt_expand = float(getattr(td, "expand", getattr(loss_cfg, "kpt_expand", 1.25)))
+    # build a kwargs dictionary with all possible parameters
+    pool_kwargs = {
+        "lambda_box": lambda_box,
+        "lambda_obj": lambda_obj,
+        "lambda_ang": lambda_ang,
+        "lambda_cls": lambda_cls,
+        "lambda_kpt": lambda_kpt,
+        "kpt_freeze_epochs": kpt_freeze_epochs,
+        "kpt_warmup_epochs": kpt_warmup_epochs,
+        # note: no kpt_crop or kpt_expand here!
+    }
 
-    kpt_freeze_epochs  = int(getattr(loss_cfg, "kpt_freeze_epochs", 0))
-    kpt_warmup_epochs  = int(getattr(loss_cfg, "kpt_warmup_epochs", 0))
-    kpt_iou_gate       = float(getattr(loss_cfg, "kpt_iou_gate", 0.0))
+    # inspect the TDOBBWKpt1Criterion signature to see which args it accepts
+    ctor = TDOBBWKpt1Criterion.__init__
+    allowed = set(inspect.signature(ctor).parameters) - {"self"}
+    filtered_kwargs = {k: v for k, v in pool_kwargs.items() if k in allowed}
 
-    criterion = TDOBBWKpt1Criterion(
-        num_classes=int(getattr(getattr(cfg, "data", SimpleNamespace()), "nc", 1)),
-        lambda_box=lambda_box,
-        lambda_obj=lambda_obj,
-        lambda_ang=lambda_ang,
-        lambda_cls=lambda_cls,
-        lambda_kpt=lambda_kpt,
-        kpt_crop=kpt_crop,
-        kpt_expand=kpt_expand,
-        kpt_freeze_epochs=kpt_freeze_epochs,
-        kpt_warmup_epochs=kpt_warmup_epochs,
-        kpt_iou_gate=kpt_iou_gate,
-    ).to(device)
-    return criterion
+    # adapt to either 'nc' or 'num_classes'
+    if "nc" in allowed:
+        return TDOBBWKpt1Criterion(nc=nc, **filtered_kwargs).to(device)
+    elif "num_classes" in allowed:
+        return TDOBBWKpt1Criterion(num_classes=nc, **filtered_kwargs).to(device)
+    else:
+        return TDOBBWKpt1Criterion(**filtered_kwargs).to(device)
+
 
 
 # ---------------------------- main ----------------------------
@@ -282,7 +292,7 @@ def main():
     warmup_epochs = float(getattr(tr, "warmup_epochs", 3.0))
     warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))  # as a fraction of base
 
-    scaler = GradScaler("cuda", enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
     evaluator = EvaluatorFull(
         cfg={"eval": {"score_thresh": 0.3, "nms_iou": 0.5, "iou_thr": 0.5,
                       "pck_tau": 0.05, "max_det": 100},
