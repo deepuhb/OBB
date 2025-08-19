@@ -58,9 +58,6 @@ def obb_to_affine(
 
     return theta, M
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class RotatedROIPool(nn.Module):
     """

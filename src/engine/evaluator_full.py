@@ -1,14 +1,12 @@
 # src/engine/evaluator_full.py
-
 import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-# ---- optional fast geometry backends ----
+# ---- optional geometry backends ----
 try:
     from mmcv.ops import box_iou_rotated as mmcv_box_iou_rotated
     from mmcv.ops import nms_rotated as mmcv_nms_rotated
@@ -81,6 +79,26 @@ def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
     d["print_every"] = int(d["print_every"])
     return d
 
+def _get_first_batch(dl):
+    # Safely get one batch without assuming its structure.
+    it = iter(dl)
+    batch = next(it)
+
+    if isinstance(batch, dict):
+        # Common dict keys
+        imgs = batch.get("imgs") or batch.get("images") or batch.get("image")
+        targets = batch.get("targets") or batch.get("labels")
+    elif isinstance(batch, (list, tuple)):
+        imgs = batch[0]
+        targets = batch[1] if len(batch) > 1 else None
+    else:
+        # Single tensor or custom container
+        imgs, targets = batch, None
+
+    if imgs is None:
+        raise RuntimeError("Could not locate images in the first batch; check your dataset return format.")
+    return imgs, targets
+
 
 class EvaluatorFull:
     """
@@ -120,6 +138,12 @@ class EvaluatorFull:
                  val_loader: torch.utils.data.DataLoader,
                  device: torch.device,
                  max_images: Optional[int] = None) -> Dict[str, Any]:
+
+        # --- inside evaluate() ---
+        try:
+            imgs, _ = _get_first_batch(val_loader)  # was: imgs, _ = next(iter(val_loader))
+        except StopIteration:
+            raise RuntimeError("Validation DataLoader is empty. Check val dataset length / filters.")
 
         model_eval = model.module if hasattr(model, "module") else model
         model_eval.eval()
@@ -168,7 +192,7 @@ class EvaluatorFull:
                         obb_for_kpt.append(bx[: min(self.cfg["max_det"], bx.shape[0])] if bx.numel() else bx)
                     uv_pred, _ = model_eval.kpt_from_obbs(feats, obb_for_kpt)
                 except Exception as e:
-                    self.log.debug("[eval] kpt_from_obbs failed: %s", str(e))
+                    self.log.warning("[eval] kpt_from_obbs failed: %s", str(e))
                     uv_pred = None
 
             uv_cursor = 0
@@ -192,7 +216,7 @@ class EvaluatorFull:
                 stats["best_iou"].append(float(iou_mat.max().item()) if iou_mat.numel() else 0.0)
 
                 order = torch.argsort(scores, descending=True)
-                used = torch.zeros((gt_boxes.shape[0],), dtype=torch.bool)
+                used = torch.zeros((gt_boxes.shape[0],), dtype=torch.bool, device=boxes.device)
                 for t in self.iou_thrs:
                     tp, fp = [], []
                     for i in order.tolist():
@@ -270,22 +294,203 @@ class EvaluatorFull:
                 "scores": torch.zeros((0,), device=device),
                 "cls": None}
 
+    def _extract_map4d(self, x) -> Optional[torch.Tensor]:
+        if torch.is_tensor(x) and x.dim() == 4 and x.numel() > 0:
+            return x
+        if isinstance(x, (list, tuple)):
+            for y in x:
+                if torch.is_tensor(y) and y.dim() == 4 and y.numel() > 0:
+                    return y
+        if isinstance(x, dict):
+            for k in ("cls", "obj", "heatmap", "hm", "box", "reg", "angle", "ang", "logits", "maps"):
+                y = x.get(k, None)
+                if torch.is_tensor(y) and y.dim() == 4 and y.numel() > 0:
+                    return y
+        return None
+
+    def _coerce_pyramid(self, det_maps) -> Optional[List[Tuple[torch.Tensor, ...]]]:
+        """
+        Make a list of per-level tuples of 4-D tensors (cls/reg/angle …), removing Nones.
+        Returns None if nothing usable.
+        """
+        levels = []
+
+        # Case A: already a list/tuple of levels
+        if isinstance(det_maps, (list, tuple)):
+            iterable = list(det_maps)
+        # Case B: dict of level maps
+        elif isinstance(det_maps, dict):
+            iterable = list(det_maps.values())
+        else:
+            return None
+
+        dropped_levels = []
+        for li, lvl in enumerate(iterable):
+            # If the level itself is a tensor, treat it as a 1-tuple.
+            if torch.is_tensor(lvl):
+                if lvl.dim() == 4 and lvl.numel() > 0:
+                    levels.append((lvl,))
+                else:
+                    dropped_levels.append(li)
+                continue
+
+            # If the level is a tuple/list/dict, extract all valid 4D tensors in order.
+            submaps: List[torch.Tensor] = []
+            if isinstance(lvl, (list, tuple)):
+                for sm in lvl:
+                    t = self._extract_map4d(sm)
+                    if t is not None:
+                        submaps.append(t)
+            elif isinstance(lvl, dict):
+                # keep a stable ordering: cls/obj → box/reg → angle
+                for key_group in (("cls", "obj", "heatmap", "hm", "logits"),
+                                  ("box", "reg", "bbox"),
+                                  ("angle", "ang")):
+                    for k in key_group:
+                        t = lvl.get(k, None)
+                        if torch.is_tensor(t) and t.dim() == 4 and t.numel() > 0:
+                            submaps.append(t)
+                # also sweep remaining values just in case
+                for v in lvl.values():
+                    t = self._extract_map4d(v)
+                    if t is not None and t not in submaps:
+                        submaps.append(t)
+
+            # Remove None/invalids
+            submaps = [t for t in submaps if torch.is_tensor(t) and t.dim() == 4 and t.numel() > 0]
+            if len(submaps) == 0:
+                # try to salvage a single 4D tensor from the nested structure
+                t = self._extract_map4d(lvl)
+                if t is not None:
+                    levels.append((t,))
+                else:
+                    dropped_levels.append(li)
+                continue
+
+            # At least one valid submap found
+            levels.append(tuple(submaps))
+
+        if dropped_levels and not hasattr(self, "_pyr_drop_log_once"):
+            self._pyr_drop_log_once = True
+            self.log.warning("[eval] dropped %d pyramid levels with None/invalid entries: idx=%s",
+                             len(dropped_levels), dropped_levels)
+
+        return levels if len(levels) > 0 else None
+
+    def _try_decode_with_pyramid(self, model_eval, pyramids, imgs, score_thr):
+        """
+        Try decode_obb_from_pyramids with several per-level tuple arities:
+        (t,), (t,t), (t,t,t). Only expands levels when needed.
+        """
+        fn = getattr(model_eval, "decode_obb_from_pyramids", None)
+        if not callable(fn):
+            return None
+
+        # helper to call with kwargs/positional
+        def _call(candidate):
+            # try kwargs first (some impls require names)
+            try:
+                return fn(pyramids=candidate, imgs=imgs, score_thr=score_thr, max_det=self.cfg["max_det"])
+            except TypeError:
+                pass
+            except Exception as e:
+                # bubble other runtime errors up
+                raise e
+            # then positional
+            try:
+                return fn(candidate, imgs, score_thr=score_thr, max_det=self.cfg["max_det"])
+            except TypeError:
+                return None
+
+        # 1) try as-is (e.g. already tuples of correct arity)
+        out = _call(pyramids)
+        if out is not None:
+            self._maybe_log_decode_path("model.decode_obb_from_pyramids(as-is)")
+            return out
+
+        # Determine max number of submaps present across levels
+        max_k = max(len(lvl) for lvl in pyramids)
+        # 2) if any level is a single map, try duplicating to 2-tuple/3-tuple
+        for target_k in (2, 3):
+            if max_k >= target_k:
+                continue
+            expanded = []
+            for lvl in pyramids:
+                if len(lvl) == 0:
+                    expanded.append(tuple())  # will fail; but keep structure
+                    continue
+                t0 = lvl[0]
+                if len(lvl) >= target_k:
+                    expanded.append(lvl[:target_k])
+                else:
+                    expanded.append(tuple([t0] * target_k))
+            out = _call(expanded)
+            if out is not None:
+                self._maybe_log_decode_path(f"model.decode_obb_from_pyramids(duplicated {target_k}-tuple)")
+                return out
+
+        return None
+
+    def _try_hooks(self, obj, det_maps, imgs, names):
+        """
+        Try obj.<name> with rich permutations:
+          (det_maps, imgs), (pyramids=..., imgs=...), (det_maps=..., imgs=...),
+          then (det_maps,), (imgs,), ().
+        """
+        for name in names:
+            fn = getattr(obj, name, None)
+            if not callable(fn):
+                continue
+
+            # kwargs tries
+            for kw in (
+                    {"pyramids": det_maps, "imgs": imgs},
+                    {"det_maps": det_maps, "imgs": imgs},
+                    {"maps": det_maps, "imgs": imgs},
+            ):
+                try:
+                    out = fn(**kw)
+                    self._last_called_name = name
+                    return out
+                except TypeError:
+                    pass
+                except Exception as e:
+                    self.log.error("[eval] %s.%s(**%s) failed: %s",
+                                   obj.__class__.__name__, name, list(kw.keys()), str(e))
+                    break
+
+            # positional tries
+            for args in ((det_maps, imgs), (det_maps,), (imgs,), tuple()):
+                try:
+                    out = fn(*args)
+                    self._last_called_name = name
+                    return out
+                except TypeError:
+                    continue
+                except Exception as e:
+                    self.log.error("[eval] %s.%s%r failed: %s",
+                                   obj.__class__.__name__, name,
+                                   tuple(type(a).__name__ for a in args), str(e))
+                    break
+        return None
+
     def _decode_preds(self, model_eval, det_maps, imgs, score_thr=0.25):
-        """Return list[dict] per image with boxes in px/rad, scores, cls."""
         B, _, H, W = imgs.shape
         device = imgs.device
 
-        # 0) If det_maps is a dict, try to normalize into something decodable
-        dict_pyr = None
-        if isinstance(det_maps, dict):
-            # A) if looks like per-image lists already
-            if "boxes" in det_maps and isinstance(det_maps["boxes"], list):
-                return self._normalize_decoded(det_maps, (W, H), device, score_thr)
+        # 1) Try robust pyramid path first (coerce + call decode_obb_from_pyramids)
+        pyr = self._coerce_pyramid(det_maps)
+        if pyr is not None:
+            try:
+                out = self._try_decode_with_pyramid(model_eval, pyr, imgs, score_thr)
+                if out is not None:
+                    parsed = self._normalize_decoded(out, (W, H), device, score_thr)
+                    if parsed is not None:
+                        return parsed
+            except Exception as e:
+                self.log.error("[eval] decode_obb_from_pyramids(coerced) failed: %s", str(e))
 
-            # B) pull (B,C,Hf,Wf) tensors and order by inferred stride
-            dict_pyr = self._dict_to_pyramid(det_maps, (H, W), device)
-
-        # 1) Known hooks on the model (accept dict or list)
+        # 2) Then the generic hook path you already have
         hook_names = (
             "export_decode", "decode_obb", "decode_detections", "postprocess",
             "predict", "inference", "forward_export", "decode"
@@ -296,7 +501,6 @@ class EvaluatorFull:
             self._maybe_log_decode_path(f"model.{self._last_called_name}")
             return parsed
 
-        # 2) Hooks on common submodules
         for subname in ("head", "det_head", "yolo"):
             sub = getattr(model_eval, subname, None)
             if sub is None:
@@ -307,69 +511,20 @@ class EvaluatorFull:
                 self._maybe_log_decode_path(f"model.{subname}.{self._last_called_name}")
                 return parsed
 
-        # 3) Pyramid decode if we built one from dict
-        if dict_pyr is not None:
-            for name in ("decode_obb_from_pyramids", "decode_from_pyramids", "decode_yolo", "export_pyramids"):
-                fn = getattr(model_eval, name, None)
-                if callable(fn):
-                    try:
-                        out = fn(dict_pyr, imgs)
-                        parsed = self._normalize_decoded(out, (W, H), device, score_thr)
-                        if parsed is not None:
-                            self._maybe_log_decode_path(f"model.{name}(pyramids-from-dict, imgs)")
-                            return parsed
-                    except Exception as e:
-                        self._dbg(f"{name}(dict_pyr, imgs) failed: {e}")
-
-        # 4) If maps are a pyramid list/tuple, try explicit pyramid decode names
-        if isinstance(det_maps, (list, tuple)) and len(det_maps) in (3, 4, 5):
-            for name in ("decode_obb_from_pyramids", "decode_from_pyramids", "decode_yolo", "export_pyramids"):
-                fn = getattr(model_eval, name, None)
-                if callable(fn):
-                    try:
-                        out = fn(det_maps, imgs)
-                        parsed = self._normalize_decoded(out, (W, H), device, score_thr)
-                        if parsed is not None:
-                            self._maybe_log_decode_path(f"model.{name}(pyramids, imgs)")
-                            return parsed
-                    except Exception as e:
-                        self._dbg(f"{name}(pyramids, imgs) failed: {e}")
-
-        # 5) Dense fallback (B,N,K) — from tensor OR from any dict entry that matches
-        candidates = []
-        if torch.is_tensor(det_maps):
-            candidates.append(det_maps)
-        elif isinstance(det_maps, dict):
+        # 3) Dense fallback kept as-is (if you already have it)
+        if torch.is_tensor(det_maps) and det_maps.dim() == 3 and det_maps.size(-1) >= 6:
+            parsed = self._decode_dense(det_maps, (W, H), device, score_thr)
+            if parsed is not None:
+                self._maybe_log_decode_path("dense_fallback(B,N,K)")
+                return parsed
+        if isinstance(det_maps, dict):
             for v in det_maps.values():
                 if torch.is_tensor(v) and v.dim() == 3 and v.size(-1) >= 6:
-                    candidates.append(v)
-        for t in candidates:
-            try:
-                parsed = self._decode_dense(t, (W, H), device, score_thr)
-                if parsed is not None:
-                    self._maybe_log_decode_path("dense_fallback(B,N,K)")
-                    return parsed
-            except Exception as e:
-                self._dbg(f"dense fallback failed: {e}")
+                    parsed = self._decode_dense(v, (W, H), device, score_thr)
+                    if parsed is not None:
+                        self._maybe_log_decode_path("dense_fallback(B,N,K) from dict value")
+                        return parsed
 
-        return None
-
-    def _try_hooks(self, obj, det_maps, imgs, names):
-        """Try calling obj.<name> with (det_maps, imgs) → (det_maps,) → (imgs,) → ()."""
-        for name in names:
-            fn = getattr(obj, name, None)
-            if not callable(fn):
-                continue
-            for args in ((det_maps, imgs), (det_maps,), (imgs,), tuple()):
-                try:
-                    out = fn(*args)
-                    self._last_called_name = name
-                    return out
-                except TypeError:
-                    continue
-                except Exception as e:
-                    self._dbg(f"{obj.__class__.__name__}.{name}{tuple(a.__class__.__name__ for a in args)} failed: {e}")
-                    break
         return None
 
     def _normalize_decoded(self, decoded, wh: Tuple[int, int], device, score_thr):
@@ -495,27 +650,22 @@ class EvaluatorFull:
         return bx
 
     # --------------- dict → pyramid ---------------
-
     def _dict_to_pyramid(self, d: Dict[str, Any], hw: Tuple[int, int], device) -> Optional[List[torch.Tensor]]:
-        """Extract (B,C,Hf,Wf) maps from dict and sort by inferred stride."""
         H, W = hw
-        items: List[Tuple[float, torch.Tensor]] = []
+        items = []
         for k, v in d.items():
-            if torch.is_tensor(v) and v.dim() == 4:
+            if torch.is_tensor(v) and v.dim() == 4 and v.numel() > 0:
                 _, _, Hf, Wf = v.shape
-                # inferred stride ~ image_size / feature_size
                 sH = max(1.0, H / max(1, Hf))
                 sW = max(1.0, W / max(1, Wf))
                 s = float((sH + sW) * 0.5)
                 items.append((s, v.to(device)))
         if not items:
             return None
-        # sort by increasing stride (P3→P4→P5…)
-        items.sort(key=lambda x: x[0])
+        items.sort(key=lambda x: x[0])  # low stride → high stride
         return [v for _, v in items]
 
     # --------------- IoU / NMS ---------------
-
     def _rotated_nms(self, boxes: torch.Tensor, scores: torch.Tensor,
                      iou_thr: float, max_det: int) -> torch.Tensor:
         if boxes.numel() == 0:
@@ -575,7 +725,6 @@ class EvaluatorFull:
         return self._iou_aabb(boxes, gts).clamp_(0, 1)
 
     # --------------- shapely / aabb helpers ---------------
-
     def _to_poly(self, obb_np: np.ndarray) -> List["Polygon"]:
         out = []
         for cx, cy, w, h, ang in obb_np:
@@ -627,7 +776,6 @@ class EvaluatorFull:
         return out
 
     # --------------- metrics ---------------
-
     def _ap_from_pr(self, tp: np.ndarray, fp: np.ndarray, sc: np.ndarray) -> float:
         if tp.size == 0:
             return 0.0
@@ -698,18 +846,10 @@ class EvaluatorFull:
         )
 
     # --------------- debug helpers ---------------
-
     def _maybe_log_decode_path(self, path: str):
         if not hasattr(self, "_dec_path_printed"):
             self._dec_path_printed = True
             self.log.info("[eval] decode path: %s", path)
-
-    def _dbg(self, msg: str):
-        if not hasattr(self, "_dbg_printed"):
-            self._dbg_printed = 0
-        if self._dbg_printed < 6:
-            self._dbg_printed += 1
-            self.log.debug("[eval] %s", msg)
 
     def _debug_decode_failure(self, model_eval, det_maps):
         cand = []
@@ -727,10 +867,14 @@ class EvaluatorFull:
                 "[eval] decode failed. Candidate methods on model: %s | det_maps=dict keys=[%s] shapes=%s",
                 (", ".join(sorted(cand)) or "<none>"), keys, shapes
             )
+        elif isinstance(det_maps, (list, tuple)):
+            shapes = [tuple(v.shape) if torch.is_tensor(v) else type(v).__name__ for v in det_maps]
+            self.log.warning(
+                "[eval] decode failed. Candidate methods on model: %s | det_maps=pyramid levels=%s",
+                (", ".join(sorted(cand)) or "<none>"), shapes
+            )
         else:
-            shape_str = (f"tensor{tuple(det_maps.shape)}" if torch.is_tensor(det_maps)
-                         else f"pyramid[{len(det_maps)}]" if isinstance(det_maps, (list, tuple))
-                         else type(det_maps).__name__)
+            shape_str = (f"tensor{tuple(det_maps.shape)}" if torch.is_tensor(det_maps) else type(det_maps).__name__)
             self.log.warning(
                 "[eval] decode failed. Candidate methods on model: %s | det_maps=%s",
                 (", ".join(sorted(cand)) or "<none>"), shape_str

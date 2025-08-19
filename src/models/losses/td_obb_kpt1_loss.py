@@ -350,7 +350,6 @@ class TDOBBWKpt1Criterion(nn.Module):
 
         return total_box, total_ang, total_obj, total_cls
 
-
     def _predict_kpts_from_feats(self, model, feats, pos_meta):
         """
         Use model helper (ROI + head). Compatible with both (preds, metas)
