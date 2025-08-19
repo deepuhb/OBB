@@ -39,6 +39,9 @@ decode:
 
 eval:
   interval: 1
+  select: mAP50
+  warmup_noeval_epochs: 0
+  select_mode: max
   score_thresh: 0.3
   iou_thr: 0.2           # start loose; raise to 0.5 later
   pck_tau: 0.10          # start loose; tighten to 0.05 later

@@ -1,4 +1,3 @@
-# scripts/train.py
 from __future__ import annotations
 
 import argparse
@@ -12,31 +11,19 @@ import torch
 from torch.backends import cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.cuda.amp import GradScaler
+from torch import amp, autocast
 import yaml
 
 # --- project imports ---
 from src.engine.trainer import Trainer
 from src.engine.evaluator_full import EvaluatorFull
 from src.data.build import build_dataloaders
-from src.utils.distrib import (
-    init as dist_init,
-    is_main_process,
-    maybe_barrier,
-    cleanup,
-    IS_DISTRIBUTED,
-    RANK,
-    WORLD_SIZE,
-    LOCAL_RANK,
-)
+from src.utils import distrib as distu
 
-# Model + loss (adjust names if paths differ)
 from src.models.yolo11_obbpose_td import YOLO11_OBBPOSE_TD
 from src.models.losses.td_obb_kpt1_loss import TDOBBWKpt1Criterion
 
-
 # ---------------------------- utils ----------------------------
-
 def setup_logger(name: str = "obbpose11", level: int = 20):
     import logging
     lg = logging.getLogger(name)
@@ -49,14 +36,12 @@ def setup_logger(name: str = "obbpose11", level: int = 20):
     lg.propagate = False
     return lg
 
-
 def seed_everything(seed: int, rank: int = 0):
     seed = int(seed) + int(rank)
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 def load_cfg(path: str) -> SimpleNamespace:
     with open(path, "r") as f:
@@ -70,7 +55,6 @@ def load_cfg(path: str) -> SimpleNamespace:
         return x
 
     return to_ns(data)
-
 
 def merge_overrides(cfg: SimpleNamespace, args: argparse.Namespace) -> SimpleNamespace:
     if not hasattr(cfg, "train"):
@@ -114,9 +98,8 @@ def merge_overrides(cfg: SimpleNamespace, args: argparse.Namespace) -> SimpleNam
 
     return cfg
 
-
 def dataset_summary(logger, train_loader, val_loader):
-    if not is_main_process():
+    if not distu.is_main_process():
         return
     def n(x):
         try:
@@ -125,12 +108,12 @@ def dataset_summary(logger, train_loader, val_loader):
             return "?"
     logger.info(f"DATASET SUMMARY — train images: {n(train_loader)} | val images: {n(val_loader)}")
 
-
 def per_device_batch(cfg_batch: int, world_size: int, mode: str) -> int:
     if str(mode) == "total":
         return max(1, math.ceil(int(cfg_batch) / max(1, int(world_size))))
     return int(cfg_batch)
 
+# Model + loss (adjust names if paths differ)
 
 def build_model(cfg: SimpleNamespace, device: torch.device):
     td = getattr(cfg, "topdown", SimpleNamespace())
@@ -146,22 +129,21 @@ def build_model(cfg: SimpleNamespace, device: torch.device):
         roi_chunk=int(getattr(td, "roi_chunk", 128)),
         score_thresh_kpt=float(getattr(td, "score_thresh_kpt", 0.25)),
     ).to(device)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     return model
-
 
 def build_criterion(cfg: SimpleNamespace, device: torch.device):
     loss_cfg = getattr(cfg, "loss", SimpleNamespace())
     data_cfg = getattr(cfg, "data", SimpleNamespace())
     nc = int(getattr(data_cfg, "nc", 1))
 
-    # pick() helper: choose the first present attribute from several names
     def pick(obj, *names, default=None, cast=float):
         for n in names:
             if hasattr(obj, n):
                 return cast(getattr(obj, n))
         return cast(default) if default is not None else default
 
-    # read weights from config
     lambda_box = pick(loss_cfg, "lambda_box", "w_box", default=7.5)
     lambda_obj = pick(loss_cfg, "lambda_obj", "w_obj", default=3.0)
     lambda_ang = pick(loss_cfg, "lambda_ang", "w_ang", default=1.0)
@@ -170,7 +152,6 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
     kpt_freeze_epochs = int(getattr(loss_cfg, "kpt_freeze_epochs", 0))
     kpt_warmup_epochs = int(getattr(loss_cfg, "kpt_warmup_epochs", 0))
 
-    # build a kwargs dictionary with all possible parameters
     pool_kwargs = {
         "lambda_box": lambda_box,
         "lambda_obj": lambda_obj,
@@ -179,15 +160,12 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
         "lambda_kpt": lambda_kpt,
         "kpt_freeze_epochs": kpt_freeze_epochs,
         "kpt_warmup_epochs": kpt_warmup_epochs,
-        # note: no kpt_crop or kpt_expand here!
     }
 
-    # inspect the TDOBBWKpt1Criterion signature to see which args it accepts
     ctor = TDOBBWKpt1Criterion.__init__
     allowed = set(inspect.signature(ctor).parameters) - {"self"}
     filtered_kwargs = {k: v for k, v in pool_kwargs.items() if k in allowed}
 
-    # adapt to either 'nc' or 'num_classes'
     if "nc" in allowed:
         return TDOBBWKpt1Criterion(nc=nc, **filtered_kwargs).to(device)
     elif "num_classes" in allowed:
@@ -195,11 +173,7 @@ def build_criterion(cfg: SimpleNamespace, device: torch.device):
     else:
         return TDOBBWKpt1Criterion(**filtered_kwargs).to(device)
 
-
-
-
 # ---------------------------- main ----------------------------
-
 def parse_args():
     ap = argparse.ArgumentParser("OBB-Pose11 training (YOLO11-style LR, no torch schedulers)")
     ap.add_argument("--cfg", type=str, default="src/configs/obbpose11.yaml", help="YAML config path")
@@ -213,45 +187,39 @@ def parse_args():
     ap.add_argument("--amp", type=int, default=None, help="1/0")
     ap.add_argument("--save_dir", type=str, default=None)
     ap.add_argument("--lrf", type=float, default=None, help="final LR fraction (cosine), e.g. 0.01")
-    ap.add_argument("--warmup_epochs", type=float, default=None, help="warmup length in epochs (optimizer updates)")
+    ap.add_argument("--warmup_epochs", type=float, default=None, help="warmup length in epochs")
     ap.add_argument("--warmup_lr_init", type=float, default=None, help="init LR as a fraction of base, e.g. 0.2")
     ap.add_argument("--overfit_n", type=int, default=None)
     ap.add_argument("--eval_interval", type=int, default=1)
     ap.add_argument("--eval_subset", type=float, default=None)
     return ap.parse_args()
 
-
 def main():
     args = parse_args()
     logger = setup_logger()
 
     # ---- distributed init ----
+    rank, world_size, is_dist = distu.init(backend="nccl" if torch.cuda.is_available() else "gloo")
     use_cuda = torch.cuda.is_available()
-    backend = "nccl" if use_cuda else "gloo"
-    dist_init(backend=backend)
-
-    # device
+    device = torch.device(f"cuda:{distu.LOCAL_RANK}" if use_cuda else "cpu")
     if use_cuda:
-        torch.cuda.set_device(LOCAL_RANK if IS_DISTRIBUTED else 0)
-        device = torch.device(f"cuda:{LOCAL_RANK}" if IS_DISTRIBUTED else "cuda:0")
+        torch.cuda.set_device(distu.LOCAL_RANK)
         cudnn.benchmark = True
-    else:
-        device = torch.device("cpu")
 
     # ---- config & seed ----
     cfg = merge_overrides(load_cfg(args.cfg), args)
     tr = getattr(cfg, "train", SimpleNamespace())
-    seed_everything(int(getattr(tr, "seed", 0)), rank=RANK)
+    seed_everything(int(getattr(tr, "seed", 0)), rank=rank)
 
     # ---- batch/loader params ----
     batch_mode = str(getattr(tr, "batch_mode", "per_device"))
-    batch_cfg = int(getattr(tr, "batch", 8))
-    batch_per_proc = per_device_batch(batch_cfg, WORLD_SIZE, batch_mode)
-    workers = int(getattr(tr, "workers", 4))
+    batch_cfg = int(getattr(tr, "batch", 8 if not hasattr(args, "batch") or args.batch is None else args.batch))
+    batch_per_proc = per_device_batch(batch_cfg, world_size, batch_mode)
+    workers = int(getattr(tr, "workers", 4 if args.workers is None else args.workers))
     overfit_n = int(getattr(getattr(cfg, "data", SimpleNamespace()), "overfit_n", 0)) or None
 
-    if is_main_process():
-        logger.info(f"[DDP] world={WORLD_SIZE} | per_gpu_batch={batch_per_proc} | accum_steps={int(getattr(tr,'accum',1))}")
+    if distu.is_main_process():
+        logger.info(f"[DDP] world={world_size} | per_gpu_batch={batch_per_proc} | accum_steps={int(getattr(tr,'accum',1))}")
 
     # ---- data ----
     train_loader, val_loader, train_sampler = build_dataloaders(
@@ -259,15 +227,29 @@ def main():
         batch_per_device=batch_per_proc,
         workers=workers,
         overfit_n=overfit_n,
-        rank=RANK,
-        world_size=WORLD_SIZE,
+        rank=rank,
+        world_size=world_size,
     )
     dataset_summary(logger, train_loader, val_loader)
 
     # ---- model & loss ----
     model = build_model(cfg, device)
-    if IS_DISTRIBUTED and use_cuda:
-        model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, find_unused_parameters=False, gradient_as_bucket_view=True)
+
+    # --- DDP wrap (tolerate per-rank unused params) ---
+    ddp_find_unused = bool(getattr(getattr(cfg, "train", object()), "ddp_find_unused", True))
+    ddp_static_graph = bool(getattr(getattr(cfg, "train", object()), "ddp_static_graph", False))
+
+    if is_dist and use_cuda:
+        model = DDP(
+            model,
+            device_ids=[distu.LOCAL_RANK],
+            output_device=distu.LOCAL_RANK,
+            find_unused_parameters=ddp_find_unused,
+            static_graph=ddp_static_graph,  # keep False if graph can change
+            gradient_as_bucket_view=True,
+            broadcast_buffers=False,
+        )
+
     criterion = build_criterion(cfg, device)
 
     # ---- optim / amp ----
@@ -280,20 +262,18 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    # record base lr for manual warmup/cosine
     for pg in optimizer.param_groups:
         pg.setdefault("base_lr", pg["lr"])
 
     # cosine params
-    lrf = float(getattr(tr, "lrf", 0.01))                # final LR fraction
+    lrf = float(getattr(tr, "lrf", 0.01))
     def cosine_factor(epoch: int) -> float:
         return ((1 + math.cos(math.pi * epoch / max(1, epochs))) / 2) * (1 - lrf) + lrf
 
-    # warmup params (in optimizer updates)
     warmup_epochs = float(getattr(tr, "warmup_epochs", 3.0))
-    warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))  # as a fraction of base
+    warmup_lr_init = float(getattr(tr, "warmup_lr_init", 0.2))
 
-    scaler = GradScaler(enabled=use_amp)
+    scaler = amp.GradScaler("cuda" if use_cuda else "cpu", enabled=use_amp)
     evaluator = EvaluatorFull(
         cfg={"eval": {"score_thresh": 0.3, "nms_iou": 0.5, "iou_thr": 0.5,
                       "pck_tau": 0.05, "max_det": 100},
@@ -310,10 +290,9 @@ def main():
         use_amp=use_amp,
         grad_accum=accum,
         max_grad_norm=getattr(tr, "max_grad_norm", None),
-        logger=logger if is_main_process() else None,
+        logger=logger if distu.is_main_process() else None,
         cfg=cfg,
         ckpt_dir=save_dir,
-        # manual LR controls
         cosine_factor=cosine_factor,
         warmup_epochs=warmup_epochs,
         warmup_lr_init=warmup_lr_init,
@@ -321,12 +300,15 @@ def main():
 
     trainer.fit(train_loader, val_loader, evaluator, train_sampler=train_sampler)
 
-    metrics = evaluator.evaluate(model, val_loader, device='cuda')
-    print(metrics)
+    # optional final eval on main only
+    if distu.is_main_process():
+        with torch.inference_mode(), amp.autocast(device_type="cuda", enabled=use_amp):
+            metrics = evaluator.evaluate(model.module if isinstance(model, DDP) else model,
+                                         val_loader, device=str(device), max_images=None)
+        print(metrics)
 
-    maybe_barrier()
-    cleanup()
-
+    distu.maybe_barrier()
+    distu.cleanup()
 
 if __name__ == "__main__":
     main()

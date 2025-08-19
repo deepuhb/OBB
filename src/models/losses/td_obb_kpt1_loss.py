@@ -7,12 +7,26 @@ import math
 import numpy as np
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 # -------------------------------------------------------------
 # Utilities: robust GT extraction for both formats
 # -------------------------------------------------------------
+def _is_dist():
+    return dist.is_available() and dist.is_initialized()
+
+@torch.no_grad()
+def _synth_center_obbs(batch_size, img_h, img_w, device, deg=0.0):
+    # 1 ROI per image, centered, 1/3 of min side
+    S = min(img_h, img_w)
+    w = h = float(S) / 3.0
+    cx = float(img_w) / 2.0
+    cy = float(img_h) / 2.0
+    obb = torch.tensor([cx, cy, w, h, deg], device=device).view(1, 5)
+    return [obb.clone() for _ in range(batch_size)]
+
 
 def _split_targets_by_image(t: torch.Tensor, B: int, device: torch.device):
     """
@@ -350,77 +364,122 @@ class TDOBBWKpt1Criterion(nn.Module):
 
     def _loss_kpt(self, model, feats, pos_meta, kpts_list):
         """
-        Compute keypoint loss. If no detection-based ROIs exist,
-        fall back to GT boxes so kpt head still trains.
+        Keypoint loss with:
+          - det-ROI first, GT-OBB fallback (angles in DEG),
+          - DDP-safe dummy forward when a rank has 0 valid samples but others don't.
+        Returns:
+          l_kpt (scalar tensor), valid_count (int)
         """
-        device = feats[0].device if isinstance(feats, (list, tuple)) else feats.device
-        S = getattr(model.roi, "S", 64)  # crop size
-        feat_down = getattr(model.roi, "feat_down", 8)  # stride used by ROI
+        # --- basic config ---
+        feat0 = feats[0] if isinstance(feats, (list, tuple)) else feats
+        device = feat0.device
+        B, _, Hf, Wf = feat0.shape
+
+        roi = getattr(model, "roi", None)
+        S = getattr(roi, "S", 64)
+        feat_down = getattr(roi, "feat_down", 8)
         kpt_weight = getattr(self, "lambda_kpt", 1.0)
 
-        # 1) Try detection positives → ROIs
-        uv_pred, metas = model.kpt_from_obbs(feats, pos_meta)  # should return (N,2), [dict{bix,M}, ...]
-        num_rois = uv_pred.shape[0] if torch.is_tensor(uv_pred) else 0
+        # --- 1) try detection-based ROIs ---
+        uv_pred, metas = model.kpt_from_obbs(feats, pos_meta)  # (N,2), [{'bix', 'M'}, ...]
+        n_rois = int(uv_pred.shape[0]) if torch.is_tensor(uv_pred) else 0
 
-        # 2) Fallback: build GT OBBs (in IMAGE px, ANGLE IN DEGREES) and crop
-        if num_rois == 0:
+        # --- 2) GT fallback (image px, angle in DEG) ---
+        if n_rois == 0:
+            # boxes source prepared earlier in forward()
+            boxes_src = getattr(self, "_boxes_list", None)
+            if boxes_src is None:
+                boxes_src = [None] * len(kpts_list)
+
             obb_list = []
-            for b, (boxes_b, kpts_b) in enumerate(zip(self._boxes_list, kpts_list)):
-                if boxes_b is None or boxes_b.numel() == 0:
+            for boxes_b, _ in zip(boxes_src, kpts_list):
+                if boxes_b is None or (torch.is_tensor(boxes_b) and boxes_b.numel() == 0):
                     obb_list.append(torch.zeros((0, 5), device=device))
-                    continue
-                obb_b = boxes_b.clone().to(device)  # (Ni,5) cx,cy,w,h,theta_rad
-                obb_b[:, 4] = obb_b[:, 4] * (180.0 / math.pi)  # rad → deg **important**
-                obb_list.append(obb_b)
+                else:
+                    ob = boxes_b.to(device).clone()  # (Ni,5) cx,cy,w,h,theta(rad)
+                    ob[:, 4] = ob[:, 4] * (180.0 / math.pi)  # rad -> deg
+                    obb_list.append(ob)
+
             uv_pred, metas = model.kpt_from_obbs(feats, obb_list)
-            num_rois = uv_pred.shape[0] if torch.is_tensor(uv_pred) else 0
+            n_rois = int(uv_pred.shape[0]) if torch.is_tensor(uv_pred) else 0
 
-        if num_rois == 0:
-            # Nothing to train on this step
-            return torch.zeros((), device=device), 0
+        # --- If still nothing, maybe other ranks have samples -> dummy head forward here ---
+        if n_rois == 0:
+            # Check if ANY rank has kpt samples this step
+            has_local = torch.tensor([0], device=device, dtype=torch.int32)
+            any_has = has_local.clone()
+            if _is_dist():
+                dist.all_reduce(any_has, op=dist.ReduceOp.MAX)
 
-        # 3) Build GT uv targets per ROI
-        # metas: list of dicts {'bix': int, 'M': (2,3)}
+            l_kpt = torch.zeros((), device=device)
+            if any_has.item() == 1:
+                # Build one synthetic ROI per image around center of IMAGE (in px, deg)
+                # Need image resolution: infer from feature map & stride
+                img_h = Hf * int(feat_down)
+                img_w = Wf * int(feat_down)
+                synth_obbs = _synth_center_obbs(B, img_h, img_w, device, deg=0.0)
+                # ROI is @no_grad(), so crops are constants; the head still gets a graph via its own weights.
+                uv_dummy, _ = model.kpt_from_obbs(feats, synth_obbs)  # (B,2) or (N,2)
+                if torch.is_tensor(uv_dummy) and uv_dummy.numel() > 0:
+                    l_kpt = l_kpt + uv_dummy.sum() * 0.0  # zero-cost dummy that uses kpt head params
+            return l_kpt, 0
+
+        # --- 3) Build GT uv targets per ROI using metas['M'] mapping (crop px -> feat px) ---
         uv_tgt = torch.zeros_like(uv_pred, device=device)
-        valid = torch.zeros((num_rois,), dtype=torch.bool, device=device)
+        valid = torch.zeros((n_rois,), dtype=torch.bool, device=device)
+
         idx = 0
         for m in metas:
+            # metas are detached in roi; still convert dtype/device explicitly
             b = int(m.get('b', m.get('bix', 0)))
             M = m['M'].to(device=device, dtype=uv_pred.dtype)
-            # choose the first kpt for that object (dataset has 1 kpt per OBB)
-            # If you have multiple objs per image, align via the same index order:
-            # here we use a nearest match by center for simplicity.
-            if b >= len(kpts_list) or kpts_list[b].numel() == 0:
+
+            if b >= len(kpts_list) or kpts_list[b] is None or kpts_list[b].numel() == 0:
                 idx += 1
                 continue
-            kpts_b = kpts_list[b]  # (Ni,2) in image px
-            # nearest by center from M center (optional improvement)
-            # Map all GT kpts to crop uv and take the closest to crop center
-            uv_all = _img_kpts_to_crop_uv(kpts_b, M, feat_down)  # (Ni,2) in crop px
-            # Clamp inside crop
+
+            k_b = kpts_list[b]  # (Ni,2) in IMAGE px
+            uv_all = _img_kpts_to_crop_uv(k_b, M, feat_down)  # -> (Ni,2) crop px
             uv_all = torch.clamp(uv_all, 0, S - 1)
-            # Pick the closest GT to the crop center (S/2,S/2)
+
             d2 = (uv_all[:, 0] - (S / 2)) ** 2 + (uv_all[:, 1] - (S / 2)) ** 2
             j = int(torch.argmin(d2).item())
             uv_tgt[idx] = uv_all[j]
             valid[idx] = True
             idx += 1
 
-        if not valid.any():
-            return torch.zeros((), device=device), 0
+        vcnt = int(valid.sum().item())
 
+        # If no valid mapping on this rank but others have ROIs, run dummy forward for DDP
+        if vcnt == 0:
+            has_local = torch.tensor([1], device=device, dtype=torch.int32)  # we *had* ROIs, mapping failed locally
+            any_has = has_local.clone()
+            if _is_dist():
+                dist.all_reduce(any_has, op=dist.ReduceOp.MAX)
+
+            l_kpt = torch.zeros((), device=device)
+            if any_has.item() == 1:
+                img_h = Hf * int(feat_down)
+                img_w = Wf * int(feat_down)
+                synth_obbs = _synth_center_obbs(B, img_h, img_w, device, deg=0.0)
+                uv_dummy, _ = model.kpt_from_obbs(feats, synth_obbs)
+                if torch.is_tensor(uv_dummy) and uv_dummy.numel() > 0:
+                    l_kpt = l_kpt + uv_dummy.sum() * 0.0
+            return l_kpt, 0
+
+        # --- 4) real loss ---
         uv_pred_v = uv_pred[valid]
         uv_tgt_v = uv_tgt[valid]
-
         l_kpt = F.smooth_l1_loss(uv_pred_v, uv_tgt_v, reduction='mean')
 
-        if not hasattr(self, "_kpt_dbg_once"):
-            self._kpt_dbg_once = True
-            print(f"[kpt] ROIs {num_rois}, valid {int(valid.sum())}, "
-                  f"l_kpt_raw {float(l_kpt.detach().item()):.4f}, weight {kpt_weight}")
+        # Print once (rank 0)
+        if (not _is_dist()) or dist.get_rank() == 0:
+            if not hasattr(self, "_kpt_dbg_once"):
+                self._kpt_dbg_once = True
+                print(
+                    f"[kpt] ROIs {n_rois}, valid {vcnt}, l_kpt_raw {float(l_kpt.detach().item()):.4f}, weight {kpt_weight}")
 
-        # Return raw loss (weighting applied at caller)
-        return l_kpt, int(valid.sum())
+        return l_kpt, vcnt
 
     def forward(
         self,
