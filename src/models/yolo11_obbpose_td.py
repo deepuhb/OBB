@@ -1,10 +1,9 @@
 # src/models/yolo11_obbpose_td.py
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .layers.rot_roi import RotatedROIPool
-
-
 
 
 # ---- Tiny YOLO11-ish blocks (you can swap with your existing backbone/neck) ----
@@ -191,6 +190,195 @@ class YOLO11_OBBPOSE_TD(nn.Module):
             feats = [v for v in feats.values() if torch.is_tensor(v)]
             return max(feats, key=lambda t: t.shape[-1] * t.shape[-2])
         raise TypeError(f"Unsupported feats type: {type(feats)}")
+
+    @torch.no_grad()
+    def export_decode(
+            self,
+            det_maps_or_dense: torch.Tensor,
+            imgs: torch.Tensor,
+            score_thr: float = 0.25,
+            max_det: int = 300,
+    ):
+        """
+        Unified decoder for export:
+          - If input is list[Tensor(B,C,Hf,Wf)]: route to decode_obb_from_pyramids().
+          - If input is Tensor(B,N,K) with K>=7 and channel order
+                [cx, cy, w, h, sinθ, cosθ, obj, cls...]
+            (or same order but with *logits* that still need sigmoid for obj/cls)
+            decode to per-image dicts:
+                {'boxes': (Ni,5)[cx,cy,w,h,theta(rad)], 'scores': (Ni,), 'cls': Optional[(Ni,)]}
+        """
+        import torch
+
+        # Case A: pyramids (training/eval)
+        if isinstance(det_maps_or_dense, (list, tuple)):
+            return self.decode_obb_from_pyramids(det_maps_or_dense, imgs, score_thr=score_thr, max_det=max_det)
+
+        # Case B: dense predictions (B,N,K)
+        t = det_maps_or_dense
+        if (not torch.is_tensor(t)) or t.dim() != 3 or t.size(-1) < 7:
+            # graceful fallback: nothing to decode
+            B = imgs.shape[0]
+            z = imgs.new_zeros
+            return [{"boxes": z((0, 5)), "scores": z((0,)), "cls": None} for _ in range(B)]
+
+        B, N, K = t.shape
+        device = t.device
+
+        # geometry
+        cx = t[..., 0]
+        cy = t[..., 1]
+        w = t[..., 2]
+        h = t[..., 3]
+        s = t[..., 4]  # sinθ (raw)
+        c = t[..., 5]  # cosθ (raw)
+        ang = torch.atan2(s, c)  # radians
+
+        # scores & classes
+        obj = t[..., 6].sigmoid()
+        cls = None
+        if K > 7:
+            cls_logits = t[..., 7:]
+            cls_prob = cls_logits.sigmoid()  # (B,N,nc)
+            cls_score, cls_idx = cls_prob.max(dim=-1)  # (B,N)
+            scores = obj * cls_score
+            cls = cls_idx
+        else:
+            scores = obj
+
+        # threshold & top-k per image
+        out = []
+        for b in range(B):
+            sb = scores[b]
+            keep = sb >= float(score_thr)
+            if keep.any():
+                bx = torch.stack([cx[b][keep], cy[b][keep], w[b][keep], h[b][keep], ang[b][keep]], dim=-1)
+                sc = sb[keep]
+                if bx.shape[0] > max_det:
+                    idx = torch.topk(sc, k=max_det, largest=True).indices
+                    bx, sc = bx[idx], sc[idx]
+                    clb = cls[b][keep][idx] if cls is not None else None
+                else:
+                    clb = cls[b][keep] if cls is not None else None
+            else:
+                bx = imgs.new_zeros((0, 5), device=device)
+                sc = imgs.new_zeros((0,), device=device)
+                clb = None
+
+            out.append({"boxes": bx, "scores": sc, "cls": clb})
+        return out
+
+    @torch.no_grad()
+    def decode_obb_from_pyramids(
+            self,
+            pyramids,
+            imgs: torch.Tensor,
+            score_thr: float = 0.25,
+            max_det: int = 300,
+    ):
+        """
+        Decode anchor-free head outputs with channel order:
+          [tx, ty, tw, th, sinθ, cosθ, obj, cls...]
+
+        Args
+          pyramids: list[Tensor] of shape (B, C, Hf, Wf)
+          imgs:     (B,3,H,W) input images (for scale)
+        Returns list[dict] per image:
+          {'boxes': (Ni,5)[cx,cy,w,h,theta(rad)], 'scores': (Ni,), 'cls': Optional[(Ni,)]}
+        """
+        import torch
+        B, _, H, W = imgs.shape
+        device = imgs.device
+
+        per_img_boxes, per_img_scores, per_img_cls = [[] for _ in range(B)], [[] for _ in range(B)], [[] for _ in
+                                                                                                      range(B)]
+
+        for p in pyramids:
+            if (not torch.is_tensor(p)) or p.dim() != 4 or p.size(1) < 7:
+                continue
+            Bp, C, Hf, Wf = p.shape
+            assert Bp == B, "Batch mismatch between pyramids and imgs"
+
+            # spatial strides for that level
+            stride_x = W / float(Wf)
+            stride_y = H / float(Hf)
+            stride = 0.5 * (stride_x + stride_y)
+
+            # ---- split channels (correct offsets!) ----
+            tx = p[:, 0:1]  # (B,1,Hf,Wf)
+            ty = p[:, 1:2]
+            tw = p[:, 2:3]
+            th = p[:, 3:4]
+            s = p[:, 4:5]  # sinθ
+            c = p[:, 5:6]  # cosθ
+            tobj = p[:, 6:7]  # obj
+            cls_logits = p[:, 7:] if C > 7 else None
+
+            # grids
+            gy = torch.arange(Hf, device=device).view(1, 1, Hf, 1).expand(B, 1, Hf, Wf)
+            gx = torch.arange(Wf, device=device).view(1, 1, 1, Wf).expand(B, 1, Hf, Wf)
+
+            # decode to pixels
+            cx = (gx + tx.sigmoid()) * stride_x
+            cy = (gy + ty.sigmoid()) * stride_y
+            w = tw.exp() * stride
+            h = th.exp() * stride
+            ang = torch.atan2(s, c).squeeze(1)  # (B,Hf,Wf)
+            obj = tobj.sigmoid().squeeze(1)  # (B,Hf,Wf)
+
+            if cls_logits is not None and cls_logits.numel():
+                cls_prob = cls_logits.sigmoid()  # (B,nc,Hf,Wf)
+                cls_score, cls_idx = cls_prob.max(dim=1)  # (B,Hf,Wf)
+                score = obj * cls_score
+            else:
+                score = obj
+                cls_idx = None
+
+            # flatten
+            cx = cx.reshape(B, -1)
+            cy = cy.reshape(B, -1)
+            w = w.reshape(B, -1)
+            h = h.reshape(B, -1)
+            ang = ang.reshape(B, -1)
+            score = score.reshape(B, -1)
+            if cls_idx is not None:
+                cls_idx = cls_idx.reshape(B, -1)
+
+            # threshold & collect
+            keep = score >= float(score_thr)
+            for b in range(B):
+                kb = keep[b]
+                if kb.any():
+                    bx = torch.stack([cx[b][kb], cy[b][kb], w[b][kb], h[b][kb], ang[b][kb]], dim=-1)
+                    sc = score[b][kb]
+                    cl = (cls_idx[b][kb] if cls_idx is not None else None)
+                else:
+                    bx = imgs.new_zeros((0, 5))
+                    sc = imgs.new_zeros((0,))
+                    cl = None
+                per_img_boxes[b].append(bx)
+                per_img_scores[b].append(sc)
+                per_img_cls[b].append(cl)
+
+        # concat per-image and top-k
+        out = []
+        for b in range(B):
+            if per_img_boxes[b]:
+                bx = torch.cat(per_img_boxes[b], dim=0) if len(per_img_boxes[b]) > 1 else per_img_boxes[b][0]
+                sc = torch.cat(per_img_scores[b], dim=0) if len(per_img_scores[b]) > 1 else per_img_scores[b][0]
+                cl = None
+                if per_img_cls[b] and per_img_cls[b][0] is not None:
+                    cl = torch.cat(per_img_cls[b], dim=0) if len(per_img_cls[b]) > 1 else per_img_cls[b][0]
+
+                if bx.shape[0] > max_det:
+                    idx = torch.topk(sc, k=max_det, largest=True).indices
+                    bx, sc = bx[idx], sc[idx]
+                    if cl is not None:
+                        cl = cl[idx]
+                out.append({"boxes": bx, "scores": sc, "cls": cl})
+            else:
+                out.append({"boxes": imgs.new_zeros((0, 5)), "scores": imgs.new_zeros((0,)), "cls": None})
+        return out
 
     @torch.inference_mode()
     def kpt_from_obbs(self,

@@ -1,14 +1,14 @@
 # src/engine/evaluator_full.py
 
-import math
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-# -------- optional fast geometry backends --------
+# ---- optional fast geometry backends ----
 try:
     from mmcv.ops import box_iou_rotated as mmcv_box_iou_rotated
     from mmcv.ops import nms_rotated as mmcv_nms_rotated
@@ -24,17 +24,12 @@ except Exception:
 
 
 def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Merge order (rightmost wins):
-      defaults  <- cfg.evaluator or cfg  <- params
-    Works with dicts or objects (OmegaConf / SimpleNamespace).
-    """
+    """Merge (defaults <- cfg.evaluator or cfg <- params). Only known keys are used."""
     def to_dict(x):
         if x is None:
             return {}
         if isinstance(x, dict):
             return dict(x)
-        # object-like (OmegaConf, AttrDict, SimpleNamespace...)
         out = {}
         for k in dir(x):
             if k.startswith("_"):
@@ -43,49 +38,38 @@ def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
                 v = getattr(x, k)
             except Exception:
                 continue
-            # avoid methods
             if callable(v):
                 continue
             out[k] = v
         return out
 
-    # defaults
     d = dict(
         score_thresh=0.25,
         nms_iou=0.5,
         max_det=100,
         iou_backend=("mmcv" if _MMCV_OK else "shapely"),
-        map_iou_st=0.5,
-        map_iou_ed=0.95,
-        map_iou_step=0.05,
+        map_iou_st=0.5, map_iou_ed=0.95, map_iou_step=0.05,
         pck_alpha=0.05,
         print_every=0,
     )
 
-    # pull from cfg (prefer cfg.evaluator if present)
     src = None
     if cfg is not None:
-        # cfg may have .evaluator or ['evaluator']
         for key in ("evaluator",):
-            try:
-                if isinstance(cfg, dict) and key in cfg:
-                    src = cfg[key]
-                    break
-                if hasattr(cfg, key):
-                    src = getattr(cfg, key)
-                    break
-            except Exception:
-                pass
+            if isinstance(cfg, dict) and key in cfg:
+                src = cfg[key]; break
+            if hasattr(cfg, key):
+                src = getattr(cfg, key); break
         if src is None:
             src = cfg
-        d.update({k: v for k, v in to_dict(src).items()
-                  if k in d})  # ignore unrelated keys
-
-    # final overlay from params if provided
+        for k, v in to_dict(src).items():
+            if k in d:
+                d[k] = v
     if params:
-        d.update({k: v for k, v in params.items() if k in d})
+        for k, v in params.items():
+            if k in d:
+                d[k] = v
 
-    # coerce types
     d["score_thresh"] = float(d["score_thresh"])
     d["nms_iou"] = float(d["nms_iou"])
     d["max_det"] = int(d["max_det"])
@@ -100,21 +84,13 @@ def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
 
 class EvaluatorFull:
     """
-    Full evaluator for OBB + single keypoint.
+    OBB + single keypoint evaluator.
 
-    Expects val_loader batches shaped like your dataset/collate:
-      batch = {
-        "image": (B,3,H,W) tensor,
-        "bboxes": list[Bi,5]  [cx,cy,w,h,theta(rad)] in image pixels,
-        "labels": list[Bi],   ints,
-        "kpts":   list[Bi,2]  [x,y] in image pixels,
-        "paths":  list[str],  (optional)
-        "meta":   ...         (optional)
-      }
-
-    Model hooks (already exist in your codebase):
-      - forward(imgs) -> (det_maps, feats)  (or anything the decoder can handle)
-      - model.kpt_from_obbs(feats, obb_list) -> (N,2) predicted keypoints in image px
+    Expects val batch like:
+      {"image": (B,3,H,W),
+       "bboxes": list[Ti,5]  (cx,cy,w,h,rad) px,
+       "labels": list[Ti],   ints,
+       "kpts":   list[Ti,2]  (x,y) px, ...}
     """
 
     def __init__(self,
@@ -127,16 +103,13 @@ class EvaluatorFull:
         self.cfg = _cfg_to_params(cfg, params)
 
         if self.cfg["iou_backend"] == "mmcv" and not _MMCV_OK:
-            self.log.warning("[eval] iou_backend='mmcv' requested, but MMCV ops not available → using 'shapely'.")
+            self.log.warning("[eval] iou_backend='mmcv' requested but MMCV ops not found; falling back.")
             self.cfg["iou_backend"] = "shapely"
         if self.cfg["iou_backend"] == "shapely" and not _SHAPELY_OK:
-            self.log.warning("[eval] Shapely not available → falling back to AABB IoU (rough).")
+            self.log.warning("[eval] Shapely not found; falling back to coarse AABB IoU.")
 
-        # precompute IoU thresholds for mAP
         self.iou_thrs = np.arange(
-            self.cfg["map_iou_st"],
-            self.cfg["map_iou_ed"] + 1e-9,
-            self.cfg["map_iou_step"]
+            self.cfg["map_iou_st"], self.cfg["map_iou_ed"] + 1e-9, self.cfg["map_iou_step"]
         ).round(2)
 
     # ---------------- EVALUATE ----------------
@@ -148,7 +121,6 @@ class EvaluatorFull:
                  device: torch.device,
                  max_images: Optional[int] = None) -> Dict[str, Any]:
 
-        # --- unwrap DDP to access real hooks ---
         model_eval = model.module if hasattr(model, "module") else model
         model_eval.eval()
 
@@ -156,9 +128,7 @@ class EvaluatorFull:
             "tp_by_thr": {float(t): [] for t in self.iou_thrs},
             "fp_by_thr": {float(t): [] for t in self.iou_thrs},
             "scores_by_thr": {float(t): [] for t in self.iou_thrs},
-            "gt_total": 0,
-            "pred_count": 0,
-            "best_iou": [],
+            "gt_total": 0, "pred_count": 0, "best_iou": [],
             "recall_hits": {0.1: 0, 0.3: 0, 0.5: 0},
             "images_eval": 0,
             "pck_ok": 0, "pck_any_ok": 0, "pck_total": 0
@@ -168,37 +138,35 @@ class EvaluatorFull:
         for batch in val_loader:
             if max_images is not None and img_seen >= max_images:
                 break
-
             if not isinstance(batch, dict) or "image" not in batch:
                 self.log.warning("[eval] Unexpected batch format; skipping.")
                 continue
 
-            imgs = batch["image"].to(device, non_blocking=True).float()  # (B,3,H,W)
+            imgs = batch["image"].to(device, non_blocking=True).float()
             B, _, H, W = imgs.shape
 
             outs = model(imgs)
             det_maps, feats = self._split_outs(outs)
 
-            # decode detections for each image
-            preds_list = self._decode_preds(model, det_maps, imgs, score_thr=self.cfg["score_thresh"])
+            preds_list = self._decode_preds(model_eval, det_maps, imgs, score_thr=self.cfg["score_thresh"])
             if preds_list is None or len(preds_list) != B:
+                if not hasattr(self, "_decode_dbg_once"):
+                    self._decode_dbg_once = True
+                    self._debug_decode_failure(model_eval, det_maps)
                 self.log.error("[eval] Could not decode predictions; returning empty preds.")
-                preds_list = [self._empty_pred(device)] * B
+                preds_list = [self._empty_pred(device) for _ in range(B)]
 
-            # gather GT lists
             gtb_list = batch.get("bboxes", [torch.zeros((0, 5), device=device) for _ in range(B)])
-            gtl_list = batch.get("labels", [torch.zeros((0,), dtype=torch.long, device=device) for _ in range(B)])
             gtk_list = batch.get("kpts",   [torch.zeros((0, 2), device=device) for _ in range(B)])
 
-            # optional: run TD keypoint head on predicted OBBs
             uv_pred = None
             if hasattr(model_eval, "kpt_from_obbs"):
-                obb_for_kpt = []
-                for pred in preds_list:
-                    bx = pred["boxes"]
-                    obb_for_kpt.append(bx[: min(self.cfg["max_det"], bx.shape[0])] if bx.numel() else bx)
                 try:
-                    uv_pred, metas = model_eval.kpt_from_obbs(feats, obb_for_kpt)
+                    obb_for_kpt = []
+                    for pred in preds_list:
+                        bx = pred["boxes"]
+                        obb_for_kpt.append(bx[: min(self.cfg["max_det"], bx.shape[0])] if bx.numel() else bx)
+                    uv_pred, _ = model_eval.kpt_from_obbs(feats, obb_for_kpt)
                 except Exception as e:
                     self.log.debug("[eval] kpt_from_obbs failed: %s", str(e))
                     uv_pred = None
@@ -220,14 +188,9 @@ class EvaluatorFull:
                 stats["pred_count"] += int(boxes.shape[0])
                 stats["gt_total"]   += int(gt_boxes.shape[0])
 
-                iou_mat = self._iou_matrix(boxes, gt_boxes)  # (P,G) on CPU
-                if iou_mat.numel():
-                    iou_mat = iou_mat.clamp_(0.0, 1.0)  # safety
-                    stats["best_iou"].append(float(iou_mat.max().item()))
-                else:
-                    stats["best_iou"].append(0.0)
+                iou_mat = self._iou_matrix(boxes, gt_boxes)
+                stats["best_iou"].append(float(iou_mat.max().item()) if iou_mat.numel() else 0.0)
 
-                # greedy class-agnostic matching by score
                 order = torch.argsort(scores, descending=True)
                 used = torch.zeros((gt_boxes.shape[0],), dtype=torch.bool)
                 for t in self.iou_thrs:
@@ -246,21 +209,19 @@ class EvaluatorFull:
                     stats["scores_by_thr"][float(t)].extend([float(s) for s in scores[order].tolist()])
                     used.zero_()
 
-                # recall@x (per-GT best over preds)
                 if gt_boxes.shape[0] and boxes.shape[0] and iou_mat.numel():
                     max_per_gt = iou_mat.max(dim=0).values
                     for r in (0.1, 0.3, 0.5):
                         stats["recall_hits"][r] += int((max_per_gt >= r).sum().item())
 
-                # PCK (single kp per obj)
                 if uv_pred is not None and gt_kpts.numel():
                     n_here = min(boxes.shape[0], uv_pred.shape[0] - uv_cursor)
                     if n_here > 0:
-                        uv_batch = uv_pred[uv_cursor: uv_cursor + n_here]  # (n,2) image px
+                        uv_batch = uv_pred[uv_cursor: uv_cursor + n_here]
                         uv_cursor += n_here
                         sizes = torch.sqrt(boxes[:n_here, 2] * boxes[:n_here, 3]).clamp(min=1.0)
-                        thr = self.cfg["pck_alpha"] * sizes  # (n,)
-                        dists = torch.cdist(uv_batch.float().to(device), gt_kpts.float().to(device))  # (n,G)
+                        thr = self.cfg["pck_alpha"] * sizes
+                        dists = torch.cdist(uv_batch.float().to(device), gt_kpts.float().to(device))
                         if dists.numel():
                             dmin, _ = dists.min(dim=1)
                             ok = (dmin <= thr)
@@ -280,12 +241,29 @@ class EvaluatorFull:
         self._pretty(metrics)
         return metrics
 
-    # --------------- helpers ---------------
+    # --------------- OUTS → (det_maps, feats) ---------------
 
     def _split_outs(self, outs):
-        if isinstance(outs, (tuple, list)) and len(outs) == 2:
-            return outs[0], outs[1]
+        # tuple/list: (det_maps, feats)
+        if isinstance(outs, (tuple, list)):
+            if len(outs) == 2:
+                return outs[0], outs[1]
+            if len(outs) == 1:
+                return outs[0], None
+            return outs, None  # unknown but pass through
+
+        # dict: common keys
+        if isinstance(outs, dict):
+            feats = outs.get("feats", outs.get("features", None))
+            det = outs.get("det", None)
+            if det is None:
+                det = outs.get("maps", outs.get("pyramids", outs.get("preds", outs)))
+            return det, feats
+
+        # raw tensor or other
         return outs, None
+
+    # --------------- decode helpers ---------------
 
     def _empty_pred(self, device):
         return {"boxes": torch.zeros((0, 5), device=device),
@@ -293,167 +271,163 @@ class EvaluatorFull:
                 "cls": None}
 
     def _decode_preds(self, model_eval, det_maps, imgs, score_thr=0.25):
-        """
-        Return list[dict] per image:
-          {"boxes": (N,5)[cx,cy,w,h,rad] px, "scores": (N,), "cls": (N,) or None}
-        Tries a series of common decoder hooks on the model or its heads, with
-        careful parsing of return formats. Falls back to dense tensor decode.
-        """
+        """Return list[dict] per image with boxes in px/rad, scores, cls."""
         B, _, H, W = imgs.shape
         device = imgs.device
 
-        # ----- 1) Try known hook names on the model itself -----
-        hook_names_model = (
-            "decode_obb", "decode_detections", "detect", "postprocess",
-            "export_decode", "inference", "predict", "forward_export", "decode"
-        )
-        out = self._try_model_hooks(model_eval, det_maps, imgs, hook_names_model)
-        if out is not None:
-            parsed = self._normalize_decoded(out, (W, H), device, score_thr)
-            if parsed is not None:
-                if not hasattr(self, "_dec_path_printed"):
-                    self._dec_path_printed = True
-                    self.log.info("[eval] decode path: model.%s", out.__class__.__name__ if not isinstance(out,
-                                                                                                           (list, tuple,
-                                                                                                            dict,
-                                                                                                            torch.Tensor)) else "hook")
-                return parsed
+        # 0) If det_maps is a dict, try to normalize into something decodable
+        dict_pyr = None
+        if isinstance(det_maps, dict):
+            # A) if looks like per-image lists already
+            if "boxes" in det_maps and isinstance(det_maps["boxes"], list):
+                return self._normalize_decoded(det_maps, (W, H), device, score_thr)
 
-        # ----- 2) Try hooks on common submodules (head / det_head / yolo) -----
+            # B) pull (B,C,Hf,Wf) tensors and order by inferred stride
+            dict_pyr = self._dict_to_pyramid(det_maps, (H, W), device)
+
+        # 1) Known hooks on the model (accept dict or list)
+        hook_names = (
+            "export_decode", "decode_obb", "decode_detections", "postprocess",
+            "predict", "inference", "forward_export", "decode"
+        )
+        out = self._try_hooks(model_eval, det_maps, imgs, hook_names)
+        parsed = self._normalize_decoded(out, (W, H), device, score_thr) if out is not None else None
+        if parsed is not None:
+            self._maybe_log_decode_path(f"model.{self._last_called_name}")
+            return parsed
+
+        # 2) Hooks on common submodules
         for subname in ("head", "det_head", "yolo"):
             sub = getattr(model_eval, subname, None)
             if sub is None:
                 continue
-            out = self._try_model_hooks(sub, det_maps, imgs, hook_names_model)
-            if out is not None:
-                parsed = self._normalize_decoded(out, (W, H), device, score_thr)
-                if parsed is not None:
-                    if not hasattr(self, "_dec_path_printed"):
-                        self._dec_path_printed = True
-                        self.log.info("[eval] decode path: model.%s.<hook>", subname)
-                    return parsed
+            out = self._try_hooks(sub, det_maps, imgs, hook_names)
+            parsed = self._normalize_decoded(out, (W, H), device, score_thr) if out is not None else None
+            if parsed is not None:
+                self._maybe_log_decode_path(f"model.{subname}.{self._last_called_name}")
+                return parsed
 
-        # ----- 3) If det_maps look like dense (B,N,K), decode directly -----
-        if torch.is_tensor(det_maps) and det_maps.dim() == 3 and det_maps.size(-1) >= 6:
-            try:
-                parsed = self._decode_dense(det_maps, (W, H), device, score_thr)
-                if parsed is not None:
-                    if not hasattr(self, "_dec_path_printed"):
-                        self._dec_path_printed = True
-                        self.log.info("[eval] decode path: dense fallback (B,N,K)")
-                    return parsed
-            except Exception as e:
-                self.log.debug("[eval] dense decode failed: %s", str(e))
-
-        # ----- 4) If det_maps is a pyramid (list/tuple), try passing both det_maps & imgs to hooks again -----
-        if isinstance(det_maps, (list, tuple)):
-            for sub in [model_eval] + [getattr(model_eval, n, None) for n in ("head", "det_head", "yolo") if
-                                       hasattr(model_eval, n)]:
-                if sub is None:
-                    continue
-                for name in hook_names_model:
-                    fn = getattr(sub, name, None)
-                    if not callable(fn):
-                        continue
+        # 3) Pyramid decode if we built one from dict
+        if dict_pyr is not None:
+            for name in ("decode_obb_from_pyramids", "decode_from_pyramids", "decode_yolo", "export_pyramids"):
+                fn = getattr(model_eval, name, None)
+                if callable(fn):
                     try:
-                        # some decoders expect (p3,p4,p5, image_size) or (maps, imgs)
+                        out = fn(dict_pyr, imgs)
+                        parsed = self._normalize_decoded(out, (W, H), device, score_thr)
+                        if parsed is not None:
+                            self._maybe_log_decode_path(f"model.{name}(pyramids-from-dict, imgs)")
+                            return parsed
+                    except Exception as e:
+                        self._dbg(f"{name}(dict_pyr, imgs) failed: {e}")
+
+        # 4) If maps are a pyramid list/tuple, try explicit pyramid decode names
+        if isinstance(det_maps, (list, tuple)) and len(det_maps) in (3, 4, 5):
+            for name in ("decode_obb_from_pyramids", "decode_from_pyramids", "decode_yolo", "export_pyramids"):
+                fn = getattr(model_eval, name, None)
+                if callable(fn):
+                    try:
                         out = fn(det_maps, imgs)
                         parsed = self._normalize_decoded(out, (W, H), device, score_thr)
                         if parsed is not None:
-                            if not hasattr(self, "_dec_path_printed"):
-                                self._dec_path_printed = True
-                                who = "model" if sub is model_eval else f"model.{[n for n in ('head', 'det_head', 'yolo') if getattr(model_eval, n, None) is sub][0]}"
-                                self.log.info("[eval] decode path: %s.%s(det_maps, imgs)", who, name)
+                            self._maybe_log_decode_path(f"model.{name}(pyramids, imgs)")
                             return parsed
                     except Exception as e:
-                        self.log.debug("[eval] %s.%s(det_maps, imgs) failed: %s", sub.__class__.__name__, name, str(e))
+                        self._dbg(f"{name}(pyramids, imgs) failed: {e}")
 
-        # ----- 5) Give up -----
+        # 5) Dense fallback (B,N,K) — from tensor OR from any dict entry that matches
+        candidates = []
+        if torch.is_tensor(det_maps):
+            candidates.append(det_maps)
+        elif isinstance(det_maps, dict):
+            for v in det_maps.values():
+                if torch.is_tensor(v) and v.dim() == 3 and v.size(-1) >= 6:
+                    candidates.append(v)
+        for t in candidates:
+            try:
+                parsed = self._decode_dense(t, (W, H), device, score_thr)
+                if parsed is not None:
+                    self._maybe_log_decode_path("dense_fallback(B,N,K)")
+                    return parsed
+            except Exception as e:
+                self._dbg(f"dense fallback failed: {e}")
+
         return None
 
-    def _try_model_hooks(self, obj, det_maps, imgs, names):
-        """Try calling obj.<name> with several signatures in order."""
+    def _try_hooks(self, obj, det_maps, imgs, names):
+        """Try calling obj.<name> with (det_maps, imgs) → (det_maps,) → (imgs,) → ()."""
         for name in names:
             fn = getattr(obj, name, None)
             if not callable(fn):
                 continue
-            # Try most common signatures in order
             for args in ((det_maps, imgs), (det_maps,), (imgs,), tuple()):
                 try:
                     out = fn(*args)
+                    self._last_called_name = name
                     return out
                 except TypeError:
                     continue
                 except Exception as e:
-                    self.log.debug("[eval] %s.%s%r failed: %s", obj.__class__.__name__, name,
-                                   tuple(a.__class__.__name__ for a in args), str(e))
+                    self._dbg(f"{obj.__class__.__name__}.{name}{tuple(a.__class__.__name__ for a in args)} failed: {e}")
                     break
         return None
 
     def _normalize_decoded(self, decoded, wh: Tuple[int, int], device, score_thr):
         W, H = wh
 
-        # Case A: list[dict] per image
+        # A) list[dict]
         if isinstance(decoded, list) and decoded and isinstance(decoded[0], dict):
             out = []
             for d in decoded:
-                boxes = d.get("boxes");
-                scores = d.get("scores")
+                boxes = d.get("boxes"); scores = d.get("scores")
                 cls = d.get("cls", d.get("labels"))
                 if boxes is None or scores is None:
                     return None
                 boxes = self._ensure_px_rad(boxes.to(device), (W, H))
                 scores = scores.to(device)
-                if cls is not None: cls = cls.to(device)
+                if cls is not None:
+                    cls = cls.to(device)
                 keep = scores >= float(score_thr)
-                out.append(
-                    {"boxes": boxes[keep], "scores": scores[keep], "cls": (cls[keep] if cls is not None else None)})
+                out.append({"boxes": boxes[keep], "scores": scores[keep], "cls": (cls[keep] if cls is not None else None)})
             return out
 
-        # Case B: tuple/list where first is list[dict]
+        # B) tuple whose first item is list[dict]
         if isinstance(decoded, (list, tuple)) and decoded:
             first = decoded[0]
             if isinstance(first, list) and first and isinstance(first[0], dict):
                 return self._normalize_decoded(first, wh, device, score_thr)
 
-        # Case C: list[tensor] per image (each [N,>=6])
+        # C) list[tensor] per image, each [N, >=6]
         if isinstance(decoded, list) and decoded and torch.is_tensor(decoded[0]):
             out = []
             for t in decoded:
                 if t.numel() == 0:
-                    out.append(self._empty_pred(device));
-                    continue
+                    out.append(self._empty_pred(device)); continue
                 if t.dim() == 1: t = t[None, :]
                 boxes = self._ensure_px_rad(t[:, :5].to(device), (W, H))
                 scores = t[:, 5].to(device)
                 cls = t[:, 6].long().to(device) if t.size(1) > 6 else None
                 keep = scores >= float(score_thr)
-                out.append(
-                    {"boxes": boxes[keep], "scores": scores[keep], "cls": (cls[keep] if cls is not None else None)})
+                out.append({"boxes": boxes[keep], "scores": scores[keep], "cls": (cls[keep] if cls is not None else None)})
             return out
 
-        # Case D: dict of lists/tensors with per-image items
+        # D) dict of per-image lists/tensors
         if isinstance(decoded, dict) and "boxes" in decoded and isinstance(decoded["boxes"], list):
             out = []
             boxes_list = decoded["boxes"]
             scores_list = decoded.get("scores", [None] * len(boxes_list))
             cls_list = decoded.get("cls", decoded.get("labels", [None] * len(boxes_list)))
             for i in range(len(boxes_list)):
-                bx = boxes_list[i];
-                sc = scores_list[i];
+                bx = boxes_list[i]; sc = scores_list[i]
                 cl = (cls_list[i] if isinstance(cls_list, list) else None)
                 bx = self._ensure_px_rad(bx.to(device), (W, H))
-                if sc is None:
-                    sc = torch.ones((bx.shape[0],), device=device)
-                else:
-                    sc = sc.to(device)
-                if cl is not None:
-                    cl = cl.to(device)
+                sc = torch.ones((bx.shape[0],), device=device) if sc is None else sc.to(device)
+                cl = (cl.to(device) if cl is not None else None)
                 keep = sc >= float(score_thr)
                 out.append({"boxes": bx[keep], "scores": sc[keep], "cls": (cl[keep] if cl is not None else None)})
             return out
 
-        # Case E: dense (B,N,K)
+        # E) dense (B,N,K)
         if torch.is_tensor(decoded) and decoded.dim() == 3 and decoded.size(-1) >= 6:
             return self._decode_dense(decoded, (W, H), device, score_thr)
 
@@ -464,11 +438,11 @@ class EvaluatorFull:
         W, H = wh
         t = t.to(device)
 
-        boxes = t[..., :5]   # cx,cy,w,h,angle
+        boxes = t[..., :5]      # cx,cy,w,h,angle
         scores = t[..., 5]
         cls = t[..., 6].long() if K > 6 else None
 
-        # normalized? heuristic
+        # heuristic: normalized?
         cx_med = boxes[..., 0].detach().abs().median()
         cy_med = boxes[..., 1].detach().abs().median()
         norm_like = (cx_med <= 1.2) and (cy_med <= 1.2)
@@ -477,15 +451,14 @@ class EvaluatorFull:
             boxes[..., 0] *= W; boxes[..., 1] *= H
             boxes[..., 2] *= W; boxes[..., 3] *= H
 
-        # degrees vs radians? heuristic
+        # heuristic: degrees?
         ang_med = boxes[..., 4].detach().abs().median()
-        deg_like = float(ang_med) > 3.5
-        if deg_like:
+        if float(ang_med) > 3.5:
             boxes = boxes.clone()
             boxes[..., 4] = torch.deg2rad(boxes[..., 4].clamp(min=-360.0, max=360.0))
 
-        boxes[..., 2] = boxes[..., 2].clamp(min=1.0, max=W*2.0)
-        boxes[..., 3] = boxes[..., 3].clamp(min=1.0, max=H*2.0)
+        boxes[..., 2] = boxes[..., 2].clamp(min=1.0, max=W * 2.0)
+        boxes[..., 3] = boxes[..., 3].clamp(min=1.0, max=H * 2.0)
 
         outs = []
         for b in range(B):
@@ -504,14 +477,12 @@ class EvaluatorFull:
         W, H = wh
         bx = boxes.clone()
 
-        # accept (N,5) or (N,6) where 6th is score/cls (we slice outside)
         if bx.size(-1) > 5:
             bx = bx[:, :5]
 
         cx_med = bx[:, 0].detach().abs().median()
         cy_med = bx[:, 1].detach().abs().median()
-        norm_like = (cx_med <= 1.2) and (cy_med <= 1.2)
-        if norm_like:
+        if (cx_med <= 1.2) and (cy_med <= 1.2):
             bx[:, 0] *= W; bx[:, 1] *= H
             bx[:, 2] *= W; bx[:, 3] *= H
 
@@ -519,35 +490,31 @@ class EvaluatorFull:
         if float(ang_med) > 3.5:
             bx[:, 4] = torch.deg2rad(bx[:, 4].clamp(min=-360.0, max=360.0))
 
-        bx[:, 2] = bx[:, 2].clamp(min=1.0, max=W*2.0)
-        bx[:, 3] = bx[:, 3].clamp(min=1.0, max=H*2.0)
+        bx[:, 2] = bx[:, 2].clamp(min=1.0, max=W * 2.0)
+        bx[:, 3] = bx[:, 3].clamp(min=1.0, max=H * 2.0)
         return bx
 
+    # --------------- dict → pyramid ---------------
+
+    def _dict_to_pyramid(self, d: Dict[str, Any], hw: Tuple[int, int], device) -> Optional[List[torch.Tensor]]:
+        """Extract (B,C,Hf,Wf) maps from dict and sort by inferred stride."""
+        H, W = hw
+        items: List[Tuple[float, torch.Tensor]] = []
+        for k, v in d.items():
+            if torch.is_tensor(v) and v.dim() == 4:
+                _, _, Hf, Wf = v.shape
+                # inferred stride ~ image_size / feature_size
+                sH = max(1.0, H / max(1, Hf))
+                sW = max(1.0, W / max(1, Wf))
+                s = float((sH + sW) * 0.5)
+                items.append((s, v.to(device)))
+        if not items:
+            return None
+        # sort by increasing stride (P3→P4→P5…)
+        items.sort(key=lambda x: x[0])
+        return [v for _, v in items]
+
     # --------------- IoU / NMS ---------------
-
-    def _iou_matrix(self, boxes: torch.Tensor, gts: torch.Tensor) -> torch.Tensor:
-        """
-        boxes, gts: (N,5) [cx,cy,w,h,rad] in pixels.
-        returns (N, M) tensor on CPU.
-        """
-        N = int(boxes.shape[0]); M = int(gts.shape[0])
-        if N == 0 or M == 0:
-            return torch.zeros((N, M))
-
-        if self.cfg["iou_backend"] == "mmcv" and _MMCV_OK:
-            b = boxes.clone(); g = gts.clone()
-            b[:, 4] = torch.rad2deg(b[:, 4])
-            g[:, 4] = torch.rad2deg(g[:, 4])
-            dev = boxes.device if boxes.is_cuda else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-            b = b.to(dev); g = g.to(dev)
-            iou = mmcv_box_iou_rotated(b, g, aligned=False)  # (N,M)
-            iou = iou.detach().float().clamp_(0, 1)
-
-            return iou.cpu()
-        # shapely / aabb fallbacks
-        if _SHAPELY_OK:
-            return self._iou_shapely(boxes, gts).clamp_(0, 1)
-        return self._iou_aabb(boxes, gts).clamp_(0, 1)
 
     def _rotated_nms(self, boxes: torch.Tensor, scores: torch.Tensor,
                      iou_thr: float, max_det: int) -> torch.Tensor:
@@ -558,21 +525,14 @@ class EvaluatorFull:
             b[:, 4] = torch.rad2deg(b[:, 4])
             try:
                 res = mmcv_nms_rotated(b, scores, float(iou_thr))
-                # mmcv v2 returns (dets, keep); some envs return just keep
-                if isinstance(res, (tuple, list)) and len(res) == 2:
-                    _, keep = res
-                else:
-                    keep = res
-                keep = keep[:max_det] if keep.numel() > max_det else keep
-                return keep
+                keep = res[1] if (isinstance(res, (tuple, list)) and len(res) == 2) else res
+                return keep[:max_det] if keep.numel() > max_det else keep
             except Exception as e:
                 self.log.warning("[eval] mmcv_nms_rotated failed (%s); using greedy fallback.", str(e))
-        # greedy fallback (shapely / aabb)
         order = torch.argsort(scores, descending=True)
         keep = []
         sup = torch.zeros_like(order, dtype=torch.bool)
         polys = self._to_poly(boxes.detach().cpu().numpy()) if _SHAPELY_OK else None
-
         for i_idx in range(order.numel()):
             i = int(order[i_idx])
             if sup[i_idx]:
@@ -587,15 +547,32 @@ class EvaluatorFull:
                 if _SHAPELY_OK:
                     pi, pj = polys[i], polys[j]
                     inter = pi.intersection(pj).area
-                    if inter <= 0:
-                        continue
                     u = pi.area + pj.area - inter
-                    iou = inter / u if u > 0 else 0.0
+                    iou = (inter / u) if u > 0 else 0.0
                 else:
                     iou = float(self._iou_aabb(boxes[i:i+1], boxes[j:j+1])[0, 0].item())
                 if iou >= iou_thr:
                     sup[j_idx] = True
         return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+    def _iou_matrix(self, boxes: torch.Tensor, gts: torch.Tensor) -> torch.Tensor:
+        N = int(boxes.shape[0]); M = int(gts.shape[0])
+        if N == 0 or M == 0:
+            return torch.zeros((N, M))
+
+        if self.cfg["iou_backend"] == "mmcv" and _MMCV_OK:
+            b = boxes.clone(); g = gts.clone()
+            b[:, 4] = torch.rad2deg(b[:, 4])
+            g[:, 4] = torch.rad2deg(g[:, 4])
+            dev = boxes.device if boxes.is_cuda else (
+                torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+            b = b.to(dev); g = g.to(dev)
+            iou = mmcv_box_iou_rotated(b, g, aligned=False).detach().float().clamp_(0, 1)
+            return iou.cpu()
+
+        if _SHAPELY_OK:
+            return self._iou_shapely(boxes, gts).clamp_(0, 1)
+        return self._iou_aabb(boxes, gts).clamp_(0, 1)
 
     # --------------- shapely / aabb helpers ---------------
 
@@ -627,7 +604,6 @@ class EvaluatorFull:
         return torch.from_numpy(out)
 
     def _iou_aabb(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # crude fallback on circumscribed axis-aligned rectangles
         def aabb(x):
             cx, cy, w, h = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
             return cx - w/2, cy - h/2, cx + w/2, cy + h/2
@@ -658,17 +634,16 @@ class EvaluatorFull:
         order = np.argsort(-sc)
         tp = tp[order].astype(np.float32)
         fp = fp[order].astype(np.float32)
-        ctp = np.cumsum(tp)
-        cfp = np.cumsum(fp)
+        ctp = np.cumsum(tp); cfp = np.cumsum(fp)
         denom = max(1.0, float(tp.sum()))
         recall = ctp / denom
         precision = ctp / np.maximum(ctp + cfp, 1e-9)
-        # 101-pt COCO
         rec_points = np.linspace(0, 1, 101)
         prec_at_rec = np.zeros_like(rec_points)
         for i, r in enumerate(rec_points):
             inds = np.where(recall >= r)[0]
-            prec_at_rec[i] = precision[inds].max() if inds.size else 0.0
+            if inds.size:
+                prec_at_rec[i] = precision[inds].max()
         return float(prec_at_rec.mean())
 
     def _finalize(self, st: Dict[str, Any]) -> Dict[str, Any]:
@@ -679,7 +654,6 @@ class EvaluatorFull:
             sc = np.array(st["scores_by_thr"][float(t)], dtype=np.float32)
             aps.append(self._ap_from_pr(tp, fp, sc))
         mAP = float(np.mean(aps)) if aps else 0.0
-        # pull mAP50 for display
         try:
             i50 = list(self.iou_thrs).index(0.5)
             mAP50 = float(aps[i50]) if aps else 0.0
@@ -716,15 +690,48 @@ class EvaluatorFull:
         self.log.info(
             "[EVAL] images %.1f  mAP50 %.6f  mAP %.6f  pck@0.05 %.6f  pck_any@0.05 %.6f  "
             "tps %.1f  pred_per_img %.2f  recall@0.1 %.2f  recall@0.3 %.2f  recall@0.5 %.2f  best_iou %.3f",
-            m.get("images", 0.0),
-            m.get("mAP50", 0.0),
-            m.get("mAP", 0.0),
-            m.get("pck@0.05", 0.0),
-            m.get("pck_any@0.05", 0.0),
-            m.get("tps", 0.0),
-            m.get("pred_per_img", 0.0),
-            m.get("recall@0.1", 0.0),
-            m.get("recall@0.3", 0.0),
-            m.get("recall@0.5", 0.0),
+            m.get("images", 0.0), m.get("mAP50", 0.0), m.get("mAP", 0.0),
+            m.get("pck@0.05", 0.0), m.get("pck_any@0.05", 0.0),
+            m.get("tps", 0.0), m.get("pred_per_img", 0.0),
+            m.get("recall@0.1", 0.0), m.get("recall@0.3", 0.0), m.get("recall@0.5", 0.0),
             m.get("best_iou", 0.0),
         )
+
+    # --------------- debug helpers ---------------
+
+    def _maybe_log_decode_path(self, path: str):
+        if not hasattr(self, "_dec_path_printed"):
+            self._dec_path_printed = True
+            self.log.info("[eval] decode path: %s", path)
+
+    def _dbg(self, msg: str):
+        if not hasattr(self, "_dbg_printed"):
+            self._dbg_printed = 0
+        if self._dbg_printed < 6:
+            self._dbg_printed += 1
+            self.log.debug("[eval] %s", msg)
+
+    def _debug_decode_failure(self, model_eval, det_maps):
+        cand = []
+        for n in dir(model_eval):
+            if any(k in n for k in ("decode", "post", "export", "predict")):
+                try:
+                    if callable(getattr(model_eval, n)):
+                        cand.append(n)
+                except Exception:
+                    pass
+        if isinstance(det_maps, dict):
+            shapes = {k: (tuple(v.shape) if torch.is_tensor(v) else type(v).__name__) for k, v in det_maps.items()}
+            keys = ", ".join(list(det_maps.keys()))
+            self.log.warning(
+                "[eval] decode failed. Candidate methods on model: %s | det_maps=dict keys=[%s] shapes=%s",
+                (", ".join(sorted(cand)) or "<none>"), keys, shapes
+            )
+        else:
+            shape_str = (f"tensor{tuple(det_maps.shape)}" if torch.is_tensor(det_maps)
+                         else f"pyramid[{len(det_maps)}]" if isinstance(det_maps, (list, tuple))
+                         else type(det_maps).__name__)
+            self.log.warning(
+                "[eval] decode failed. Candidate methods on model: %s | det_maps=%s",
+                (", ".join(sorted(cand)) or "<none>"), shape_str
+            )
