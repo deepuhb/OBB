@@ -277,8 +277,7 @@ def main():
     evaluator = EvaluatorFull(
         cfg={"eval": {"score_thresh": 0.3, "nms_iou": 0.5, "iou_thr": 0.5,
                       "pck_tau": 0.05, "max_det": 100},
-             "model": {"strides": (4, 8, 16)}},
-        debug=False)
+             "model": {"strides": (4, 8, 16)}})
 
     trainer = Trainer(
         model=model,
