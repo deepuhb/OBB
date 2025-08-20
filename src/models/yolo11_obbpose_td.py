@@ -3,70 +3,64 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .layers.rot_roi import RotatedROIPool
+from src.models.layers.rot_roi import RotatedROIPool
+from src.models.necks.pan_fpn import PANFPN
+from src.models.heads.obbpose_head import OBBPoseHead
 
 
 # ---- Tiny YOLO11-ish blocks (you can swap with your existing backbone/neck) ----
 class Conv(nn.Module):
     def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=True):
         super().__init__()
-        p = k // 2 if p is None else p
+        p = k//2 if p is None else p
         self.cv = nn.Conv2d(c1, c2, k, s, p, groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = nn.SiLU() if act else nn.Identity()
-
     def forward(self, x): return self.act(self.bn(self.cv(x)))
-
 
 class C2f(nn.Module):
     """C2f (simplified)"""
-
     def __init__(self, c1, c2, n=2, shortcut=False):
         super().__init__()
-        c_ = int(c2 // 2)
+        c_ = int(c2//2)
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
         self.m = nn.Sequential(*[Conv(c_, c_, 3, 1) for _ in range(n)])
-        self.cv3 = Conv(2 * c_, c2, 1, 1)
+        self.cv3 = Conv(2*c_, c2, 1, 1)
         self.sc = shortcut
-
     def forward(self, x):
         y1 = self.m(self.cv1(x))
         y2 = self.cv2(x)
-        return self.cv3(torch.cat([y1, y2], 1))
-
+        return self.cv3(torch.cat([y1,y2], 1))
 
 class SPPF(nn.Module):
     def __init__(self, c1, c2, k=5):
         super().__init__()
         c_ = c1 // 2
         self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.cv2 = Conv(c_*4, c2, 1, 1)
         self.k = k
-
     def forward(self, x):
         x = self.cv1(x)
-        y1 = F.max_pool2d(x, self.k, stride=1, padding=self.k // 2)
-        y2 = F.max_pool2d(y1, self.k, stride=1, padding=self.k // 2)
-        y3 = F.max_pool2d(y2, self.k, stride=1, padding=self.k // 2)
+        y1 = F.max_pool2d(x, self.k, stride=1, padding=self.k//2)
+        y2 = F.max_pool2d(y1, self.k, stride=1, padding=self.k//2)
+        y3 = F.max_pool2d(y2, self.k, stride=1, padding=self.k//2)
         return self.cv2(torch.cat([x, y1, y2, y3], 1))
-
 
 class Backbone(nn.Module):
     def __init__(self, c=3, w=0.5, d=0.33):
         super().__init__()
-        c1, c2, c3, c4, c5 = int(64 * w), int(128 * w), int(256 * w), int(512 * w), int(512 * w)
-        n = max(1, int(3 * d))
+        c1, c2, c3, c4, c5 = int(64*w), int(128*w), int(256*w), int(512*w), int(512*w)
+        n = max(1, int(3*d))
         self.stem = Conv(c, c1, 3, 2)
         self.c2 = nn.Sequential(Conv(c1, c1, 3, 1), Conv(c1, c1, 3, 1))
         self.p3 = nn.Sequential(Conv(c1, c2, 3, 2), C2f(c2, c2, n))
         self.p4 = nn.Sequential(Conv(c2, c3, 3, 2), C2f(c3, c3, n))
         self.p5 = nn.Sequential(Conv(c3, c4, 3, 2), C2f(c4, c4, n), SPPF(c4, c5))
-
     def forward(self, x):
         x = self.stem(x)
         x = self.c2(x)
-        p3 = self.p3(x)  # /8
+        p3 = self.p3(x)   # /8
         p4 = self.p4(p3)  # /16
         p5 = self.p5(p4)  # /32
         return p3, p4, p5
@@ -78,7 +72,6 @@ class FPNPAN(nn.Module):
     Outputs: n3 (c2), d4 (c3), d5 (c5)  -> strides [8,16,32]
     All concatenations are sized to match exactly.
     """
-
     def __init__(self, in_ch):  # in_ch = [p3_ch, p4_ch, p5_ch]
         super().__init__()
         c2, c3, c5 = in_ch
@@ -109,10 +102,10 @@ class FPNPAN(nn.Module):
     def forward(self, p3, p4, p5):
         # top-down
         n4 = torch.cat([F.interpolate(self.lat5_to_4(p5), scale_factor=2, mode="nearest"), p4], dim=1)
-        n4 = self.fuse4(n4)  # (B,c3,H/16,W/16)
+        n4 = self.fuse4(n4)                 # (B,c3,H/16,W/16)
 
         n3 = torch.cat([F.interpolate(self.red4_to_3(n4), scale_factor=2, mode="nearest"), p3], dim=1)
-        n3 = self.fuse3(n3)  # (B,c2,H/8,W/8)
+        n3 = self.fuse3(n3)                 # (B,c2,H/8,W/8)
 
         # bottom-up
         d4 = self.fuse4d(torch.cat([self.down4(n3), n4], dim=1))  # (B,c3,H/16,W/16)
@@ -121,73 +114,87 @@ class FPNPAN(nn.Module):
         return n3, d4, d5  # strides [8,16,32]
 
 
+
+class LazyPANFPN(nn.Module):
+    """
+    Wraps PANFPN to lazily instantiate with the correct (C3,C4,C5) from the first forward.
+    This avoids hardcoding channels and keeps compatibility with arbitrary backbones.
+    """
+    def __init__(self):
+        super().__init__()
+        self.inner = None
+
+    def forward(self, p3, p4, p5):
+        if self.inner is None:
+            ch = (int(p3.shape[1]), int(p4.shape[1]), int(p5.shape[1]))
+            self.inner = PANFPN(ch=ch)
+        return self.inner(p3, p4, p5)
 # ---- Heads ----
 class OBBHead(nn.Module):
     """Anchor-free YOLO head predicting (tx,ty,tw,th,sin,cos,obj,cls[...]) per location."""
-
     def __init__(self, ch, nc):
         super().__init__()
         self.nc = nc
         self.m = nn.ModuleList()
         for c in ch:
             self.m.append(nn.Sequential(
-                Conv(c, c, 3, 1), nn.Conv2d(c, 7 + nc, 1, 1)  # 7: tx,ty,tw,th,sin,cos,obj
+                Conv(c, c, 3, 1), nn.Conv2d(c, 7+nc, 1, 1)  # 7: tx,ty,tw,th,sin,cos,obj
             ))
-
     def forward(self, feats):
         return [h(f) for h, f in zip(self.m, feats)]  # list of (B,7+nc,H,W)
 
-
 class KptTDHead(nn.Module):
     """Top-down keypoint head that runs on rotated crops from P3 features."""
-
     def __init__(self, in_ch=256, S=64):
         super().__init__()
         base = 64
         self.net = nn.Sequential(
             Conv(in_ch, base, 3, 1), nn.MaxPool2d(2),
-            Conv(base, base * 2, 3, 1), nn.MaxPool2d(2),
-            Conv(base * 2, base * 4, 3, 1), nn.AdaptiveAvgPool2d(1),
+            Conv(base, base*2, 3, 1), nn.MaxPool2d(2),
+            Conv(base*2, base*4, 3, 1), nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(base * 4, 64), nn.SiLU(),
+            nn.Linear(base*4, 64), nn.SiLU(),
             nn.Linear(64, 2), nn.Sigmoid()  # (u,v) in [0,1]
         )
-
     def forward(self, crops):
         return self.net(crops)  # (N,2)
 
 
 class YOLO11_OBBPOSE_TD(nn.Module):
     def __init__(self, num_classes=1, width=0.5, depth=0.33, kpt_crop=64, kpt_expand=1.25,
-                 kpt_topk=128, roi_chunk=128, score_thresh_kpt=0.25):
+                 kpt_topk=128, roi_chunk=128, score_thresh_kpt=0.25,
+                 backbone: nn.Module | None = None, neck: nn.Module | None = None):
         super().__init__()
-        self.backbone = Backbone(w=width, d=depth)
+        self.num_classes = int(num_classes)
+        self.width = float(width); self.depth = float(depth)
 
-        # Channel plan that **matches Backbone** outputs:
-        # p3 -> c2, p4 -> c3, p5 -> c5
-        c2 = int(128 * width)  # p3 channels
-        c3 = int(256 * width)  # p4 channels
-        c5 = int(512 * width)  # p5 channels (after SPPF)
+        # Allow external backbone injection; fallback to the lightweight local backbone for dev.
+        self.backbone = backbone if backbone is not None else Backbone(w=self.width, d=self.depth)
 
-        # Neck consumes (p3_c, p4_c, p5_c) in that order
-        self.neck = FPNPAN([c2, c3, c5])
+        # Default neck: PANFPN (lazy wrapper builds with true (C3,C4,C5) on first call)
+        self.neck = neck if neck is not None else LazyPANFPN()
 
-        # Neck outputs [n3(c2), d4(c3), d5(c5)]
-        self.det_head = OBBHead([c2, c3, c5], nc=num_classes)
+        # Heads (lazy init when feature channels are known in forward)
+        self.det_head = None          # OBBPoseHead
+        self.kpt_head = None          # top-down (small MLP over crops)
 
-        # Top-down keypoint crops come from P3-like feature (n3), stride=8
-        self.roi = RotatedROIPool(out_size=kpt_crop, expand=kpt_expand, feat_down=8)
-        self.kpt_head = KptTDHead(in_ch=c2, S=kpt_crop)
-        # stash for kpt_from_obbs
+        # ROI pooling for top-down keypoints; PANFPN uses P3 at /4 by default
+        self.roi = RotatedROIPool(out_size=kpt_crop, expand=kpt_expand, feat_down=4)
         self.kpt_topk = int(kpt_topk)
         self.roi_chunk = int(roi_chunk)
         self.score_thresh_kpt = float(score_thresh_kpt)
 
+
     def forward(self, x):
-        p3, p4, p5 = self.backbone(x)  # (c2, c3, c5)
+        p3, p4, p5 = self.backbone(x)       # (c2, c3, c5)
         n3, d4, d5 = self.neck(p3, p4, p5)  # (c2, c3, c5)
-        det = self.det_head([n3, d4, d5])
-        return {"det": det, "feats": [n3, d4, d5]}
+        if self.det_head is None:
+            self.det_head = OBBPoseHead((int(n3.shape[1]), int(d4.shape[1]), int(d5.shape[1])), num_classes=self.num_classes)
+        if self.kpt_head is None:
+            crop_sz = getattr(self.roi, 'out_size', 64)
+            self.kpt_head = KptTDHead(in_ch=int(n3.shape[1]), S=crop_sz)
+        det, kpt_maps = self.det_head([n3, d4, d5])
+        return {"det": det, "feats": [n3, d4, d5], "kpt_maps": kpt_maps}
 
     def _select_kpt_feat(self, feats):
         # robustly pick a single feature map (finest resolution)
@@ -289,134 +296,36 @@ class YOLO11_OBBPOSE_TD(nn.Module):
             imgs: torch.Tensor,
             score_thr: float = 0.25,
             max_det: int = 300,
-            use_nms: bool = True,
-            nms_iou_thr: float = 0.5,
-            pre_topk: int = 2000,
     ):
         """
         Decode anchor-free head outputs with channel order:
           [tx, ty, tw, th, sinθ, cosθ, obj, cls...]
-        Returns per-image dictionaries containing BOTH:
-          - legacy keys: {"boxes": (Ni,5)[cx,cy,w,h,theta(rad)], "scores": (Ni,), "cls": Optional[(Ni,)]}
-          - extended keys: "obb" (degrees), "labels" (same as "cls" but always LongTensor), "polygons" (list[Tensor(4,2)])
-        Angle unit:
-          - boxes[..., 4] is radians (legacy compatibility)
-          - obb[..., 4]   is degrees (extended convenience)
-        """
-        import torch, math
 
-        assert isinstance(pyramids, (list, tuple)) and len(pyramids) > 0, "pyramids must be list/tuple of Tensors"
+        Args
+          pyramids: list[Tensor] of shape (B, C, Hf, Wf)
+          imgs:     (B,3,H,W) input images (for scale)
+        Returns list[dict] per image:
+          {'boxes': (Ni,5)[cx,cy,w,h,theta(rad)], 'scores': (Ni,), 'cls': Optional[(Ni,)]}
+        """
+        import torch
         B, _, H, W = imgs.shape
         device = imgs.device
 
-        # --- Helper functions (local) ---
-        def _obb_corners(cx, cy, w, h, ang_rad):
-            """Return (4,2) corners in image coords for a single OBB."""
-            c = torch.cos(ang_rad);
-            s = torch.sin(ang_rad)
-            wx = w / 2.0;
-            hy = h / 2.0
-            pts = torch.tensor([[-wx, -hy],
-                                [wx, -hy],
-                                [wx, hy],
-                                [-wx, hy]], device=device, dtype=torch.float32)
-            R = torch.tensor([[c, -s],
-                              [s, c]], device=device, dtype=torch.float32).T  # (2,2)
-            rot = pts @ R
-            rot[:, 0] += cx
-            rot[:, 1] += cy
-            return rot  # (4,2)
-
-        def _poly_area(poly):
-            x = poly[:, 0];
-            y = poly[:, 1]
-            return 0.5 * torch.abs(torch.sum(x * torch.roll(y, -1)) - torch.sum(y * torch.roll(x, -1)))
-
-        def _poly_clip(subject, clipper):
-            # Sutherland–Hodgman polygon clipping (convex assumption).
-            def edge_clip(s_poly, p1, p2):
-                out = []
-                for i in range(len(s_poly)):
-                    A = s_poly[i - 1];
-                    Bp = s_poly[i]
-
-                    def inside(P):
-                        return (p2[0] - p1[0]) * (P[1] - p1[1]) - (p2[1] - p1[1]) * (P[0] - p1[0]) >= 0
-
-                    def intersect():
-                        x1, y1 = A;
-                        x2, y2 = Bp;
-                        x3, y3 = p1;
-                        x4, y4 = p2
-                        den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-                        if den == 0:
-                            return Bp
-                        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
-                        return torch.tensor([x1 + t * (x2 - x1), y1 + t * (y2 - y1)], device=device,
-                                            dtype=torch.float32)
-
-                    Ain, Bin = inside(A), inside(Bp)
-                    if Ain and Bin:
-                        out.append(Bp)
-                    elif Ain and (not Bin):
-                        out.append(intersect())
-                    elif (not Ain) and Bin:
-                        out.append(intersect());
-                        out.append(Bp)
-                return out
-
-            output = [p for p in subject]
-            for i in range(len(clipper)):
-                p1 = clipper[i - 1];
-                p2 = clipper[i]
-                output = edge_clip(output, p1, p2)
-                if not output:
-                    break
-            if not output:
-                return None
-            return torch.stack(output, dim=0)
-
-        def _polygon_iou(poly1, poly2):
-            inter = _poly_clip(poly1, poly2)
-            if inter is None or inter.shape[0] < 3:
-                return torch.tensor(0.0, device=device)
-            ai = _poly_area(inter)
-            a1 = _poly_area(poly1)
-            a2 = _poly_area(poly2)
-            union = a1 + a2 - ai
-            return ai / (union + 1e-12)
-
-        def _greedy_nms_polys(polys, scores, iou_thr=0.5, max_det=100):
-            order = torch.argsort(scores, descending=True)
-            keep = []
-            for idx in order:
-                idx = idx.item()
-                good = True
-                for j in keep:
-                    if _polygon_iou(polys[idx], polys[j]) > iou_thr:
-                        good = False;
-                        break
-                if good:
-                    keep.append(idx)
-                if len(keep) >= max_det:
-                    break
-            return torch.tensor(keep, device=device, dtype=torch.long)
-
-        per_img_boxes = [[] for _ in range(B)]
-        per_img_scores = [[] for _ in range(B)]
-        per_img_cls = [[] for _ in range(B)]
+        per_img_boxes, per_img_scores, per_img_cls = [[] for _ in range(B)], [[] for _ in range(B)], [[] for _ in
+                                                                                                      range(B)]
 
         for p in pyramids:
             if (not torch.is_tensor(p)) or p.dim() != 4 or p.size(1) < 7:
                 continue
             Bp, C, Hf, Wf = p.shape
-            if Bp != B:
-                raise AssertionError("Batch mismatch between pyramids and imgs")
+            assert Bp == B, "Batch mismatch between pyramids and imgs"
 
+            # spatial strides for that level
             stride_x = W / float(Wf)
             stride_y = H / float(Hf)
             stride = 0.5 * (stride_x + stride_y)
 
+            # ---- split channels (correct offsets!) ----
             tx = p[:, 0:1]  # (B,1,Hf,Wf)
             ty = p[:, 1:2]
             tw = p[:, 2:3]
@@ -456,17 +365,13 @@ class YOLO11_OBBPOSE_TD(nn.Module):
             if cls_idx is not None:
                 cls_idx = cls_idx.reshape(B, -1)
 
-            # threshold + pre-topk and collect
+            # threshold & collect
+            keep = score >= float(score_thr)
             for b in range(B):
-                sb = score[b]
-                kb = sb >= float(score_thr)
+                kb = keep[b]
                 if kb.any():
-                    if pre_topk and kb.sum().item() > pre_topk:
-                        top_idx = torch.topk(sb[kb], k=pre_topk, largest=True).indices
-                        kb = kb.nonzero(as_tuple=False).squeeze(1)[top_idx]
-
-                    bx = torch.stack([cx[b][kb], cy[b][kb], w[b][kb], h[b][kb], ang[b][kb]], dim=-1)  # radians
-                    sc = sb[kb]
+                    bx = torch.stack([cx[b][kb], cy[b][kb], w[b][kb], h[b][kb], ang[b][kb]], dim=-1)
+                    sc = score[b][kb]
                     cl = (cls_idx[b][kb] if cls_idx is not None else None)
                 else:
                     bx = imgs.new_zeros((0, 5))
@@ -476,50 +381,24 @@ class YOLO11_OBBPOSE_TD(nn.Module):
                 per_img_scores[b].append(sc)
                 per_img_cls[b].append(cl)
 
-        # concat per-image and apply poly-NMS & cap
+        # concat per-image and top-k
         out = []
         for b in range(B):
-            if not per_img_boxes[b]:
-                out.append({"boxes": imgs.new_zeros((0, 5)), "scores": imgs.new_zeros((0,)), "cls": None,
-                            "obb": imgs.new_zeros((0, 5)), "labels": imgs.new_zeros((0,), dtype=torch.long),
-                            "polygons": []})
-                continue
+            if per_img_boxes[b]:
+                bx = torch.cat(per_img_boxes[b], dim=0) if len(per_img_boxes[b]) > 1 else per_img_boxes[b][0]
+                sc = torch.cat(per_img_scores[b], dim=0) if len(per_img_scores[b]) > 1 else per_img_scores[b][0]
+                cl = None
+                if per_img_cls[b] and per_img_cls[b][0] is not None:
+                    cl = torch.cat(per_img_cls[b], dim=0) if len(per_img_cls[b]) > 1 else per_img_cls[b][0]
 
-            bx = torch.cat(per_img_boxes[b], dim=0) if len(per_img_boxes[b]) > 1 else per_img_boxes[b][0]
-            sc = torch.cat(per_img_scores[b], dim=0) if len(per_img_scores[b]) > 1 else per_img_scores[b][0]
-            cl = None
-            if per_img_cls[b] and per_img_cls[b][0] is not None:
-                cl = torch.cat(per_img_cls[b], dim=0) if len(per_img_cls[b]) > 1 else per_img_cls[b][0]
-
-            # Build polygons and deg version
-            polys = []
-            ang_deg = bx[:, 4] * (180.0 / math.pi)
-            for i in range(bx.shape[0]):
-                polys.append(_obb_corners(bx[i, 0], bx[i, 1], bx[i, 2], bx[i, 3], bx[i, 4]))
-
-            if use_nms and bx.shape[0] > 1:
-                keep_idx = _greedy_nms_polys(polys, sc, iou_thr=nms_iou_thr, max_det=max_det)
-                bx = bx[keep_idx]
-                sc = sc[keep_idx]
-                ang_deg = ang_deg[keep_idx]
-                polys = [polys[i.item()] for i in keep_idx]
-                if cl is not None:
-                    cl = cl[keep_idx]
-            else:
                 if bx.shape[0] > max_det:
-                    top = torch.topk(sc, k=max_det, largest=True).indices
-                    bx, sc, ang_deg = bx[top], sc[top], ang_deg[top]
-                    polys = [polys[i.item()] for i in top]
+                    idx = torch.topk(sc, k=max_det, largest=True).indices
+                    bx, sc = bx[idx], sc[idx]
                     if cl is not None:
-                        cl = cl[top]
-
-            # Extended outputs
-            obb_deg = bx.clone()
-            obb_deg[:, 4] = ang_deg
-            labels = (cl.long() if cl is not None else torch.zeros_like(sc, dtype=torch.long))
-
-            out.append({"boxes": bx, "scores": sc, "cls": cl,
-                        "obb": obb_deg, "labels": labels, "polygons": polys})
+                        cl = cl[idx]
+                out.append({"boxes": bx, "scores": sc, "cls": cl})
+            else:
+                out.append({"boxes": imgs.new_zeros((0, 5)), "scores": imgs.new_zeros((0,)), "cls": None})
         return out
 
     @torch.inference_mode()

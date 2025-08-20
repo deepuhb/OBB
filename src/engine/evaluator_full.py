@@ -1,4 +1,4 @@
-# src/engine/evaluator_full.py
+# src/engine/evaluator_full.py (simplified for YOLO11_OBBPOSE_TD)
 import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,7 +9,6 @@ import torch
 # ---- optional geometry backends ----
 try:
     from mmcv.ops import box_iou_rotated as mmcv_box_iou_rotated
-    from mmcv.ops import nms_rotated as mmcv_nms_rotated
     _MMCV_OK = True
 except Exception:
     _MMCV_OK = False
@@ -43,9 +42,7 @@ def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
 
     d = dict(
         score_thresh=0.25,
-        nms_iou=0.5,
         max_det=100,
-        iou_backend=("mmcv" if _MMCV_OK else "shapely"),
         map_iou_st=0.5, map_iou_ed=0.95, map_iou_step=0.05,
         pck_alpha=0.05,
         print_every=0,
@@ -69,9 +66,7 @@ def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
                 d[k] = v
 
     d["score_thresh"] = float(d["score_thresh"])
-    d["nms_iou"] = float(d["nms_iou"])
     d["max_det"] = int(d["max_det"])
-    d["iou_backend"] = str(d["iou_backend"])
     d["map_iou_st"] = float(d["map_iou_st"])
     d["map_iou_ed"] = float(d["map_iou_ed"])
     d["map_iou_step"] = float(d["map_iou_step"])
@@ -79,22 +74,18 @@ def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
     d["print_every"] = int(d["print_every"])
     return d
 
+
 def _get_first_batch(dl):
-    # Safely get one batch without assuming its structure.
     it = iter(dl)
     batch = next(it)
-
     if isinstance(batch, dict):
-        # Common dict keys
-        imgs = batch.get("imgs") or batch.get("images") or batch.get("image")
+        imgs = batch.get("image") or batch.get("imgs") or batch.get("images") or batch.get("image")
         targets = batch.get("targets") or batch.get("labels")
     elif isinstance(batch, (list, tuple)):
         imgs = batch[0]
         targets = batch[1] if len(batch) > 1 else None
     else:
-        # Single tensor or custom container
         imgs, targets = batch, None
-
     if imgs is None:
         raise RuntimeError("Could not locate images in the first batch; check your dataset return format.")
     return imgs, targets
@@ -102,13 +93,19 @@ def _get_first_batch(dl):
 
 class EvaluatorFull:
     """
-    OBB + single keypoint evaluator.
+    OBB + (optional) single-keypoint evaluator.
 
     Expects val batch like:
       {"image": (B,3,H,W),
-       "bboxes": list[Ti,5]  (cx,cy,w,h,rad) px,
+       "bboxes": list[Ti,5]  (cx,cy,w,h,rad) in px,
        "labels": list[Ti],   ints,
        "kpts":   list[Ti,2]  (x,y) px, ...}
+
+    Assumes model implements:
+      - forward(images) -> {'det': [P3,P4,P5], 'feats': [P3,P4,P5]}
+      - decode_obb_from_pyramids(det_maps, imgs, score_thr, max_det) -> list[{'boxes','scores','cls',...}]
+      - (optional) kpt_from_obbs(feats, obb_list, scores_list=None, topk, chunk, score_thresh)
+          returns (uv_all, metas) where uv_all in [0,1], metas[i]['M'] is 2x3 crop->image affine and 'bix' image index.
     """
 
     def __init__(self,
@@ -119,12 +116,6 @@ class EvaluatorFull:
         self.log = logger or logging.getLogger("evaluator_full")
         self.names = names or []
         self.cfg = _cfg_to_params(cfg, params)
-
-        if self.cfg["iou_backend"] == "mmcv" and not _MMCV_OK:
-            self.log.warning("[eval] iou_backend='mmcv' requested but MMCV ops not found; falling back.")
-            self.cfg["iou_backend"] = "shapely"
-        if self.cfg["iou_backend"] == "shapely" and not _SHAPELY_OK:
-            self.log.warning("[eval] Shapely not found; falling back to coarse AABB IoU.")
 
         self.iou_thrs = np.arange(
             self.cfg["map_iou_st"], self.cfg["map_iou_ed"] + 1e-9, self.cfg["map_iou_step"]
@@ -139,9 +130,9 @@ class EvaluatorFull:
                  device: torch.device,
                  max_images: Optional[int] = None) -> Dict[str, Any]:
 
-        # --- inside evaluate() ---
+        # sanity: loader not empty
         try:
-            imgs, _ = _get_first_batch(val_loader)  # was: imgs, _ = next(iter(val_loader))
+            _ = _get_first_batch(val_loader)
         except StopIteration:
             raise RuntimeError("Validation DataLoader is empty. Check val dataset length / filters.")
 
@@ -170,32 +161,58 @@ class EvaluatorFull:
             B, _, H, W = imgs.shape
 
             outs = model(imgs)
-            det_maps, feats = self._split_outs(outs)
+            det_maps = outs["det"] if isinstance(outs, dict) else (outs[0] if isinstance(outs, (list,tuple)) else outs)
+            feats = outs.get("feats") if isinstance(outs, dict) else (outs[1] if isinstance(outs, (list,tuple)) and len(outs) > 1 else None)
 
-            preds_list = self._decode_preds(model_eval, det_maps, imgs, score_thr=self.cfg["score_thresh"])
+            # ---- decode via the model's canonical decoder ----
+            try:
+                preds_list = model_eval.decode_obb_from_pyramids(det_maps, imgs,
+                                                                 score_thr=self.cfg["score_thresh"],
+                                                                 max_det=self.cfg["max_det"])
+            except Exception as e:
+                self.log.error("[eval] decode_obb_from_pyramids failed: %s", str(e))
+                preds_list = None
+
             if preds_list is None or len(preds_list) != B:
-                if not hasattr(self, "_decode_dbg_once"):
-                    self._decode_dbg_once = True
-                    self._debug_decode_failure(model_eval, det_maps)
                 self.log.error("[eval] Could not decode predictions; returning empty preds.")
-                preds_list = [self._empty_pred(device) for _ in range(B)]
+                preds_list = [{"boxes": torch.zeros((0,5), device=device),
+                               "scores": torch.zeros((0,), device=device),
+                               "cls": None} for _ in range(B)]
 
+            # ---- ground truth ----
             gtb_list = batch.get("bboxes", [torch.zeros((0, 5), device=device) for _ in range(B)])
             gtk_list = batch.get("kpts",   [torch.zeros((0, 2), device=device) for _ in range(B)])
 
-            uv_pred = None
-            if hasattr(model_eval, "kpt_from_obbs"):
+            # ---- top-down keypoints (optional) ----
+            uv_img_by_b = [torch.empty((0,2), device=device) for _ in range(B)]
+            if hasattr(model_eval, "kpt_from_obbs") and feats is not None:
                 try:
-                    obb_for_kpt = []
-                    for pred in preds_list:
-                        bx = pred["boxes"]
-                        obb_for_kpt.append(bx[: min(self.cfg["max_det"], bx.shape[0])] if bx.numel() else bx)
-                    uv_pred, _ = model_eval.kpt_from_obbs(feats, obb_for_kpt)
+                    obb_for_kpt = [pred.get("obb") if (isinstance(pred, dict) and "obb" in pred) else pred["boxes"].clone()
+                                   for pred in preds_list]
+                    scores_for_kpt = [pred.get("scores") for pred in preds_list]
+                    uv_all, metas = model_eval.kpt_from_obbs(feats, obb_for_kpt, scores_list=scores_for_kpt,
+                                                             topk=min(128, self.cfg["max_det"]),
+                                                             chunk=128, score_thresh=self.cfg["score_thresh"])
+                    if uv_all is not None and len(metas) == uv_all.shape[0]:
+                        # map each (u,v) in [0,1] to image pixels via affine M (2x3)
+                        for (uv, meta) in zip(uv_all, metas):
+                            if not isinstance(meta, dict) or ("M" not in meta) or ("bix" not in meta):
+                                continue
+                            M = meta["M"]
+                            bix = int(meta["bix"]) if isinstance(meta["bix"], (int,)) else int(meta["bix"].item())
+                            if not torch.is_tensor(M):
+                                M = torch.as_tensor(M, dtype=torch.float32, device=device)
+                            M = M.to(device).float()  # (2,3)
+                            # normalize uv -> [-1,1] assumed by affine
+                            x = uv[0] * 2.0 - 1.0
+                            y = uv[1] * 2.0 - 1.0
+                            xy1 = torch.stack([x, y, torch.tensor(1.0, device=device)], dim=0)  # (3,)
+                            xy_img = (M @ xy1)  # (2,)
+                            uv_img_by_b[bix] = torch.cat([uv_img_by_b[bix], xy_img[None, :]], dim=0)
                 except Exception as e:
                     self.log.warning("[eval] kpt_from_obbs failed: %s", str(e))
-                    uv_pred = None
 
-            uv_cursor = 0
+            # ---- per-image scoring ----
             for b in range(B):
                 img_seen += 1
                 stats["images_eval"] += 1
@@ -203,11 +220,8 @@ class EvaluatorFull:
                 gt_kpts  = gtk_list[b].to(device)
                 preds    = preds_list[b]
 
-                keep = self._rotated_nms(preds["boxes"], preds["scores"],
-                                         iou_thr=self.cfg["nms_iou"],
-                                         max_det=self.cfg["max_det"])
-                boxes  = preds["boxes"][keep]
-                scores = preds["scores"][keep]
+                boxes  = preds["boxes"]
+                scores = preds["scores"]
 
                 stats["pred_count"] += int(boxes.shape[0])
                 stats["gt_total"]   += int(gt_boxes.shape[0])
@@ -238,20 +252,23 @@ class EvaluatorFull:
                     for r in (0.1, 0.3, 0.5):
                         stats["recall_hits"][r] += int((max_per_gt >= r).sum().item())
 
-                if uv_pred is not None and gt_kpts.numel():
-                    n_here = min(boxes.shape[0], uv_pred.shape[0] - uv_cursor)
-                    if n_here > 0:
-                        uv_batch = uv_pred[uv_cursor: uv_cursor + n_here]
-                        uv_cursor += n_here
-                        sizes = torch.sqrt(boxes[:n_here, 2] * boxes[:n_here, 3]).clamp(min=1.0)
-                        thr = self.cfg["pck_alpha"] * sizes
-                        dists = torch.cdist(uv_batch.float().to(device), gt_kpts.float().to(device))
-                        if dists.numel():
-                            dmin, _ = dists.min(dim=1)
-                            ok = (dmin <= thr)
-                            stats["pck_ok"] += int(ok.sum().item())
-                            stats["pck_any_ok"] += int((dmin <= thr.max()).sum().item())
-                            stats["pck_total"] += int(n_here)
+                # PCK on predicted keypoints for this image (if any)
+                uv_img = uv_img_by_b[b]
+                if uv_img.numel() and gt_kpts.numel():
+                    sizes = torch.sqrt(boxes[:, 2] * boxes[:, 3]).clamp(min=1.0)
+                    # if fewer kpts than boxes, use matched sizes; else broadcast first K sizes
+                    n = uv_img.shape[0]
+                    if sizes.numel() == 0:
+                        thr = torch.full((n,), 1.0, device=device)
+                    else:
+                        thr = self.cfg["pck_alpha"] * (sizes[:n] if sizes.numel() >= n else sizes[-1].repeat(n))
+                    dists = torch.cdist(uv_img.float(), gt_kpts.float())  # (n, G)
+                    if dists.numel():
+                        dmin, _ = dists.min(dim=1)
+                        ok = (dmin <= thr)
+                        stats["pck_ok"] += int(ok.sum().item())
+                        stats["pck_any_ok"] += int((dmin <= thr.max()).sum().item())
+                        stats["pck_total"] += int(n)
 
                 if self.cfg["print_every"] and (img_seen % self.cfg["print_every"] == 0):
                     self.log.info("[EVAL img] #%d GT=%d pred=%d bestIoU=%.3f score[min/mean/max]=[%.3f/%.3f/%.3f]",
@@ -265,460 +282,22 @@ class EvaluatorFull:
         self._pretty(metrics)
         return metrics
 
-    # --------------- OUTS → (det_maps, feats) ---------------
-
-    def _split_outs(self, outs):
-        # tuple/list: (det_maps, feats)
-        if isinstance(outs, (tuple, list)):
-            if len(outs) == 2:
-                return outs[0], outs[1]
-            if len(outs) == 1:
-                return outs[0], None
-            return outs, None  # unknown but pass through
-
-        # dict: common keys
-        if isinstance(outs, dict):
-            feats = outs.get("feats", outs.get("features", None))
-            det = outs.get("det", None)
-            if det is None:
-                det = outs.get("maps", outs.get("pyramids", outs.get("preds", outs)))
-            return det, feats
-
-        # raw tensor or other
-        return outs, None
-
-    # --------------- decode helpers ---------------
-
-    def _empty_pred(self, device):
-        return {"boxes": torch.zeros((0, 5), device=device),
-                "scores": torch.zeros((0,), device=device),
-                "cls": None}
-
-    def _extract_map4d(self, x) -> Optional[torch.Tensor]:
-        if torch.is_tensor(x) and x.dim() == 4 and x.numel() > 0:
-            return x
-        if isinstance(x, (list, tuple)):
-            for y in x:
-                if torch.is_tensor(y) and y.dim() == 4 and y.numel() > 0:
-                    return y
-        if isinstance(x, dict):
-            for k in ("cls", "obj", "heatmap", "hm", "box", "reg", "angle", "ang", "logits", "maps"):
-                y = x.get(k, None)
-                if torch.is_tensor(y) and y.dim() == 4 and y.numel() > 0:
-                    return y
-        return None
-
-    def _coerce_pyramid(self, det_maps) -> Optional[List[Tuple[torch.Tensor, ...]]]:
-        """
-        Make a list of per-level tuples of 4-D tensors (cls/reg/angle …), removing Nones.
-        Returns None if nothing usable.
-        """
-        levels = []
-
-        # Case A: already a list/tuple of levels
-        if isinstance(det_maps, (list, tuple)):
-            iterable = list(det_maps)
-        # Case B: dict of level maps
-        elif isinstance(det_maps, dict):
-            iterable = list(det_maps.values())
-        else:
-            return None
-
-        dropped_levels = []
-        for li, lvl in enumerate(iterable):
-            # If the level itself is a tensor, treat it as a 1-tuple.
-            if torch.is_tensor(lvl):
-                if lvl.dim() == 4 and lvl.numel() > 0:
-                    levels.append((lvl,))
-                else:
-                    dropped_levels.append(li)
-                continue
-
-            # If the level is a tuple/list/dict, extract all valid 4D tensors in order.
-            submaps: List[torch.Tensor] = []
-            if isinstance(lvl, (list, tuple)):
-                for sm in lvl:
-                    t = self._extract_map4d(sm)
-                    if t is not None:
-                        submaps.append(t)
-            elif isinstance(lvl, dict):
-                # keep a stable ordering: cls/obj → box/reg → angle
-                for key_group in (("cls", "obj", "heatmap", "hm", "logits"),
-                                  ("box", "reg", "bbox"),
-                                  ("angle", "ang")):
-                    for k in key_group:
-                        t = lvl.get(k, None)
-                        if torch.is_tensor(t) and t.dim() == 4 and t.numel() > 0:
-                            submaps.append(t)
-                # also sweep remaining values just in case
-                for v in lvl.values():
-                    t = self._extract_map4d(v)
-                    if t is not None and t not in submaps:
-                        submaps.append(t)
-
-            # Remove None/invalids
-            submaps = [t for t in submaps if torch.is_tensor(t) and t.dim() == 4 and t.numel() > 0]
-            if len(submaps) == 0:
-                # try to salvage a single 4D tensor from the nested structure
-                t = self._extract_map4d(lvl)
-                if t is not None:
-                    levels.append((t,))
-                else:
-                    dropped_levels.append(li)
-                continue
-
-            # At least one valid submap found
-            levels.append(tuple(submaps))
-
-        if dropped_levels and not hasattr(self, "_pyr_drop_log_once"):
-            self._pyr_drop_log_once = True
-            self.log.warning("[eval] dropped %d pyramid levels with None/invalid entries: idx=%s",
-                             len(dropped_levels), dropped_levels)
-
-        return levels if len(levels) > 0 else None
-
-    def _try_decode_with_pyramid(self, model_eval, pyramids, imgs, score_thr):
-        """
-        Try decode_obb_from_pyramids with several per-level tuple arities:
-        (t,), (t,t), (t,t,t). Only expands levels when needed.
-        """
-        fn = getattr(model_eval, "decode_obb_from_pyramids", None)
-        if not callable(fn):
-            return None
-
-        # helper to call with kwargs/positional
-        def _call(candidate):
-            # try kwargs first (some impls require names)
-            try:
-                return fn(pyramids=candidate, imgs=imgs, score_thr=score_thr, max_det=self.cfg["max_det"])
-            except TypeError:
-                pass
-            except Exception as e:
-                # bubble other runtime errors up
-                raise e
-            # then positional
-            try:
-                return fn(candidate, imgs, score_thr=score_thr, max_det=self.cfg["max_det"])
-            except TypeError:
-                return None
-
-        # 1) try as-is (e.g. already tuples of correct arity)
-        out = _call(pyramids)
-        if out is not None:
-            self._maybe_log_decode_path("model.decode_obb_from_pyramids(as-is)")
-            return out
-
-        # Determine max number of submaps present across levels
-        max_k = max(len(lvl) for lvl in pyramids)
-        # 2) if any level is a single map, try duplicating to 2-tuple/3-tuple
-        for target_k in (2, 3):
-            if max_k >= target_k:
-                continue
-            expanded = []
-            for lvl in pyramids:
-                if len(lvl) == 0:
-                    expanded.append(tuple())  # will fail; but keep structure
-                    continue
-                t0 = lvl[0]
-                if len(lvl) >= target_k:
-                    expanded.append(lvl[:target_k])
-                else:
-                    expanded.append(tuple([t0] * target_k))
-            out = _call(expanded)
-            if out is not None:
-                self._maybe_log_decode_path(f"model.decode_obb_from_pyramids(duplicated {target_k}-tuple)")
-                return out
-
-        return None
-
-    def _try_hooks(self, obj, det_maps, imgs, names):
-        """
-        Try obj.<name> with rich permutations:
-          (det_maps, imgs), (pyramids=..., imgs=...), (det_maps=..., imgs=...),
-          then (det_maps,), (imgs,), ().
-        """
-        for name in names:
-            fn = getattr(obj, name, None)
-            if not callable(fn):
-                continue
-
-            # kwargs tries
-            for kw in (
-                    {"pyramids": det_maps, "imgs": imgs},
-                    {"det_maps": det_maps, "imgs": imgs},
-                    {"maps": det_maps, "imgs": imgs},
-            ):
-                try:
-                    out = fn(**kw)
-                    self._last_called_name = name
-                    return out
-                except TypeError:
-                    pass
-                except Exception as e:
-                    self.log.error("[eval] %s.%s(**%s) failed: %s",
-                                   obj.__class__.__name__, name, list(kw.keys()), str(e))
-                    break
-
-            # positional tries
-            for args in ((det_maps, imgs), (det_maps,), (imgs,), tuple()):
-                try:
-                    out = fn(*args)
-                    self._last_called_name = name
-                    return out
-                except TypeError:
-                    continue
-                except Exception as e:
-                    self.log.error("[eval] %s.%s%r failed: %s",
-                                   obj.__class__.__name__, name,
-                                   tuple(type(a).__name__ for a in args), str(e))
-                    break
-        return None
-
-    def _decode_preds(self, model_eval, det_maps, imgs, score_thr=0.25):
-        B, _, H, W = imgs.shape
-        device = imgs.device
-
-        # 1) Try robust pyramid path first (coerce + call decode_obb_from_pyramids)
-        pyr = self._coerce_pyramid(det_maps)
-        if pyr is not None:
-            try:
-                out = self._try_decode_with_pyramid(model_eval, pyr, imgs, score_thr)
-                if out is not None:
-                    parsed = self._normalize_decoded(out, (W, H), device, score_thr)
-                    if parsed is not None:
-                        return parsed
-            except Exception as e:
-                self.log.error("[eval] decode_obb_from_pyramids(coerced) failed: %s", str(e))
-
-        # 2) Then the generic hook path you already have
-        hook_names = (
-            "export_decode", "decode_obb", "decode_detections", "postprocess",
-            "predict", "inference", "forward_export", "decode"
-        )
-        out = self._try_hooks(model_eval, det_maps, imgs, hook_names)
-        parsed = self._normalize_decoded(out, (W, H), device, score_thr) if out is not None else None
-        if parsed is not None:
-            self._maybe_log_decode_path(f"model.{self._last_called_name}")
-            return parsed
-
-        for subname in ("head", "det_head", "yolo"):
-            sub = getattr(model_eval, subname, None)
-            if sub is None:
-                continue
-            out = self._try_hooks(sub, det_maps, imgs, hook_names)
-            parsed = self._normalize_decoded(out, (W, H), device, score_thr) if out is not None else None
-            if parsed is not None:
-                self._maybe_log_decode_path(f"model.{subname}.{self._last_called_name}")
-                return parsed
-
-        # 3) Dense fallback kept as-is (if you already have it)
-        if torch.is_tensor(det_maps) and det_maps.dim() == 3 and det_maps.size(-1) >= 6:
-            parsed = self._decode_dense(det_maps, (W, H), device, score_thr)
-            if parsed is not None:
-                self._maybe_log_decode_path("dense_fallback(B,N,K)")
-                return parsed
-        if isinstance(det_maps, dict):
-            for v in det_maps.values():
-                if torch.is_tensor(v) and v.dim() == 3 and v.size(-1) >= 6:
-                    parsed = self._decode_dense(v, (W, H), device, score_thr)
-                    if parsed is not None:
-                        self._maybe_log_decode_path("dense_fallback(B,N,K) from dict value")
-                        return parsed
-
-        return None
-
-    def _normalize_decoded(self, decoded, wh: Tuple[int, int], device, score_thr):
-        W, H = wh
-
-        # A) list[dict]
-        if isinstance(decoded, list) and decoded and isinstance(decoded[0], dict):
-            out = []
-            for d in decoded:
-                boxes = d.get("boxes"); scores = d.get("scores")
-                cls = d.get("cls", d.get("labels"))
-                if boxes is None or scores is None:
-                    return None
-                boxes = self._ensure_px_rad(boxes.to(device), (W, H))
-                scores = scores.to(device)
-                if cls is not None:
-                    cls = cls.to(device)
-                keep = scores >= float(score_thr)
-                out.append({"boxes": boxes[keep], "scores": scores[keep], "cls": (cls[keep] if cls is not None else None)})
-            return out
-
-        # B) tuple whose first item is list[dict]
-        if isinstance(decoded, (list, tuple)) and decoded:
-            first = decoded[0]
-            if isinstance(first, list) and first and isinstance(first[0], dict):
-                return self._normalize_decoded(first, wh, device, score_thr)
-
-        # C) list[tensor] per image, each [N, >=6]
-        if isinstance(decoded, list) and decoded and torch.is_tensor(decoded[0]):
-            out = []
-            for t in decoded:
-                if t.numel() == 0:
-                    out.append(self._empty_pred(device)); continue
-                if t.dim() == 1: t = t[None, :]
-                boxes = self._ensure_px_rad(t[:, :5].to(device), (W, H))
-                scores = t[:, 5].to(device)
-                cls = t[:, 6].long().to(device) if t.size(1) > 6 else None
-                keep = scores >= float(score_thr)
-                out.append({"boxes": boxes[keep], "scores": scores[keep], "cls": (cls[keep] if cls is not None else None)})
-            return out
-
-        # D) dict of per-image lists/tensors
-        if isinstance(decoded, dict) and "boxes" in decoded and isinstance(decoded["boxes"], list):
-            out = []
-            boxes_list = decoded["boxes"]
-            scores_list = decoded.get("scores", [None] * len(boxes_list))
-            cls_list = decoded.get("cls", decoded.get("labels", [None] * len(boxes_list)))
-            for i in range(len(boxes_list)):
-                bx = boxes_list[i]; sc = scores_list[i]
-                cl = (cls_list[i] if isinstance(cls_list, list) else None)
-                bx = self._ensure_px_rad(bx.to(device), (W, H))
-                sc = torch.ones((bx.shape[0],), device=device) if sc is None else sc.to(device)
-                cl = (cl.to(device) if cl is not None else None)
-                keep = sc >= float(score_thr)
-                out.append({"boxes": bx[keep], "scores": sc[keep], "cls": (cl[keep] if cl is not None else None)})
-            return out
-
-        # E) dense (B,N,K)
-        if torch.is_tensor(decoded) and decoded.dim() == 3 and decoded.size(-1) >= 6:
-            return self._decode_dense(decoded, (W, H), device, score_thr)
-
-        return None
-
-    def _decode_dense(self, t: torch.Tensor, wh: Tuple[int, int], device, score_thr):
-        B, N, K = t.shape
-        W, H = wh
-        t = t.to(device)
-
-        boxes = t[..., :5]      # cx,cy,w,h,angle
-        scores = t[..., 5]
-        cls = t[..., 6].long() if K > 6 else None
-
-        # heuristic: normalized?
-        cx_med = boxes[..., 0].detach().abs().median()
-        cy_med = boxes[..., 1].detach().abs().median()
-        norm_like = (cx_med <= 1.2) and (cy_med <= 1.2)
-        if norm_like:
-            boxes = boxes.clone()
-            boxes[..., 0] *= W; boxes[..., 1] *= H
-            boxes[..., 2] *= W; boxes[..., 3] *= H
-
-        # heuristic: degrees?
-        ang_med = boxes[..., 4].detach().abs().median()
-        if float(ang_med) > 3.5:
-            boxes = boxes.clone()
-            boxes[..., 4] = torch.deg2rad(boxes[..., 4].clamp(min=-360.0, max=360.0))
-
-        boxes[..., 2] = boxes[..., 2].clamp(min=1.0, max=W * 2.0)
-        boxes[..., 3] = boxes[..., 3].clamp(min=1.0, max=H * 2.0)
-
-        outs = []
-        for b in range(B):
-            s = scores[b]
-            k = s >= float(score_thr)
-            outs.append({
-                "boxes": boxes[b][k],
-                "scores": s[k],
-                "cls": (cls[b][k] if cls is not None else None)
-            })
-        return outs
-
-    def _ensure_px_rad(self, boxes: torch.Tensor, wh: Tuple[int, int]):
-        if boxes.numel() == 0:
-            return boxes
-        W, H = wh
-        bx = boxes.clone()
-
-        if bx.size(-1) > 5:
-            bx = bx[:, :5]
-
-        cx_med = bx[:, 0].detach().abs().median()
-        cy_med = bx[:, 1].detach().abs().median()
-        if (cx_med <= 1.2) and (cy_med <= 1.2):
-            bx[:, 0] *= W; bx[:, 1] *= H
-            bx[:, 2] *= W; bx[:, 3] *= H
-
-        ang_med = bx[:, 4].detach().abs().median()
-        if float(ang_med) > 3.5:
-            bx[:, 4] = torch.deg2rad(bx[:, 4].clamp(min=-360.0, max=360.0))
-
-        bx[:, 2] = bx[:, 2].clamp(min=1.0, max=W * 2.0)
-        bx[:, 3] = bx[:, 3].clamp(min=1.0, max=H * 2.0)
-        return bx
-
-    # --------------- dict → pyramid ---------------
-    def _dict_to_pyramid(self, d: Dict[str, Any], hw: Tuple[int, int], device) -> Optional[List[torch.Tensor]]:
-        H, W = hw
-        items = []
-        for k, v in d.items():
-            if torch.is_tensor(v) and v.dim() == 4 and v.numel() > 0:
-                _, _, Hf, Wf = v.shape
-                sH = max(1.0, H / max(1, Hf))
-                sW = max(1.0, W / max(1, Wf))
-                s = float((sH + sW) * 0.5)
-                items.append((s, v.to(device)))
-        if not items:
-            return None
-        items.sort(key=lambda x: x[0])  # low stride → high stride
-        return [v for _, v in items]
-
-    # --------------- IoU / NMS ---------------
-    def _rotated_nms(self, boxes: torch.Tensor, scores: torch.Tensor,
-                     iou_thr: float, max_det: int) -> torch.Tensor:
-        if boxes.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=boxes.device)
-        if self.cfg["iou_backend"] == "mmcv" and _MMCV_OK:
-            b = boxes.clone()
-            b[:, 4] = torch.rad2deg(b[:, 4])
-            try:
-                res = mmcv_nms_rotated(b, scores, float(iou_thr))
-                keep = res[1] if (isinstance(res, (tuple, list)) and len(res) == 2) else res
-                return keep[:max_det] if keep.numel() > max_det else keep
-            except Exception as e:
-                self.log.warning("[eval] mmcv_nms_rotated failed (%s); using greedy fallback.", str(e))
-        order = torch.argsort(scores, descending=True)
-        keep = []
-        sup = torch.zeros_like(order, dtype=torch.bool)
-        polys = self._to_poly(boxes.detach().cpu().numpy()) if _SHAPELY_OK else None
-        for i_idx in range(order.numel()):
-            i = int(order[i_idx])
-            if sup[i_idx]:
-                continue
-            keep.append(i)
-            if len(keep) >= max_det:
-                break
-            for j_idx in range(i_idx + 1, order.numel()):
-                if sup[j_idx]:
-                    continue
-                j = int(order[j_idx])
-                if _SHAPELY_OK:
-                    pi, pj = polys[i], polys[j]
-                    inter = pi.intersection(pj).area
-                    u = pi.area + pj.area - inter
-                    iou = (inter / u) if u > 0 else 0.0
-                else:
-                    iou = float(self._iou_aabb(boxes[i:i+1], boxes[j:j+1])[0, 0].item())
-                if iou >= iou_thr:
-                    sup[j_idx] = True
-        return torch.tensor(keep, dtype=torch.long, device=boxes.device)
-
+    # --------------- IoU ---------------
     def _iou_matrix(self, boxes: torch.Tensor, gts: torch.Tensor) -> torch.Tensor:
         N = int(boxes.shape[0]); M = int(gts.shape[0])
         if N == 0 or M == 0:
             return torch.zeros((N, M))
 
-        if self.cfg["iou_backend"] == "mmcv" and _MMCV_OK:
+        if _MMCV_OK:
+            # mmcv expects degrees
             b = boxes.clone(); g = gts.clone()
             b[:, 4] = torch.rad2deg(b[:, 4])
             g[:, 4] = torch.rad2deg(g[:, 4])
-            dev = boxes.device if boxes.is_cuda else (
-                torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-            b = b.to(dev); g = g.to(dev)
-            iou = mmcv_box_iou_rotated(b, g, aligned=False).detach().float().clamp_(0, 1)
-            return iou.cpu()
+            try:
+                iou = mmcv_box_iou_rotated(b, g, aligned=False).detach().float().clamp_(0, 1)
+                return iou.cpu()
+            except Exception:
+                pass  # fall through to shapely/aabb
 
         if _SHAPELY_OK:
             return self._iou_shapely(boxes, gts).clamp_(0, 1)
@@ -808,8 +387,8 @@ class EvaluatorFull:
         except ValueError:
             mAP50 = 0.0
 
-        images = float(st["images_eval"])
-        pred_per_img = float(st["pred_count"]) / max(images, 1.0)
+        images = float(st["images_eval"]) or 1.0
+        pred_per_img = float(st["pred_count"]) / images
         gt_total = max(int(st["gt_total"]), 1)
 
         rec01 = float(st["recall_hits"][0.1]) / gt_total
@@ -835,7 +414,7 @@ class EvaluatorFull:
         }
 
     def _pretty(self, m: Dict[str, Any]):
-        self.log.info(
+        logging.getLogger("evaluator_full").info(
             "[EVAL] images %.1f  mAP50 %.6f  mAP %.6f  pck@0.05 %.6f  pck_any@0.05 %.6f  "
             "tps %.1f  pred_per_img %.2f  recall@0.1 %.2f  recall@0.3 %.2f  recall@0.5 %.2f  best_iou %.3f",
             m.get("images", 0.0), m.get("mAP50", 0.0), m.get("mAP", 0.0),
@@ -844,38 +423,3 @@ class EvaluatorFull:
             m.get("recall@0.1", 0.0), m.get("recall@0.3", 0.0), m.get("recall@0.5", 0.0),
             m.get("best_iou", 0.0),
         )
-
-    # --------------- debug helpers ---------------
-    def _maybe_log_decode_path(self, path: str):
-        if not hasattr(self, "_dec_path_printed"):
-            self._dec_path_printed = True
-            self.log.info("[eval] decode path: %s", path)
-
-    def _debug_decode_failure(self, model_eval, det_maps):
-        cand = []
-        for n in dir(model_eval):
-            if any(k in n for k in ("decode", "post", "export", "predict")):
-                try:
-                    if callable(getattr(model_eval, n)):
-                        cand.append(n)
-                except Exception:
-                    pass
-        if isinstance(det_maps, dict):
-            shapes = {k: (tuple(v.shape) if torch.is_tensor(v) else type(v).__name__) for k, v in det_maps.items()}
-            keys = ", ".join(list(det_maps.keys()))
-            self.log.warning(
-                "[eval] decode failed. Candidate methods on model: %s | det_maps=dict keys=[%s] shapes=%s",
-                (", ".join(sorted(cand)) or "<none>"), keys, shapes
-            )
-        elif isinstance(det_maps, (list, tuple)):
-            shapes = [tuple(v.shape) if torch.is_tensor(v) else type(v).__name__ for v in det_maps]
-            self.log.warning(
-                "[eval] decode failed. Candidate methods on model: %s | det_maps=pyramid levels=%s",
-                (", ".join(sorted(cand)) or "<none>"), shapes
-            )
-        else:
-            shape_str = (f"tensor{tuple(det_maps.shape)}" if torch.is_tensor(det_maps) else type(det_maps).__name__)
-            self.log.warning(
-                "[eval] decode failed. Candidate methods on model: %s | det_maps=%s",
-                (", ".join(sorted(cand)) or "<none>"), shape_str
-            )
