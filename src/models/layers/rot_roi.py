@@ -173,7 +173,7 @@ class RotatedROIPool(nn.Module):
                 cr = F.grid_sample(src, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
                 crops.append(cr)
                 for j in range(s, e):
-                    metas.append({"bix": b, "M": M_all[j].detach()})
+                    metas.append({"bix": b, "M": M_all[j].detach(), "oi": int(j)})
 
         if len(crops) == 0:
             return feat.new_zeros((0, C, S, S)), []

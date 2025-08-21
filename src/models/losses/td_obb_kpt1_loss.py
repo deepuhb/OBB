@@ -1,4 +1,3 @@
-
 # src/models/losses/td_obb_kpt1_loss.py
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -13,17 +12,24 @@ class TDOBBWKpt1Criterion(nn.Module):
     """
     Detection + single-keypoint criterion for YOLO11-style OBB + top-down keypoint.
 
-    Expects:
-      - det_maps: list of 3 tensors [(B,C,H,W), ...] for strides (8,16,32)
-                  channels C = 7 + nc : [tx,ty,tw,th,sin,cos,obj,(cls...)]
-      - feats:    list [n3,d4,d5] = PAN-FPN outputs used by ROI pooling (same strides 8/16/32)
-      - batch:    dict with either:
-                  * {'bboxes': list(Ti,5 radians), 'labels': list(Ti,), 'kpts': list(Ti,2 px)}
-                  * or YOLO-style 'targets' tensor (M, 8/9): [bix, cls, cx,cy,w,h,ang(rad), kpx,kpy]
-      - model:    module exposing .kpt_from_obbs(feats, obb_list, ...) and .roi (with out_size, feat_down)
+    Inputs
+    ------
+    det_maps : list[Tensor]
+        Three tensors [(B, C, H, W), ...] for strides (8, 16, 32).
+        Channels C = 7 + nc laid out as: [tx, ty, tw, th, sin, cos, obj, (cls...)].
+    feats : list[Tensor]
+        PAN-FPN outputs [n3, d4, d5] used for ROI pooling (same strides 8/16/32).
+    batch : dict
+        Either:
+          • {'bboxes': list(Ti,5 radians), 'labels': list(Ti,), 'kpts': list(Ti,2 px)}
+          • or YOLO-style 'targets' tensor (M, 8/9): [bix, cls, cx,cy,w,h,ang(rad), kpx,kpy]
+    model : nn.Module
+        Must expose .kpt_from_obbs(feats, obb_list, ...) and .roi (with out_size, feat_down).
 
-    Returns:
-      total_loss, logs_dict
+    Returns
+    -------
+    total_loss : Tensor (scalar)
+    logs : dict[str, float]
     """
 
     def __init__(
@@ -211,7 +217,7 @@ class TDOBBWKpt1Criterion(nn.Module):
         l_box = torch.zeros((), device=device)
         l_obj = torch.zeros((), device=device)
         l_ang = torch.zeros((), device=device)
-        l_cls = torch.zeros((), device=device) if self.nc > 1 else torch.scalar_tensor(0.0, device=device)
+        l_cls = torch.zeros((), device=device) if self.nc > 1 else torch.zeros((), device=device)
 
         total_pos = 0
         for li, dm in enumerate(det_maps):
@@ -262,7 +268,7 @@ class TDOBBWKpt1Criterion(nn.Module):
         boxes_list: List[torch.Tensor],
         kpts_list: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, int]:
-        """Compute top-down keypoint loss using GT OBBs to form ROIs on P3."""
+        """Compute top-down keypoint loss using GT OBBs to form ROIs on P3 (/8)."""
         device = feats[0].device
 
         # Build OBB list (degrees) for ROI

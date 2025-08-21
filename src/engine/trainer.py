@@ -55,12 +55,13 @@ def _to_device(obj: Any, device: str) -> Any:
 
 class Trainer:
     """
-    Drop-in trainer with:
-      - single-backward per micro-batch
-      - DDP no_sync for grad accumulation
-      - AMP support (new and old autocast APIs)
-      - cosine/warmup hooks (optional)
-      - robust checkpointing and metric selection
+    Trainer with:
+      - DDP + no_sync for grad accumulation
+      - AMP (new and old autocast)
+      - warmup per update + optional cosine epoch scheduler
+      - dynamic loss balancer hook (multi_noise)
+      - rank0 evaluation on a non-distributed loader
+      - metric-based checkpointing (best/last)
     """
 
     def __init__(
@@ -158,6 +159,7 @@ class Trainer:
             collate_fn=val_loader.collate_fn,
             persistent_workers=getattr(val_loader, "persistent_workers", False),
         )
+
     # --------------------- public API ---------------------
 
     def fit(self, train_loader, val_loader, evaluator, train_sampler=None):
@@ -194,9 +196,16 @@ class Trainer:
 
             for it, batch in enumerate(train_loader):
                 batch = _to_device(batch, device)
-                imgs = batch.get("image", None)
+
+                # ---- robust image extraction: image/images/imgs/img ----
+                imgs = None
+                if isinstance(batch, dict):
+                    for k in ("image", "images", "imgs", "img"):
+                        if k in batch:
+                            imgs = batch[k]
+                            break
                 if imgs is None:
-                    raise RuntimeError("Batch must contain key 'image' (B,C,H,W).")
+                    raise RuntimeError("Batch must contain key 'image' (or 'images'/'imgs'/'img') with (B,C,H,W).")
                 if not torch.is_tensor(imgs):
                     imgs = torch.stack(imgs, dim=0)
 
@@ -210,24 +219,37 @@ class Trainer:
                     with self._autocast():
                         outs = model(imgs)
 
-                        # model may return tuple or dict
+                        # model may return tuple or dict; prefer dict with det/feats
                         if isinstance(outs, dict):
                             det_maps = outs.get("det") or outs.get("pred") or outs.get("yolo")
-                            feats = outs.get("feats") or outs.get("features")
+                            feats    = outs.get("feats") or outs.get("features")
+                            if det_maps is None or feats is None:
+                                raise RuntimeError(f"Model outputs missing 'det'/'feats'. Got keys: {list(outs.keys())}")
                         else:
                             if not isinstance(outs, (list, tuple)) or len(outs) < 2:
                                 raise RuntimeError("Model must return (det_maps, feats) or dict with keys.")
                             det_maps, feats = outs[0], outs[1]
 
                         model_for_loss = ddp_module(self.model)
-                        loss, logs = self.criterion(det_maps, feats, batch, model=model_for_loss, epoch=epoch)
+
+                        # ---- loss: kwargs first, then legacy positional fallback ----
+                        try:
+                            loss, logs = self.criterion(
+                                det_maps=det_maps,
+                                feats=feats,
+                                batch=batch,
+                                model=model_for_loss,
+                                epoch=epoch,
+                            )
+                        except TypeError:
+                            loss, logs = self.criterion(det_maps, feats, batch, model=model_for_loss, epoch=epoch)
 
                         # optional dynamic loss balancing (expects per-task raw losses)
                         if self.multi_noise is not None:
-                            raw_keys = ("box_loss_raw", "obj_loss_raw", "ang_loss_raw", "kpt_loss_raw", "kc_loss_raw")
+                            raw_keys = ("box_loss_raw", "obj_loss_raw", "ang_loss_raw", "kpt_loss_raw", "kc_loss_raw", "cls_loss_raw")
                             raw_vals = []
                             for k in raw_keys:
-                                v = logs.get(k, None)
+                                v = logs.get(k, None) if isinstance(logs, dict) else None
                                 if v is None:
                                     continue
                                 if not torch.is_tensor(v):
@@ -268,6 +290,7 @@ class Trainer:
                     self.global_update += 1
 
                 # aggregate logs
+                logs = logs or {}
                 agg["loss"] += float(logs.get("loss", (loss.item() * self.grad_accum)))
                 agg["box"]  += float(logs.get("loss_box", 0.0))
                 agg["obj"]  += float(logs.get("loss_obj", 0.0))
@@ -280,10 +303,16 @@ class Trainer:
 
                 if self.rank == 0:
                     lr_now = self.optimizer.param_groups[0]["lr"]
+                    # cast to float for safety
+                    box_s = float(logs.get('loss_box', 0.0))
+                    obj_s = float(logs.get('loss_obj', 0.0))
+                    ang_s = float(logs.get('loss_ang', 0.0))
+                    kpt_s = float(logs.get('loss_kpt', 0.0))
+                    cls_s = float(logs.get('loss_cls', 0.0)) if 'loss_cls' in logs else 0.0
                     pbar.set_postfix_str(
                         f"GPU_mem {_gpu_mem_str(device)}  lr {lr_now:.3e}  "
-                        f"box={logs.get('loss_box', 0.0):.3f}, obj={logs.get('loss_obj', 0.0):.3f}, "
-                        f"ang={logs.get('loss_ang', 0.0):.3f}, kpt={logs.get('loss_kpt', 0.0):.3f}"
+                        f"box={box_s:.3f}, obj={obj_s:.3f}, ang={ang_s:.3f}, kpt={kpt_s:.3f}"
+                        + (f", cls={cls_s:.3f}" if 'loss_cls' in logs else "")
                     )
                     pbar.update(1)
 
@@ -308,7 +337,7 @@ class Trainer:
                     f"{epoch+1:>4}/{self.epochs:<4}    GPU_mem {_gpu_mem_str(device)}  "
                     f"box_loss {agg_avg['box']:.4f}  obj_loss {agg_avg['obj']:.4f}  "
                     f"ang_loss {agg_avg['ang']:.4f}  kpt_loss {agg_avg['kpt']:.4f}  "
-                    f"kc_loss {agg_avg['kc']:.4f}  Pos {agg_avg['pos']:.1f}"
+                    f"kc_loss {agg_avg['kc']:.4f}  cls_loss {agg_avg['cls']:.4f}  Pos {agg_avg['pos']:.1f}"
                 )
 
             # evaluation cadence (rank0)
@@ -351,8 +380,7 @@ class Trainer:
                     self._save_checkpoint(os.path.join(self.ckpt_dir, "last.pt"), metrics)
                     sel_val = self._selection_value(metrics)
                     if sel_val is not None:
-                        is_better = (sel_val > self.best_metric) if self.sel_mode == "max" else (
-                                    sel_val < self.best_metric)
+                        is_better = (sel_val > self.best_metric) if self.sel_mode == "max" else (sel_val < self.best_metric)
                         if is_better:
                             self.best_metric = sel_val
                             self._save_checkpoint(os.path.join(self.ckpt_dir, "best.pt"), metrics)
@@ -374,7 +402,6 @@ class Trainer:
                 return None
         return None
 
-    # --- inside class Trainer ---
     def _save_checkpoint(self, path: str, metrics: Dict[str, Any] | None):
         state = {
             "model": ddp_module(self.model).state_dict(),
@@ -386,7 +413,6 @@ class Trainer:
         tmp = path + ".tmp"
         torch.save(state, tmp)
         os.replace(tmp, path)
-        # use the same logger the user sees
         (self.logger or logging.getLogger("obbpose11")).info(f"[ckpt] saved: {path}")
 
     def _log_eval(self, metrics: dict):
@@ -414,5 +440,3 @@ class Trainer:
                 parts.append(f"{k} {v:{fmt}}" if fmt else f"{k} {v}")
         msg = "  ".join(parts) if parts else str(metrics)
         (self.logger or logging.getLogger("obbpose11")).info(f"[EVAL] {msg}")
-
-

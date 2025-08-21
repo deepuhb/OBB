@@ -1,507 +1,324 @@
 # src/models/yolo11_obbpose_td.py
-import math
+from __future__ import annotations
+from typing import List, Tuple, Optional, Dict
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from src.models.layers.rot_roi import RotatedROIPool
+
+from src.models.backbones.cspnext11 import Backbone as CSPBackbone, conv_bn_act
 from src.models.necks.pan_fpn import PANFPN
 from src.models.heads.obbpose_head import OBBPoseHead
+from src.models.layers.rot_roi import RotatedROIPool
 
 
-# ---- Tiny YOLO11-ish blocks (you can swap with your existing backbone/neck) ----
-class Conv(nn.Module):
-    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=True):
-        super().__init__()
-        p = k//2 if p is None else p
-        self.cv = nn.Conv2d(c1, c2, k, s, p, groups=g, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU() if act else nn.Identity()
-    def forward(self, x): return self.act(self.bn(self.cv(x)))
-
-class C2f(nn.Module):
-    """C2f (simplified)"""
-    def __init__(self, c1, c2, n=2, shortcut=False):
-        super().__init__()
-        c_ = int(c2//2)
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.m = nn.Sequential(*[Conv(c_, c_, 3, 1) for _ in range(n)])
-        self.cv3 = Conv(2*c_, c2, 1, 1)
-        self.sc = shortcut
-    def forward(self, x):
-        y1 = self.m(self.cv1(x))
-        y2 = self.cv2(x)
-        return self.cv3(torch.cat([y1,y2], 1))
-
-class SPPF(nn.Module):
-    def __init__(self, c1, c2, k=5):
-        super().__init__()
-        c_ = c1 // 2
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_*4, c2, 1, 1)
-        self.k = k
-    def forward(self, x):
-        x = self.cv1(x)
-        y1 = F.max_pool2d(x, self.k, stride=1, padding=self.k//2)
-        y2 = F.max_pool2d(y1, self.k, stride=1, padding=self.k//2)
-        y3 = F.max_pool2d(y2, self.k, stride=1, padding=self.k//2)
-        return self.cv2(torch.cat([x, y1, y2, y3], 1))
-
-class Backbone(nn.Module):
-    def __init__(self, c=3, w=0.5, d=0.33):
-        super().__init__()
-        c1, c2, c3, c4, c5 = int(64*w), int(128*w), int(256*w), int(512*w), int(512*w)
-        n = max(1, int(3*d))
-        self.stem = Conv(c, c1, 3, 2)
-        self.c2 = nn.Sequential(Conv(c1, c1, 3, 1), Conv(c1, c1, 3, 1))
-        self.p3 = nn.Sequential(Conv(c1, c2, 3, 2), C2f(c2, c2, n))
-        self.p4 = nn.Sequential(Conv(c2, c3, 3, 2), C2f(c3, c3, n))
-        self.p5 = nn.Sequential(Conv(c3, c4, 3, 2), C2f(c4, c4, n), SPPF(c4, c5))
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.c2(x)
-        p3 = self.p3(x)   # /8
-        p4 = self.p4(p3)  # /16
-        p5 = self.p5(p4)  # /32
-        return p3, p4, p5
-
-
-class FPNPAN(nn.Module):
-    """
-    Inputs:  p3 (c2), p4 (c3), p5 (c5)
-    Outputs: n3 (c2), d4 (c3), d5 (c5)  -> strides [8,16,32]
-    All concatenations are sized to match exactly.
-    """
-    def __init__(self, in_ch):  # in_ch = [p3_ch, p4_ch, p5_ch]
-        super().__init__()
-        c2, c3, c5 = in_ch
-
-        # ---- top-down FPN ----
-        # lateral from p5 -> c3 to match p4 width
-        self.lat5_to_4 = Conv(c5, c3, 1, 1)
-        # fuse up(p5->c3) with p4(c3)
-        self.fuse4 = Conv(c3 + c3, c3, 3, 1)
-
-        # reduce fused c3 to c2 for next upsample stage
-        self.red4_to_3 = Conv(c3, c2, 1, 1)
-        # lateral p3->c2 already
-        # fuse up(red4_to_3)->c2 with p3(c2)
-        self.fuse3 = Conv(c2 + c2, c2, 3, 1)
-
-        # ---- bottom-up PAN ----
-        # down from n3(c2) to c3
-        self.down4 = Conv(c2, c3, 3, 2)
-        # fuse down(n3)->c3 with n4(c3)
-        self.fuse4d = Conv(c3 + c3, c3, 3, 1)
-
-        # down from d4(c3) to c5
-        self.down5 = Conv(c3, c5, 3, 2)
-        # fuse down(d4)->c5 with p5(c5)
-        self.fuse5d = Conv(c5 + c5, c5, 3, 1)
-
-    def forward(self, p3, p4, p5):
-        # top-down
-        n4 = torch.cat([F.interpolate(self.lat5_to_4(p5), scale_factor=2, mode="nearest"), p4], dim=1)
-        n4 = self.fuse4(n4)                 # (B,c3,H/16,W/16)
-
-        n3 = torch.cat([F.interpolate(self.red4_to_3(n4), scale_factor=2, mode="nearest"), p3], dim=1)
-        n3 = self.fuse3(n3)                 # (B,c2,H/8,W/8)
-
-        # bottom-up
-        d4 = self.fuse4d(torch.cat([self.down4(n3), n4], dim=1))  # (B,c3,H/16,W/16)
-        d5 = self.fuse5d(torch.cat([self.down5(d4), p5], dim=1))  # (B,c5,H/32,W/32)
-
-        return n3, d4, d5  # strides [8,16,32]
-
-
-
+# ---------------------- Lazy neck wrapper ----------------------
 class LazyPANFPN(nn.Module):
-    """
-    Wraps PANFPN to lazily instantiate with the correct (C3,C4,C5) from the first forward.
-    This avoids hardcoding channels and keeps compatibility with arbitrary backbones.
-    """
-    def __init__(self):
+    """Wraps PANFPN and instantiates with proper channels on first forward."""
+    def __init__(self, neck: Optional[nn.Module] = None):
         super().__init__()
-        self.inner = None
+        self.inner = neck  # may be None until we see channels
+        self._ch = None
 
-    def forward(self, p3, p4, p5):
+    def forward(self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor):
         if self.inner is None:
-            ch = (int(p3.shape[1]), int(p4.shape[1]), int(p5.shape[1]))
+            ch = (p3.shape[1], p4.shape[1], p5.shape[1])
             self.inner = PANFPN(ch=ch)
+            self._ch = ch
         return self.inner(p3, p4, p5)
-# ---- Heads ----
-class OBBHead(nn.Module):
-    """Anchor-free YOLO head predicting (tx,ty,tw,th,sin,cos,obj,cls[...]) per location."""
-    def __init__(self, ch, nc):
-        super().__init__()
-        self.nc = nc
-        self.m = nn.ModuleList()
-        for c in ch:
-            self.m.append(nn.Sequential(
-                Conv(c, c, 3, 1), nn.Conv2d(c, 7+nc, 1, 1)  # 7: tx,ty,tw,th,sin,cos,obj
-            ))
-    def forward(self, feats):
-        return [h(f) for h, f in zip(self.m, feats)]  # list of (B,7+nc,H,W)
 
+    @property
+    def ch(self):
+        return self._ch if self._ch is not None else getattr(self.inner, "_ch", None)
+
+
+# ---------------------- Top-down keypoint head ----------------------
 class KptTDHead(nn.Module):
-    """Top-down keypoint head that runs on rotated crops from P3 features."""
-    def __init__(self, in_ch=256, S=64):
+    """Predicts (u,v) in [0,1] from rotated crops (C,S,S)."""
+    def __init__(self, in_ch: int = 256):
         super().__init__()
-        base = 64
+        b = 64
         self.net = nn.Sequential(
-            Conv(in_ch, base, 3, 1), nn.MaxPool2d(2),
-            Conv(base, base*2, 3, 1), nn.MaxPool2d(2),
-            Conv(base*2, base*4, 3, 1), nn.AdaptiveAvgPool2d(1),
+            conv_bn_act(in_ch, b, 3, 1), nn.MaxPool2d(2),
+            conv_bn_act(b, b*2, 3, 1),   nn.MaxPool2d(2),
+            conv_bn_act(b*2, b*4, 3, 1), nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(base*4, 64), nn.SiLU(),
-            nn.Linear(64, 2), nn.Sigmoid()  # (u,v) in [0,1]
+            nn.Linear(b*4, 64), nn.SiLU(),
+            nn.Linear(64, 2), nn.Sigmoid()
         )
-    def forward(self, crops):
-        return self.net(crops)  # (N,2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
+# ---------------------- Model ----------------------
 class YOLO11_OBBPOSE_TD(nn.Module):
-    def __init__(self, num_classes=1, width=0.5, depth=0.33, kpt_crop=64, kpt_expand=1.25,
-                 kpt_topk=128, roi_chunk=128, score_thresh_kpt=0.25,
-                 backbone: nn.Module | None = None, neck: nn.Module | None = None):
+    """
+    YOLO11-style OBB + top-down keypoint model.
+    - Backbone: CSPNext-11 returning (p3=/8, p4=/16, p5=/32)
+    - Neck: PAN-FPN returning (n3=/8, d4=/16, d5=/32)
+    - Head: OBBPoseHead -> detection maps (7+nc) and kpt maps (3) per level
+    - TD keypoint: RotatedROIPool on P3 (/8) + small head -> (u,v) in [0,1]
+    """
+    def __init__(
+        self,
+        num_classes: int = 1,
+        width: float = 0.5,
+        depth: float = 0.33,
+        backbone: Optional[nn.Module] = None,
+        neck: Optional[nn.Module] = None,
+        kpt_crop: int = 64,
+        kpt_expand: float = 1.25,
+    ) -> None:
         super().__init__()
-        self.num_classes = int(num_classes)
-        self.width = float(width); self.depth = float(depth)
+        self.nc = int(num_classes)
+        self.width = float(width)
+        self.depth = float(depth)
 
-        # Allow external backbone injection; fallback to the lightweight local backbone for dev.
-        self.backbone = backbone if backbone is not None else Backbone(w=self.width, d=self.depth)
+        # modules
+        self.backbone = backbone if backbone is not None else CSPBackbone(in_ch=3, width=self.width, depth=self.depth)
+        self.neck = LazyPANFPN(neck if neck is not None else None)
+        self.head: Optional[OBBPoseHead] = None  # init lazily
 
-        # Default neck: PANFPN (lazy wrapper builds with true (C3,C4,C5) on first call)
-        self.neck = neck if neck is not None else LazyPANFPN()
+        # top-down ROI + head (feat_down=8 for P3 stride)
+        self.roi = RotatedROIPool(out_size=kpt_crop, expand=kpt_expand, feat_down=8)
+        self.kpt_head: Optional[KptTDHead] = None  # init lazily after first forward
 
-        # Heads (lazy init when feature channels are known in forward)
-        self.det_head = None          # OBBPoseHead
-        self.kpt_head = None          # top-down (small MLP over crops)
-
-        # ROI pooling for top-down keypoints; PANFPN uses P3 at /4 by default
-        self.roi = RotatedROIPool(out_size=kpt_crop, expand=kpt_expand, feat_down=4)
-        self.kpt_topk = int(kpt_topk)
-        self.roi_chunk = int(roi_chunk)
-        self.score_thresh_kpt = float(score_thresh_kpt)
-
-
-    def forward(self, x):
-        p3, p4, p5 = self.backbone(x)       # (c2, c3, c5)
-        n3, d4, d5 = self.neck(p3, p4, p5)  # (c2, c3, c5)
-        if self.det_head is None:
-            self.det_head = OBBPoseHead((int(n3.shape[1]), int(d4.shape[1]), int(d5.shape[1])), num_classes=self.num_classes)
+    # -------- internals --------
+    def _ensure_heads(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        if self.head is None:
+            ch = (feats[0].shape[1], feats[1].shape[1], feats[2].shape[1])
+            self.head = OBBPoseHead(ch=ch, num_classes=self.nc)
         if self.kpt_head is None:
-            crop_sz = getattr(self.roi, 'out_size', 64)
-            self.kpt_head = KptTDHead(in_ch=int(n3.shape[1]), S=crop_sz)
-        det, kpt_maps = self.det_head([n3, d4, d5])
-        return {"det": det, "feats": [n3, d4, d5], "kpt_maps": kpt_maps}
+            self.kpt_head = KptTDHead(in_ch=feats[0].shape[1])
 
-    def _select_kpt_feat(self, feats):
-        # robustly pick a single feature map (finest resolution)
-        if torch.is_tensor(feats):
-            return feats
-        if isinstance(feats, (list, tuple)):
-            feats = [f for f in feats if torch.is_tensor(f)]
-            return max(feats, key=lambda t: t.shape[-1] * t.shape[-2])
-        if isinstance(feats, dict):
-            for k in ("kpt", "p3", "P3"):
-                v = feats.get(k)
-                if torch.is_tensor(v):
-                    return v
-            feats = [v for v in feats.values() if torch.is_tensor(v)]
-            return max(feats, key=lambda t: t.shape[-1] * t.shape[-2])
-        raise TypeError(f"Unsupported feats type: {type(feats)}")
+    # -------- forward --------
+    def forward(self, images: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
+        # backbone → neck
+        p3, p4, p5 = self.backbone(images)  # /8, /16, /32
+        n3, d4, d5 = self.neck(p3, p4, p5)  # /8, /16, /32
+        self._ensure_heads((n3, d4, d5))
 
-    @torch.no_grad()
-    def export_decode(
-            self,
-            det_maps_or_dense: torch.Tensor,
-            imgs: torch.Tensor,
-            score_thr: float = 0.25,
-            max_det: int = 300,
-    ):
-        """
-        Unified decoder for export:
-          - If input is list[Tensor(B,C,Hf,Wf)]: route to decode_obb_from_pyramids().
-          - If input is Tensor(B,N,K) with K>=7 and channel order
-                [cx, cy, w, h, sinθ, cosθ, obj, cls...]
-            (or same order but with *logits* that still need sigmoid for obj/cls)
-            decode to per-image dicts:
-                {'boxes': (Ni,5)[cx,cy,w,h,theta(rad)], 'scores': (Ni,), 'cls': Optional[(Ni,)]}
-        """
-        import torch
+        det_maps, kpt_maps = self.head([n3, d4, d5])  # lists of 3 maps
+        return {"det": det_maps, "feats": [n3, d4, d5], "kpt_maps": kpt_maps}
 
-        # Case A: pyramids (training/eval)
-        if isinstance(det_maps_or_dense, (list, tuple)):
-            return self.decode_obb_from_pyramids(det_maps_or_dense, imgs, score_thr=score_thr, max_det=max_det)
-
-        # Case B: dense predictions (B,N,K)
-        t = det_maps_or_dense
-        if (not torch.is_tensor(t)) or t.dim() != 3 or t.size(-1) < 7:
-            # graceful fallback: nothing to decode
-            B = imgs.shape[0]
-            z = imgs.new_zeros
-            return [{"boxes": z((0, 5)), "scores": z((0,)), "cls": None} for _ in range(B)]
-
-        B, N, K = t.shape
-        device = t.device
-
-        # geometry
-        cx = t[..., 0]
-        cy = t[..., 1]
-        w = t[..., 2]
-        h = t[..., 3]
-        s = t[..., 4]  # sinθ (raw)
-        c = t[..., 5]  # cosθ (raw)
-        ang = torch.atan2(s, c)  # radians
-
-        # scores & classes
-        obj = t[..., 6].sigmoid()
-        cls = None
-        if K > 7:
-            cls_logits = t[..., 7:]
-            cls_prob = cls_logits.sigmoid()  # (B,N,nc)
-            cls_score, cls_idx = cls_prob.max(dim=-1)  # (B,N)
-            scores = obj * cls_score
-            cls = cls_idx
-        else:
-            scores = obj
-
-        # threshold & top-k per image
-        out = []
-        for b in range(B):
-            sb = scores[b]
-            keep = sb >= float(score_thr)
-            if keep.any():
-                bx = torch.stack([cx[b][keep], cy[b][keep], w[b][keep], h[b][keep], ang[b][keep]], dim=-1)
-                sc = sb[keep]
-                if bx.shape[0] > max_det:
-                    idx = torch.topk(sc, k=max_det, largest=True).indices
-                    bx, sc = bx[idx], sc[idx]
-                    clb = cls[b][keep][idx] if cls is not None else None
-                else:
-                    clb = cls[b][keep] if cls is not None else None
-            else:
-                bx = imgs.new_zeros((0, 5), device=device)
-                sc = imgs.new_zeros((0,), device=device)
-                clb = None
-
-            out.append({"boxes": bx, "scores": sc, "cls": clb})
-        return out
-
+    # -------- decode: det maps -> OBB predictions per image --------
     @torch.no_grad()
     def decode_obb_from_pyramids(
-            self,
-            pyramids,
-            imgs: torch.Tensor,
-            score_thr: float = 0.25,
-            max_det: int = 300,
-    ):
+        self,
+        det_maps: List[torch.Tensor],
+        imgs: Optional[torch.Tensor] = None,
+        conf_thres: float = 0.25,
+        iou_thres: float = 0.7,
+        multi_label: bool = False,
+        agnostic: bool = False,
+        max_det: int = 300,
+        use_nms: bool = True,
+    ) -> List[Dict[str, torch.Tensor]]:
         """
-        Decode anchor-free head outputs with channel order:
-          [tx, ty, tw, th, sinθ, cosθ, obj, cls...]
-
-        Args
-          pyramids: list[Tensor] of shape (B, C, Hf, Wf)
-          imgs:     (B,3,H,W) input images (for scale)
-        Returns list[dict] per image:
-          {'boxes': (Ni,5)[cx,cy,w,h,theta(rad)], 'scores': (Ni,), 'cls': Optional[(Ni,)]}
+        YOLO11-style decode:
+          - scores = obj * sigmoid(cls) for multi-class (else = obj for single-class)
+          - multi_label: keep multiple classes per location if above conf_thres
+          - preferred rotated NMS: mmcv.ops.nms_rotated; fallback to torchvision.ops.nms_rotated;
+            then AABB NMS; finally top-K.
+        Returns per-image dicts: boxes(rad), obb(deg), scores, labels
         """
-        import torch
-        B, _, H, W = imgs.shape
-        device = imgs.device
+        # --- Resolve rotated NMS backends (prefer MMCV) ---
+        mmcv_nms_rot = None
+        tv_nms_rot = None
+        try:
+            from mmcv.ops import nms_rotated as _mmcv_nms_rot
+            if callable(_mmcv_nms_rot):
+                mmcv_nms_rot = _mmcv_nms_rot
+        except Exception:
+            mmcv_nms_rot = None
+        if mmcv_nms_rot is None:
+            try:
+                import torchvision
+                _tv = getattr(torchvision.ops, "nms_rotated", None)
+                if callable(_tv):
+                    tv_nms_rot = _tv
+            except Exception:
+                tv_nms_rot = None
 
-        per_img_boxes, per_img_scores, per_img_cls = [[] for _ in range(B)], [[] for _ in range(B)], [[] for _ in
-                                                                                                      range(B)]
+        strides = (8, 16, 32)
+        B = det_maps[0].shape[0]
+        device = det_maps[0].device
+        results: List[Dict[str, torch.Tensor]] = []
 
-        for p in pyramids:
-            if (not torch.is_tensor(p)) or p.dim() != 4 or p.size(1) < 7:
-                continue
-            Bp, C, Hf, Wf = p.shape
-            assert Bp == B, "Batch mismatch between pyramids and imgs"
-
-            # spatial strides for that level
-            stride_x = W / float(Wf)
-            stride_y = H / float(Hf)
-            stride = 0.5 * (stride_x + stride_y)
-
-            # ---- split channels (correct offsets!) ----
-            tx = p[:, 0:1]  # (B,1,Hf,Wf)
-            ty = p[:, 1:2]
-            tw = p[:, 2:3]
-            th = p[:, 3:4]
-            s = p[:, 4:5]  # sinθ
-            c = p[:, 5:6]  # cosθ
-            tobj = p[:, 6:7]  # obj
-            cls_logits = p[:, 7:] if C > 7 else None
-
-            # grids
-            gy = torch.arange(Hf, device=device).view(1, 1, Hf, 1).expand(B, 1, Hf, Wf)
-            gx = torch.arange(Wf, device=device).view(1, 1, 1, Wf).expand(B, 1, Hf, Wf)
-
-            # decode to pixels
-            cx = (gx + tx.sigmoid()) * stride_x
-            cy = (gy + ty.sigmoid()) * stride_y
-            w = tw.exp() * stride
-            h = th.exp() * stride
-            ang = torch.atan2(s, c).squeeze(1)  # (B,Hf,Wf)
-            obj = tobj.sigmoid().squeeze(1)  # (B,Hf,Wf)
-
-            if cls_logits is not None and cls_logits.numel():
-                cls_prob = cls_logits.sigmoid()  # (B,nc,Hf,Wf)
-                cls_score, cls_idx = cls_prob.max(dim=1)  # (B,Hf,Wf)
-                score = obj * cls_score
-            else:
-                score = obj
-                cls_idx = None
-
-            # flatten
-            cx = cx.reshape(B, -1)
-            cy = cy.reshape(B, -1)
-            w = w.reshape(B, -1)
-            h = h.reshape(B, -1)
-            ang = ang.reshape(B, -1)
-            score = score.reshape(B, -1)
-            if cls_idx is not None:
-                cls_idx = cls_idx.reshape(B, -1)
-
-            # threshold & collect
-            keep = score >= float(score_thr)
-            for b in range(B):
-                kb = keep[b]
-                if kb.any():
-                    bx = torch.stack([cx[b][kb], cy[b][kb], w[b][kb], h[b][kb], ang[b][kb]], dim=-1)
-                    sc = score[b][kb]
-                    cl = (cls_idx[b][kb] if cls_idx is not None else None)
-                else:
-                    bx = imgs.new_zeros((0, 5))
-                    sc = imgs.new_zeros((0,))
-                    cl = None
-                per_img_boxes[b].append(bx)
-                per_img_scores[b].append(sc)
-                per_img_cls[b].append(cl)
-
-        # concat per-image and top-k
-        out = []
         for b in range(B):
-            if per_img_boxes[b]:
-                bx = torch.cat(per_img_boxes[b], dim=0) if len(per_img_boxes[b]) > 1 else per_img_boxes[b][0]
-                sc = torch.cat(per_img_scores[b], dim=0) if len(per_img_scores[b]) > 1 else per_img_scores[b][0]
-                cl = None
-                if per_img_cls[b] and per_img_cls[b][0] is not None:
-                    cl = torch.cat(per_img_cls[b], dim=0) if len(per_img_cls[b]) > 1 else per_img_cls[b][0]
+            boxes_all, obb_all, scores_all, labels_all = [], [], [], []
 
-                if bx.shape[0] > max_det:
-                    idx = torch.topk(sc, k=max_det, largest=True).indices
-                    bx, sc = bx[idx], sc[idx]
-                    if cl is not None:
-                        cl = cl[idx]
-                out.append({"boxes": bx, "scores": sc, "cls": cl})
-            else:
-                out.append({"boxes": imgs.new_zeros((0, 5)), "scores": imgs.new_zeros((0,)), "cls": None})
-        return out
+            for level, stride in zip(det_maps, strides):
+                pred = level[b]  # (C, H, W)
+                C, H, W = pred.shape
 
-    @torch.inference_mode()
-    def kpt_from_obbs(self,
-                      feats,
-                      pos_meta,
-                      chunk: int = 128,
-                      **kwargs):
-        """
-        Normalize pos_meta to the per-image OBB list that RotatedROIPool expects.
-        Accepts:
-          • list of dicts {'b'|'bix', 'obb'| 'obb_abs'|'obb_norm'}
-          • list/tuple of length B where each item is (Ni,5) Tensor or None
-          • flat list of Tensors (various shapes)
-          • single Tensor (N,5) or (N,6) (first col may be batch index)
-        Returns:
-          (kpred, metas)
-        """
-        feat = self._select_kpt_feat(feats)  # robustly pick one map
-        device, dtype = feat.device, feat.dtype
-        B, C, Hf, Wf = feat.shape
+                tx = pred[0].sigmoid(); ty = pred[1].sigmoid()
+                tw = pred[2].exp();     th = pred[3].exp()
+                si = pred[4].tanh();    co = pred[5].tanh()
+                obj= pred[6].sigmoid()
+                cls_logits = pred[7:] if C > 7 else None
 
-        def to_tensor(x):
-            if torch.is_tensor(x):
-                return x.to(device=device, dtype=dtype)
-            return torch.tensor(x, device=device, dtype=dtype)
+                yv, xv = torch.meshgrid(
+                    torch.arange(H, device=pred.device),
+                    torch.arange(W, device=pred.device),
+                    indexing='ij'
+                )
+                cx = (tx + xv) * stride
+                cy = (ty + yv) * stride
+                w  = tw * stride
+                h  = th * stride
+                ang = torch.atan2(si, co)  # radians
 
-        # --- Build obb_list: list length B, each item is (Ni,5) Tensor or None ---
-        obb_list = [None] * B
-
-        if isinstance(pos_meta, (list, tuple)):
-            # Case 1: evaluator-style per-image list
-            if len(pos_meta) == B and all((x is None) or (torch.is_tensor(x) and x.ndim == 2 and x.shape[1] >= 5)
-                                          for x in pos_meta):
-                obb_list = [(to_tensor(x) if x is not None else None) for x in pos_meta]
-
-            else:
-                # Case 2: training/other — list of dicts OR flat list of tensors
-                grouped = [[] for _ in range(B)]
-                for m in pos_meta:
-                    if isinstance(m, dict):
-                        b = int(m.get('b', m.get('bix', 0)))
-                        obb = m.get('obb') or m.get('obb_abs') or m.get('obb_norm')
-                        if obb is None:
-                            continue
-                        grouped[b].append(to_tensor(obb).reshape(-1, 5))
-                    elif torch.is_tensor(m):
-                        t = to_tensor(m)
-                        if t.ndim == 2 and t.shape[1] >= 6:
-                            bix = t[:, 0].long().clamp_(0, B - 1)
-                            obb = t[:, 1:6]
-                            for b in range(B):
-                                sel = bix == b
-                                if sel.any():
-                                    grouped[b].append(obb[sel])
-                        elif t.ndim == 2 and t.shape[1] >= 5:
-                            # no batch info; assign to image 0
-                            grouped[0].append(t[:, :5])
-                        elif t.ndim == 1 and t.numel() >= 5:
-                            grouped[0].append(t[:5].unsqueeze(0))
-                        # else: ignore malformed
-                    # else: ignore other element types
-
-                for b in range(B):
-                    if len(grouped[b]):
-                        obb_list[b] = torch.cat(grouped[b], dim=0)
+                if cls_logits is None or cls_logits.shape[0] == 0:
+                    # single-class
+                    conf = obj
+                    keep = conf > float(conf_thres)
+                    if keep.any():
+                        boxes_all.append(torch.stack([cx[keep], cy[keep], w[keep], h[keep], ang[keep]], 1))
+                        obb_all.append(torch.stack([cx[keep], cy[keep], w[keep], h[keep], torch.rad2deg(ang[keep])], 1))
+                        scores_all.append(conf[keep])
+                        labels_all.append(torch.zeros_like(conf[keep], dtype=torch.long))
+                else:
+                    probs = torch.sigmoid(cls_logits)  # (nc, H, W)
+                    if multi_label:
+                        scores_pc = obj.unsqueeze(0) * probs            # (nc, H, W)
+                        cls_idx, yy, xx = (scores_pc > float(conf_thres)).nonzero(as_tuple=True)
+                        if cls_idx.numel():
+                            s = scores_pc[cls_idx, yy, xx]
+                            cxk = cx[yy, xx]; cyk = cy[yy, xx]
+                            wk  =  w[yy, xx]; hk  =  h[yy, xx]
+                            ak  = ang[yy, xx]
+                            boxes_all.append(torch.stack([cxk, cyk, wk, hk, ak], 1))
+                            obb_all.append(torch.stack([cxk, cyk, wk, hk, torch.rad2deg(ak)], 1))
+                            scores_all.append(s)
+                            labels_all.append(cls_idx.long())
                     else:
-                        obb_list[b] = None
+                        cls_conf, cls_idx = probs.max(dim=0)            # (H, W)
+                        conf = obj * cls_conf
+                        keep = conf > float(conf_thres)
+                        if keep.any():
+                            boxes_all.append(torch.stack([cx[keep], cy[keep], w[keep], h[keep], ang[keep]], 1))
+                            obb_all.append(torch.stack([cx[keep], cy[keep], w[keep], h[keep], torch.rad2deg(ang[keep])], 1))
+                            scores_all.append(conf[keep])
+                            labels_all.append(cls_idx[keep].long())
 
-        elif torch.is_tensor(pos_meta):
-            # Case 3: single tensor
-            t = to_tensor(pos_meta)
-            if t.ndim == 2 and t.shape[1] >= 6:
-                bix = t[:, 0].long().clamp_(0, B - 1)
-                obb = t[:, 1:6]
-                for b in range(B):
-                    sel = bix == b
-                    if sel.any():
-                        obb_list[b] = obb[sel]
-            elif t.ndim == 2 and t.shape[1] >= 5:
-                obb_list[0] = t[:, :5]
+            if len(scores_all) == 0:
+                results.append({
+                    "boxes": torch.zeros((0,5), device=device),
+                    "obb": torch.zeros((0,5), device=device),
+                    "scores": torch.zeros((0,), device=device),
+                    "labels": torch.zeros((0,), dtype=torch.long, device=device),
+                    "polygons": []
+                })
+                continue
+
+            boxes = torch.cat(boxes_all, 0)        # (N,5) angle in radians
+            obb   = torch.cat(obb_all, 0)          # (N,5) angle in degrees
+            scores= torch.cat(scores_all, 0)       # (N,)
+            labels= torch.cat(labels_all, 0)       # (N,)
+
+            # --- Rotated NMS (prefer MMCV), else TorchVision, else AABB NMS, else top-K ---
+            if use_nms and obb.numel():
+                # ensure numeric expectations for kernels
+                obb = obb.to(torch.float32).contiguous()
+                scores = scores.to(torch.float32).contiguous()
+
+                keep_idx = None
+                if mmcv_nms_rot is not None:
+                    if agnostic:
+                        _, keep_idx = mmcv_nms_rot(obb, scores, float(iou_thres))
+                    else:
+                        chunks = []
+                        for c in labels.unique():
+                            idx = (labels == c).nonzero(as_tuple=True)[0]
+                            if idx.numel():
+                                _, k = mmcv_nms_rot(obb[idx], scores[idx], float(iou_thres))
+                                chunks.append(idx[k])
+                        keep_idx = torch.cat(chunks, 0) if chunks else torch.arange(0, obb.shape[0], device=obb.device)
+                elif tv_nms_rot is not None:
+                    if agnostic:
+                        keep_idx = tv_nms_rot(obb, scores, float(iou_thres))
+                    else:
+                        chunks = []
+                        for c in labels.unique():
+                            idx = (labels == c).nonzero(as_tuple=True)[0]
+                            if idx.numel():
+                                k = tv_nms_rot(obb[idx], scores[idx], float(iou_thres))
+                                chunks.append(idx[k])
+                        keep_idx = torch.cat(chunks, 0) if chunks else torch.arange(0, obb.shape[0], device=obb.device)
+                else:
+                    # AABB fallback via torchvision.ops.nms
+                    x1 = obb[:, 0] - obb[:, 2] * 0.5
+                    y1 = obb[:, 1] - obb[:, 3] * 0.5
+                    x2 = obb[:, 0] + obb[:, 2] * 0.5
+                    y2 = obb[:, 1] + obb[:, 3] * 0.5
+                    aabb = torch.stack([x1, y1, x2, y2], 1).to(torch.float32).contiguous()
+                    try:
+                        from torchvision.ops import nms as tv_nms
+                    except Exception:
+                        tv_nms = None
+                    if tv_nms is not None:
+                        if agnostic:
+                            keep_idx = tv_nms(aabb, scores, float(iou_thres))
+                        else:
+                            chunks = []
+                            for c in labels.unique():
+                                idx = (labels == c).nonzero(as_tuple=True)[0]
+                                if idx.numel():
+                                    k = tv_nms(aabb[idx], scores[idx], float(iou_thres))
+                                    chunks.append(idx[k])
+                            keep_idx = torch.cat(chunks, 0) if chunks else torch.arange(0, aabb.shape[0], device=aabb.device)
+
+                if keep_idx is not None:
+                    keep_idx = keep_idx[scores[keep_idx].argsort(descending=True)]
+                    if keep_idx.numel() > max_det:
+                        keep_idx = keep_idx[:max_det]
+                    boxes, obb, scores, labels = boxes[keep_idx], obb[keep_idx], scores[keep_idx], labels[keep_idx]
+                else:
+                    # Final fallback: top-K
+                    if boxes.shape[0] > max_det:
+                        topk = torch.topk(scores, k=max_det, sorted=True)
+                        keep_idx = topk.indices
+                        boxes, obb, scores, labels = boxes[keep_idx], obb[keep_idx], scores[keep_idx], labels[keep_idx]
             else:
-                raise ValueError("pos_meta tensor must be (N,5) or (N,6).")
-        else:
-            raise TypeError(f"Unsupported pos_meta type: {type(pos_meta)}")
+                # no NMS requested; cap to max_det
+                if boxes.shape[0] > max_det:
+                    topk = torch.topk(scores, k=max_det, sorted=True)
+                    keep_idx = topk.indices
+                    boxes, obb, scores, labels = boxes[keep_idx], obb[keep_idx], scores[keep_idx], labels[keep_idx]
 
-        # --- Optional evaluator knobs ---
-        scores_list = kwargs.get("scores_list", None)
-        topk = kwargs.get("topk", None)
-        score_thresh = kwargs.get("score_thresh", None)
+            results.append({
+                "boxes": boxes,   # radians
+                "obb": obb,       # degrees
+                "scores": scores,
+                "labels": labels,
+                "polygons": []
+            })
+        return results
 
-        # --- ROI crop (your RotatedROIPool.forward signature already matches this) ---
+    # -------- top-down keypoints from OBBs --------
+    @torch.no_grad()
+    def kpt_from_obbs(
+        self,
+        feats: List[torch.Tensor],
+        obb_list: List[torch.Tensor],
+        scores_list: Optional[List[torch.Tensor]] = None,
+        topk: int = 128,
+        chunk: int = 128,
+        score_thresh: float = 0.25,
+    ) -> Tuple[torch.Tensor, List[dict]]:
+        # crop from P3 (/8) features
+        P3 = feats[0]
         crops, metas = self.roi(
-            feat,
-            obb_list=obb_list,
-            scores_list=scores_list,
-            topk=topk,
-            chunk=chunk,
-            score_thresh=score_thresh,
+            P3, obb_list,
+            scores_list=scores_list, topk=topk, chunk=chunk, score_thresh=score_thresh
         )
-
         if crops.numel() == 0:
-            return crops, metas
+            return P3.new_zeros((0,2)), []
 
-        kpred = self.kpt_head(crops)
-        return kpred, metas
+        # ensure kpt head
+        if self.kpt_head is None or getattr(self.kpt_head.net[0][0], "in_channels", None) != P3.shape[1]:
+            self.kpt_head = KptTDHead(in_ch=P3.shape[1])
+
+        uv = self.kpt_head(crops)  # (N,2) in [0,1]
+        return uv, metas

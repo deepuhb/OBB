@@ -16,7 +16,7 @@ import yaml
 
 # --- project imports ---
 from src.engine.trainer import Trainer
-from src.engine.evaluator_full import EvaluatorFull
+from src.engine.evaluator import EvaluatorFull
 from src.data.build import build_dataloaders
 from src.utils import distrib as distu
 
