@@ -1,13 +1,14 @@
+
 # src/data/build.py
 from __future__ import annotations
 from types import SimpleNamespace
 from typing import Tuple, Optional
 
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from src.data.datasets import YoloObbKptDataset          # your dataset
 from src.data.mosaic_wrapper import AugmentingDataset    # augmentation wrapper
-from src.data.collate import collate_obbdet              # <-- robust collate
+from src.data.collate import collate_obbdet              # robust collate
 
 
 def _yaml(cfg, path: str, default=None):
@@ -23,6 +24,13 @@ def _yaml(cfg, path: str, default=None):
 def _yaml_names(cfg) -> list[str]:
     n = _yaml(cfg, "data.names", []) or []
     return list(n)
+
+
+def _maybe_subset(ds, n: Optional[int]):
+    if not n or n <= 0:
+        return ds
+    n = min(n, len(ds))
+    return Subset(ds, list(range(n)))
 
 
 def build_dataloaders(
@@ -50,6 +58,11 @@ def build_dataloaders(
     train_base = YoloObbKptDataset(root=root, split=train_split, img_size=img_size)
     val_ds     = YoloObbKptDataset(root=root, split=val_split,   img_size=img_size)
 
+    # Optional small subset for quick debugging
+    if overfit_n:
+        train_base = _maybe_subset(train_base, overfit_n)
+        val_ds     = _maybe_subset(val_ds, overfit_n)
+
     # ---- push names/nc onto datasets AFTER construction (if provided) ----
     if yaml_names:
         try:
@@ -58,8 +71,19 @@ def build_dataloaders(
         except Exception:
             pass
     try:
-        train_base.nc = yaml_nc
-        val_ds.nc = yaml_nc
+        # If Subset, attach to its dataset
+        def _set_nc(obj, nc):
+            try:
+                obj.nc = nc
+            except Exception:
+                base = getattr(obj, "dataset", None)
+                if base is not None:
+                    try:
+                        base.nc = nc
+                    except Exception:
+                        pass
+        _set_nc(train_base, yaml_nc)
+        _set_nc(val_ds, yaml_nc)
     except Exception:
         pass
 
@@ -96,7 +120,6 @@ def build_dataloaders(
         persistent_workers=bool(workers > 0),
         collate_fn=collate_obbdet,
     )
-    print()
 
     val_loader = DataLoader(
         val_ds,
@@ -111,4 +134,3 @@ def build_dataloaders(
     )
 
     return train_loader, val_loader, train_sampler
-

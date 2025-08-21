@@ -1,45 +1,85 @@
-import torch, numpy as np
+# src/data/collate.py
+from __future__ import annotations
 from typing import Any, Dict, List, Union
-from ..utils.box_ops import quad_to_cxcywh_angle
+import torch
+
+# Optional util to convert quads->OBB if available
+try:
+    from src.utils.box_ops import quad_to_cxcywh_angle
+except Exception:
+    quad_to_cxcywh_angle = None
 
 
-def _to_tensor(x, dtype=None):
+def _to_tensor(x, dtype=torch.float32):
     if torch.is_tensor(x):
-        return x if dtype is None else x.to(dtype=dtype)
-    if isinstance(x, np.ndarray):
-        t = torch.from_numpy(x)
-        return t if dtype is None else t.to(dtype=dtype)
-    if isinstance(x, (list, tuple)):
-        try:
-            return torch.tensor(x, dtype=dtype if dtype is not None else torch.float32)
-        except Exception:
-            return x  # leave as-is if heterogeneous
-    return x
+        return x.to(dtype=dtype)
+    return torch.as_tensor(x, dtype=dtype)
 
-def _ensure_targets(sample: Dict[str, Any]) -> Dict[str, Any]:
-    """Guarantee 'bboxes','labels','kpts' exist as tensors.
-       If 'bboxes' missing or not tensor, synthesize from 'quads' else 'boxes+angles'.
+
+
+
+def _coerce_angles_like(cx: torch.Tensor, ang) -> torch.Tensor:
+    """Return an angle tensor shaped like `cx`.
+    - None or empty -> zeros_like(cx)
+    - scalar -> broadcast
+    - length mismatch -> zeros_like(cx)
     """
-    s = sample
+    if ang is None:
+        return torch.zeros_like(cx)
+    th = _to_tensor(ang, dtype=torch.float32).to(device=cx.device).reshape(-1)
+    if th.numel() == 0:
+        return torch.zeros_like(cx)
+    if th.numel() == 1:
+        return th.expand_as(cx)
+    if th.numel() != cx.numel():
+        return torch.zeros_like(cx)
+    return th
 
-    # Coerce common fields to tensors (if present)
-    if "labels" in s and not torch.is_tensor(s["labels"]):
-        s["labels"] = _to_tensor(s["labels"], dtype=torch.long)
-    if "kpts" in s and not torch.is_tensor(s["kpts"]):
-        s["kpts"] = _to_tensor(s["kpts"], dtype=torch.float32)
-    if "bboxes" in s and not torch.is_tensor(s["bboxes"]):
-        s["bboxes"] = _to_tensor(s["bboxes"], dtype=torch.float32)
+def _ensure_targets(s: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize a single sample so that:
+      - image is CHW FloatTensor
+      - bboxes (N,5) [cx,cy,w,h,theta_rad] exist (pixels)
+      - labels (N,) LongTensor
+      - kpts (N,2) FloatTensor (pixels)
+    Preserve 'quads','boxes','angles' if present. Drop ambiguous 'targets'.
+    """
+    # ---- image -> CHW float32 ----
+    if "image" not in s:
+        raise KeyError("sample missing 'image'")
+    img = s["image"]
 
-    # Synthesize bboxes if missing or empty/non-tensor
+    if torch.is_tensor(img):
+        if img.dim() == 3 and img.shape[0] in (1, 3):  # CHW
+            img = img.float()
+        elif img.dim() == 3 and img.shape[-1] in (1, 3):  # HWC tensor
+            img = img.permute(2, 0, 1).contiguous().float()
+        else:
+            img = img.contiguous().float()
+    else:
+        # assume numpy HWC
+        import numpy as np
+        if isinstance(img, np.ndarray):
+            if img.ndim == 3 and img.shape[2] in (1, 3):
+                img = torch.from_numpy(img.transpose(2, 0, 1)).contiguous().float()
+            else:
+                img = torch.from_numpy(img).contiguous().float()
+        else:
+            # generic -> tensor
+            img = _to_tensor(img).float()
+
+    s["image"] = img
+
+    # ---- labels ----
+    s["labels"] = _to_tensor(s.get("labels", []), dtype=torch.long) if "labels" in s else torch.zeros((0,), dtype=torch.long)
+
+    # ---- bboxes (prefer quads->OBB, else boxes+angles) ----
     need_bboxes = ("bboxes" not in s) or (not torch.is_tensor(s["bboxes"]))
-    if not need_bboxes:
-        if s["bboxes"].ndim != 2 or s["bboxes"].shape[-1] != 5:
-            need_bboxes = True
-
     if need_bboxes:
         bboxes = None
-        # Prefer quads -> OBB
-        if "quads" in s:
+
+        # Prefer quads -> OBB (if util exists)
+        if "quads" in s and quad_to_cxcywh_angle is not None:
             q = s["quads"]
             if not torch.is_tensor(q):
                 q = _to_tensor(q, dtype=torch.float32)
@@ -47,8 +87,8 @@ def _ensure_targets(sample: Dict[str, Any]) -> Dict[str, Any]:
                 q = q.view(-1, 4, 2).float()
                 obb = []
                 for i in range(q.shape[0]):
-                    cx, cy, w, h, th = quad_to_cxcywh_angle(q[i])  # th in radians
-                    obb.append([float(cx), float(cy), max(float(w),1.0), max(float(h),1.0), float(th)])
+                    cx, cy, w, h, th = quad_to_cxcywh_angle(q[i])  # radians
+                    obb.append([float(cx), float(cy), max(float(w), 1.0), max(float(h), 1.0), float(th)])
                 bboxes = torch.tensor(obb, dtype=torch.float32)
 
         # Fallback: boxes + angles -> OBB
@@ -63,10 +103,7 @@ def _ensure_targets(sample: Dict[str, Any]) -> Dict[str, Any]:
                 w  = (bx[:, 2] - bx[:, 0]).clamp_min_(1.0)
                 h  = (bx[:, 3] - bx[:, 1]).clamp_min_(1.0)
                 ang = s.get("angles", None)
-                if ang is None or (not torch.is_tensor(ang)) or ang.numel() == 0:
-                    th = torch.zeros_like(cx)
-                else:
-                    th = _to_tensor(ang, dtype=torch.float32).reshape(-1)
+                th = _coerce_angles_like(cx, ang)
                 bboxes = torch.stack([cx, cy, w, h, th], dim=1)
 
         if bboxes is None:
@@ -74,13 +111,16 @@ def _ensure_targets(sample: Dict[str, Any]) -> Dict[str, Any]:
 
         s["bboxes"] = bboxes
 
-    # Final dtype guarantees
-    if "labels" not in s or not torch.is_tensor(s["labels"]):
-        s["labels"] = torch.zeros((0,), dtype=torch.long)
+    # ---- kpts ----
     if "kpts" not in s or not torch.is_tensor(s["kpts"]):
         s["kpts"] = torch.zeros((0, 2), dtype=torch.float32)
 
+    # ---- remove ambiguous targets ----
+    if "targets" in s:
+        s.pop("targets", None)
+
     return s
+
 
 def _can_stack(lst):
     if not lst or not all(torch.is_tensor(x) for x in lst):
@@ -88,12 +128,11 @@ def _can_stack(lst):
     s0 = tuple(lst[0].shape)
     return all(tuple(x.shape) == s0 for x in lst)
 
+
 def collate_obbdet(batch: List[Union[Dict[str, Any], tuple]]):
-    # Dict samples (your case)
+    # Dict samples (primary path)
     if isinstance(batch[0], dict):
-        # --- New: pre-normalize each sample so targets are present and tensors ---
-        for i in range(len(batch)):
-            batch[i] = _ensure_targets(batch[i])
+        batch = [_ensure_targets(b) for b in batch]
 
         out: Dict[str, Any] = {}
         keys = set().union(*(b.keys() for b in batch))
@@ -102,19 +141,22 @@ def collate_obbdet(batch: List[Union[Dict[str, Any], tuple]]):
             if k == "image":
                 out[k] = torch.stack(vals, dim=0)
                 continue
-            # AFTER — 'targets' is intentionally omitted
+            # Keep per-sample lists for ragged keys
             if k in ("bboxes", "boxes", "quads", "kpts", "labels", "angles",
-                     "paths", "meta", "metas", "pos_meta"):
+                     "paths", "path", "meta", "metas", "pos_meta"):
                 out[k] = vals
                 continue
-            # If some wrapper insists on adding 'targets', drop it here:
             if k == "targets":
                 continue
-
             out[k] = torch.stack(vals, dim=0) if _can_stack(vals) else vals
+
+        # unify path key
+        if "path" in out and "paths" not in out:
+            out["paths"] = out["path"]
+            out.pop("path", None)
         return out
 
-    # Tuple fallback
+    # Tuple fallback (img, target)
     imgs = [b[0] for b in batch]
     tars = [b[1] for b in batch]
     return torch.stack(imgs, dim=0), tars
