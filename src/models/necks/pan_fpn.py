@@ -1,55 +1,51 @@
-
 # src/models/necks/pan_fpn.py
-from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Use the same helper from the backbone
-from src.models.backbones.cspnext11 import conv_bn_act
-
-
 class PANFPN(nn.Module):
     """
-    Channel-consistent PAN-FPN:
-      - Project P3, P4, P5 to the same width C (default: C = ch[1], i.e., /16 width).
-      - Top-down: fuse at /16 then /8.
-      - Bottom-up: aggregate back to /16 and /32.
-    Returns (N3=/8, D4=/16, D5=/32) each with C channels.
+    Explicit-contract PAN/FPN neck.
+    - Takes backbone feature channels explicitly: ch_in=(c3,c4,c5)
+    - Emits three maps (all with ch_out channels): P3_out (/8), P4_out (/16), P5_out (/32)
     """
-    def __init__(self, ch=(128, 256, 512), out_ch: int | None = None):
+    def __init__(self, ch_in: tuple[int, int, int], ch_out: int):
         super().__init__()
-        c3, c4, c5 = ch
-        C = int(out_ch) if out_ch is not None else int(c4)  # unify to /16 width by default
+        assert len(ch_in) == 3, "ch_in must be a 3-tuple (c3,c4,c5)"
+        c3, c4, c5 = ch_in
 
-        # lateral projections to unified width C
-        self.lat3 = conv_bn_act(c3, C, k=1, s=1, p=0)
-        self.lat4 = conv_bn_act(c4, C, k=1, s=1, p=0)
-        self.lat5 = conv_bn_act(c5, C, k=1, s=1, p=0)
+        # lateral 1x1 to unify channels
+        self.lat5 = nn.Conv2d(c5, ch_out, 1, 1, 0)
+        self.lat4 = nn.Conv2d(c4, ch_out, 1, 1, 0)
+        self.lat3 = nn.Conv2d(c3, ch_out, 1, 1, 0)
 
-        # top-down fusions (concat -> 2C, then reduce to C)
-        self.fuse4 = conv_bn_act(C * 2, C, k=3, s=1)
-        self.fuse3 = conv_bn_act(C * 2, C, k=3, s=1)
+        # top-down smoothing
+        self.smooth4 = nn.Conv2d(ch_out, ch_out, 3, 1, 1)
+        self.smooth3 = nn.Conv2d(ch_out, ch_out, 3, 1, 1)
 
-        # bottom-up aggregations
-        self.down4 = conv_bn_act(C * 2, C, k=3, s=1)  # cat(pool(f3), f4)
-        self.down5 = conv_bn_act(C * 2, C, k=3, s=1)  # cat(pool(d4), lat5(p5))
+        # bottom-up aggregation
+        self.down3 = nn.Conv2d(ch_out, ch_out, 3, 2, 1)         # P3_out -> stride-16
+        self.out4  = nn.Conv2d(ch_out * 2, ch_out, 3, 1, 1)     # cat(P3_down, P4_top)
+        self.down4 = nn.Conv2d(ch_out, ch_out, 3, 2, 1)         # P4_out -> stride-32
+        self.out5  = nn.Conv2d(ch_out * 2, ch_out, 3, 1, 1)     # cat(P4_down, P5_top)
 
-        self._ch_out = (C, C, C)
+        # expose for the head
+        self.ch_out = ch_out
 
     def forward(self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor):
         # Top-down
-        u4 = F.interpolate(self.lat5(p5), scale_factor=2, mode="nearest")   # /32 -> /16
-        f4 = self.fuse4(torch.cat([u4, self.lat4(p4)], dim=1))              # /16, C
-        u3 = F.interpolate(f4, scale_factor=2, mode="nearest")              # /16 -> /8
-        f3 = self.fuse3(torch.cat([u3, self.lat3(p3)], dim=1))              # /8,  C
+        p5_top = self.lat5(p5)
+        p4_top = self.lat4(p4) + F.interpolate(p5_top, scale_factor=2, mode="nearest")
+        p4_top = self.smooth4(p4_top)
+
+        p3_top = self.lat3(p3) + F.interpolate(p4_top, scale_factor=2, mode="nearest")
+        p3_top = self.smooth3(p3_top)
 
         # Bottom-up
-        d4 = self.down4(torch.cat([F.max_pool2d(f3, 2), f4], dim=1))        # /16, C
-        d5 = self.down5(torch.cat([F.max_pool2d(d4, 2), self.lat5(p5)], dim=1))  # /32, C
+        p3_down = self.down3(p3_top)
+        p4_out  = self.out4(torch.cat([p3_down, p4_top], dim=1))
+        p4_down = self.down4(p4_out)
+        p5_out  = self.out5(torch.cat([p4_down, p5_top], dim=1))
 
-        return f3, d4, d5
-
-    @property
-    def ch_out(self):
-        return self._ch_out
+        # Final three maps (all ch_out channels): /8, /16, /32
+        return p3_top, p4_out, p5_out

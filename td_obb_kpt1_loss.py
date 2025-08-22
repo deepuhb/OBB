@@ -271,7 +271,7 @@ class TDOBBWKpt1Criterion(nn.Module):
                 # bbox regression — compare activated preds to targets
                 p_tx = torch.sigmoid(tx[b, j, i])
                 p_ty = torch.sigmoid(ty[b, j, i])
-                # widths/heights are predicted in log-space → exp at decode;
+                # widths/heights are predicted in log-space → exp at decode; 
                 # here supervise on decoded scale in *stride units* for stability.
                 p_tw = torch.exp(tw[b, j, i])
                 p_th = torch.exp(th[b, j, i])

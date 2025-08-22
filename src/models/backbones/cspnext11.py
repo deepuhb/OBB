@@ -38,7 +38,7 @@ class C3(nn.Module):
         y2 = self.cv2(x)
         return self.cv3(torch.cat([y1, y2], dim=1))
 
-class Backbone(nn.Module):
+class CSPBackbone(nn.Module):
     """
     Lightweight CSP-Next style backbone.
     Returns three feature maps:

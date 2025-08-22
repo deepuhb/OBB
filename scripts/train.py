@@ -1,201 +1,205 @@
-# scripts/train.py
-from __future__ import annotations
-import os, sys, argparse, random
-from types import SimpleNamespace
-from datetime import timedelta, datetime
-
-# Ensure repo root on sys.path
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+#!/usr/bin/env python3
+import os
+import time
+import argparse
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-# --- Project imports ---
 from src.data.build import build_dataloaders
 from src.engine.trainer import Trainer
+from src.engine.dist import ddp_is_enabled, get_rank, get_world_size, setup_ddp, cleanup_ddp
+from src.engine.checkpoint import load_smart_state_dict, save_checkpoint_bundle
+
 from src.models.yolo11_obbpose_td import YOLO11_OBBPOSE_TD
 from src.models.losses.td_obb_kpt1_loss import TDOBBWKpt1Criterion
 
-try:
-    from src.engine.evaluator import Evaluator
-except Exception:
-    Evaluator = None
 
-# ----------------- utils -----------------
-def seed_all(seed: int = 42):
-    random.seed(seed); os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+def parse_args():
+    p = argparse.ArgumentParser("YOLO11-OBBPOSE TD — train")
+    p.add_argument("--data_root", type=str, required=True)
+    p.add_argument("--img_size", type=int, default=640)
+    p.add_argument("--epochs", type=int, default=300)
+    p.add_argument("--batch", type=int, default=16, help="per-GPU batch size")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--classes", type=int, default=1)
+    p.add_argument("--width", type=float, default=1.0)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--weight_decay", type=float, default=5e-2)
+    p.add_argument("--resume", type=str, default="", help="optional checkpoint path")
+    p.add_argument("--save_dir", type=str, default="runs")
+    p.add_argument("--name", type=str, default="", help="subfolder name (optional)")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--overfit_n", type=int, default=0, help="debug: use N images repeatedly")
+    # evaluation cadence
+    p.add_argument("--eval_interval", type=int, default=1)
+    p.add_argument("--warmup_noeval", type=int, default=0)
+    p.add_argument("--metric", type=str, default="mAP50")
+    p.add_argument("--metric_mode", type=str, default="max", choices=["max", "min"])
+    return p.parse_args()
+
+
+def build_model(num_classes: int, width: float, device: torch.device):
+    model = YOLO11_OBBPOSE_TD(num_classes=num_classes, width=width).to(device)
+    # Compact but stable(ish) architecture signature for train/eval matching
+    try:
+        total = sum(p.numel() for p in model.parameters())
+        sig = f"{hash(tuple(n for n, _ in model.named_parameters())) & 0xFFFFFFFF:08x}"
+        if get_rank() == 0:
+            print(f"[SCHEMA TRAIN] sig={sig} params={total}")
+    except Exception:
+        pass
+    return model
+
+
+def make_criterion(args, device):
+    """
+    Be resilient to small signature diffs between loss versions.
+    Prefer the newer names; fall back to the older ones if needed.
+    """
+    # Preferred / current naming
+    try:
+        crit = TDOBBWKpt1Criterion(
+            num_classes=args.classes,
+            strides=(8, 16, 32),
+            # routing thresholds between P3/P4/P5 in pixels (short side of OBB bbox)
+            level_boundaries=(64.0, 128.0),
+            # detection loss weights
+            lambda_box=1.0,
+            lambda_obj=1.0,
+            lambda_ang=0.25,
+            lambda_cls=0.0 if args.classes == 1 else 0.5,
+            # keypoint path
+            lambda_kpt=1.0,
+            kpt_freeze_epochs=0,
+            kpt_warmup_epochs=0,
+            # positives/assignment behavior
+            neighbor_cells=True,
+            neighbor_range=1,
+            adjacent_level_margin=16.0,
+        ).to(device)
+        return crit
+    except TypeError:
+        # Legacy naming
+        crit = TDOBBWKpt1Criterion(
+            num_classes=args.classes,
+            strides=(8, 16, 32),
+             ).to(device)
+        return crit
+
+
+def main():
+    # Minor memory friendliness & determinism niceties
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-def get_dist_env():
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    rank       = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    return local_rank, rank, world_size
+    args = parse_args()
 
-def build_model(num_classes: int, width: float = 1.0):
-    import inspect
-    sig = inspect.signature(YOLO11_OBBPOSE_TD.__init__)
-    params = set(sig.parameters.keys())
-    kwargs = {}
-    if "num_classes" in params: kwargs["num_classes"] = num_classes
-    elif "nc" in params:        kwargs["nc"] = num_classes
-    elif "classes" in params:   kwargs["classes"] = num_classes
-    if "width" in params: kwargs["width"] = width
-    for k in ("kpt_channels", "kp_channels", "kpm_channels", "n_keypoints"):
-        if k in params: kwargs[k] = 3
-    return YOLO11_OBBPOSE_TD(**kwargs)
-
-# ----------------- main -----------------
-def main():
-    ap = argparse.ArgumentParser()
-    # Data/IO
-    ap.add_argument("--data_root", type=str, default="datasets")
-    ap.add_argument("--img_size", type=int, default=640)
-    ap.add_argument("--save_dir", type=str, default="runs")
-    ap.add_argument("--run_name", type=str, default=None)
-    ap.add_argument("--resume", type=str, default="")
-    # Train
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--batch", type=int, default=16, help="per-GPU batch size")
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=5e-4)
-    ap.add_argument("--weight_decay", type=float, default=5e-3)
-    ap.add_argument("--accum_steps", type=int, default=1)
-    ap.add_argument("--grad_clip", type=float, default=None)
-    ap.add_argument("--overfit_n", type=int, default=0, help="subset N images (debug)")
-    # Eval/AMP
-    ap.add_argument("--eval_interval", type=int, default=1)
-    ap.add_argument("--warmup_noeval", type=int, default=0)
-    ap.add_argument("--amp", action="store_true"); ap.add_argument("--no_amp", dest="amp", action="store_false"); ap.set_defaults(amp=True)
-    # Model
-    ap.add_argument("--classes", type=int, default=1)
-    ap.add_argument("--width", type=float, default=1.0)
-    args = ap.parse_args()
-
-    seed_all(42)
-
-    # --- DDP init & per-rank device ---
-    local_rank, rank, world_size = get_dist_env()
+    # --- DDP setup ---
+    setup_ddp()
+    rank, world = get_rank(), get_world_size()
+    is_ddp = ddp_is_enabled()
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        device = torch.device("cpu")
 
-    is_distributed = world_size > 1
-    if is_distributed and not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(minutes=60))
+    # --- run dir ---
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    name = args.name or f"exp-{ts}"
+    save_dir = Path(args.save_dir) / name
+    if rank == 0:
+        save_dir.mkdir(parents=True, exist_ok=True)
 
     if rank == 0:
-        print(f"[DDP] world={world_size} | per_gpu_batch={args.batch} | accum_steps={args.accum_steps}")
+        print(f"[DDP] world={world} | per_gpu_batch={args.batch} | accum_steps=1")
+        print(f"[EVAL cfg] interval={args.eval_interval}  warmup_noeval={args.warmup_noeval}  "
+              f"select='{args.metric}' mode='{args.metric_mode}'")
 
-    # --------------- dataloaders ---------------
-    data_cfg = SimpleNamespace(
-        data=SimpleNamespace(
-            root=args.data_root,
-            train="train",
-            val="val",
-            img_size=args.img_size,
-            pin_memory=True,
-        ),
-        train=SimpleNamespace(
-            mosaic=True, mosaic_prob=0.5,
-            fliplr=0.5, flipud=0.0,
-            hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-        ),
-    )
-
+    # --- dataloaders ---
+    cfg = {
+        "data_root": args.data_root,
+        "img_size": args.img_size,
+        "classes": args.classes,
+        "save_dir": str(save_dir),
+        "eval_interval": args.eval_interval,
+        "warmup_noeval": args.warmup_noeval,
+        "eval_select": args.metric,      # name used inside Trainer
+        "eval_mode": args.metric_mode,   # 'max' or 'min'
+        "amp": args.amp,
+    }
     train_loader, val_loader, train_sampler = build_dataloaders(
-        data_cfg,
+        cfg=cfg,
         batch_per_device=args.batch,
         workers=args.workers,
         overfit_n=args.overfit_n,
         rank=rank,
-        world_size=world_size,
+        world_size=world,
     )
 
-    # --------------- model / ddp ---------------
-    model = build_model(num_classes=args.classes, width=args.width).to(device)
-    if is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank,
-            broadcast_buffers=False, find_unused_parameters=False,
-        )
+    # --- model / loss / opt ---
+    model = build_model(args.classes, args.width, device)
+    if is_ddp:
+        # find_unused_parameters=True: kpt path may be unused for some micro-batches
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    # --------------- criterion / optim / sched ---------------
-    criterion = TDOBBWKpt1Criterion(num_classes=args.classes)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scheduler.step_on_iter = False
+    criterion = make_criterion(args, device)
 
-    # --------------- run dir ---------------
-    run_name = args.run_name or datetime.now().strftime("exp-%Y%m%d_%H%M%S")
-    save_dir = os.path.join(args.save_dir, run_name)
-    os.makedirs(save_dir, exist_ok=True)
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
+    )
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=0.1 * args.lr)
 
-    # --------------- optional resume ---------------
+    # --- optional resume (load on ALL ranks so params/buffers match) ---
     if args.resume:
-        try:
-            from src.engine import checkpoint as ckpt
-            ckpt.smart_load(
-                path=args.resume,
-                model=model,
-                optimizer=optimizer,
-                scaler=None,
-                img_size=args.img_size,
-                device=device,
-                strict=False,
-                verbose=(rank == 0),
-                extra_maps=[{"neck.inner.": "neck."}, {"head.": "det_head."}],
-            )
-        except Exception as e:
-            if rank == 0:
-                print(f"[WARN] smart_load failed ({e}); falling back to torch.load strict=False")
-            sd = torch.load(args.resume, map_location=device)
-            if "model" in sd:
-                sd = sd["model"]
+        ckpt_path = Path(args.resume)
+        if ckpt_path.is_file():
             try:
-                (model.module if hasattr(model, "module") else model).load_state_dict(sd, strict=False)
-            except Exception as e2:
+                # Handle common key prefix drift (e.g. 'neck.inner.' -> 'neck.')
+                load_smart_state_dict(model.module if is_ddp else model,
+                                      ckpt_path, map_renames=[("neck.inner.", "neck.")])
                 if rank == 0:
-                    print(f"[ERROR] resume load_state_dict failed: {e2}")
+                    print(f"[RESUME] loaded weights from {ckpt_path}")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[RESUME] failed to load weights: {e}")
+        elif rank == 0:
+            print(f"[RESUME] path not found: {ckpt_path}")
 
-    evaluator = Evaluator() if Evaluator is not None else None
-
-    # --------------- Trainer config ---------------
-    cfg = SimpleNamespace(
-        train=SimpleNamespace(
-            epochs=args.epochs,
-            accum_steps=args.accum_steps,
-            amp=args.amp,
-            grad_clip=args.grad_clip,
-            eval_interval=args.eval_interval,
-            warmup_noeval=args.warmup_noeval,
-            log_interval=50,
-            save_dir=save_dir,
-        ),
-        eval=SimpleNamespace(select="mAP50", mode="max"),
-    )
-
+    # --- trainer ---
     trainer = Trainer(
         model=model,
         criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
+        optimizer=opt,
+        scheduler=sched,
         device=device,
         cfg=cfg,
         logger=None,
     )
 
-    trainer.fit(train_loader, val_loader, evaluator, train_sampler=train_sampler)
+    # --- fit ---
+    best = trainer.fit(train_loader, val_loader, evaluator=None, train_sampler=train_sampler)
 
-    # Clean shutdown
-    if is_distributed:
-        dist.barrier()
-        dist.destroy_process_group()
+    # --- save final bundle on rank-0 ---
+    if rank == 0:
+        save_checkpoint_bundle(
+            save_dir / "last.pt",
+            model=model,
+            optimizer=opt,
+            scheduler=sched,
+            meta={
+                "epochs": args.epochs,
+                "args": vars(args),
+                "best": best,
+            },
+        )
+
+    cleanup_ddp()
+
 
 if __name__ == "__main__":
     main()

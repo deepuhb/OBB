@@ -3,6 +3,8 @@ from __future__ import annotations
 import os, sys, argparse, json, random
 import numpy as np
 import torch
+from src.utils.model_schema import print_schema
+from src.data.build import build_dataloaders
 
 # Make eval deterministic across runs
 random.seed(0)
@@ -161,7 +163,7 @@ def main():
         flipud=0.0, fliplr=0.0, degrees=0.0, translate=0.0, scale=1.0, shear=0.0, perspective=0.0,
         mosaic_prob=0.0, mixup_prob=0.0, kpt_expand=1.25, kpt_crop=args.kpt_crop,
     )
-    from src.data.build import build_dataloaders
+
     train_loader, val_loader, _ = build_dataloaders(cfg, args.batch, args.workers, 0, 0, 1)
     print('[EVAL-ONCE] dataloaders ready.', flush=True)
     # Show VAL sample path summary (if dataset exposes)
@@ -188,6 +190,7 @@ def main():
     # Build model
     print(f"[EVAL-ONCE] building model (width={width})...", flush=True)
     model = _build_model(num_classes=args.classes, width=width).to(device).eval()
+    print_schema(model, tag='Eval-CONSTRUCTED')
 
     # Load checkpoint (smart-load + zero unmatched)
     print(f"[EVAL-ONCE] loading checkpoint '{args.ckpt}'...", flush=True)
