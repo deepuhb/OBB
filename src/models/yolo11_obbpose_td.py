@@ -14,7 +14,6 @@ OBBPoseHead / RotatedROI.
 """
 
 from __future__ import annotations
-
 from typing import List, Optional, Tuple
 
 import torch
@@ -22,7 +21,7 @@ import torch.nn as nn
 
 # ---- use your existing modules ----
 # backbone must return (p3,p4,p5) with channels like (256,512,1024)
-from .backbones.cspnext11 import CSPBackbone  # adapt if your exported name differs
+from .backbones.cspnext11 import CSPBackbone  # adapt import if your symbol differs
 from .necks.pan_fpn import PANFPN
 from .heads.obbpose_head import OBBPoseHead
 from .layers.rot_roi import RotatedROIPool
@@ -95,10 +94,9 @@ class YOLO11_OBBPOSE_TD(nn.Module):
         self.neck_ch_out: int = int(getattr(self.neck, "ch_out", 256))
 
         # ---- Detection Head (kept as in your repo) ----
-        # Your OBBPoseHead previously accepted 'ch' as an int (the neck out channels per scale).
-        # If your local head still expects a tuple, adjust below to pass (self.neck_ch_out,)*3.
+        # If your OBBPoseHead expects a tuple of channels per scale, pass (neck_ch_out,)*3.
         self.head: OBBPoseHead = head if head is not None else OBBPoseHead(
-            ch=(self.neck_ch_out,)*3,  # if needed: (self.neck_ch_out, self.neck_ch_out, self.neck_ch_out)
+            ch=(self.neck_ch_out,)*3,
             num_classes=self.num_classes,
         )
 
@@ -153,6 +151,11 @@ class YOLO11_OBBPOSE_TD(nn.Module):
             chunk: int = 512,
             **kwargs,  # accept legacy names
     ):
+        """
+        Returns:
+            uv_pred: (M,2) in [0,1]
+            metas  : list of dicts (one per crop) with bbox + geometry + bix (image index)
+        """
         # ---- alias mapping (compat with caller) ----
         if "topk" in kwargs:            kpt_topk = int(kwargs["topk"])
         if "crop" in kwargs:            kpt_crop = int(kwargs["crop"])
@@ -162,15 +165,20 @@ class YOLO11_OBBPOSE_TD(nn.Module):
         if "chunk_size" in kwargs:      chunk = int(kwargs["chunk_size"])
 
         def _to_2d_tensor(x, device, dtype):
+            """
+            Normalize inputs to strict (N,5) float tensor on the right device/dtype.
+            - empty -> (0,5)
+            - single ROI like (5,) -> (1,5)
+            """
             t = torch.as_tensor(x, device=device, dtype=dtype)
-            # empty -> (0,5) not (0,)
             if t.ndim == 1:
                 if t.numel() == 0:
                     return t.new_zeros((0, 5))
-                t = t.unsqueeze(0)
-            # sanity: last dim must be 5
+                t = t.unsqueeze(0)  # (1,5)
+            if t.ndim != 2:
+                raise ValueError(f"OBB tensor must be 2-D (N,5); got {tuple(t.shape)}")
             if t.shape[-1] != 5:
-                raise ValueError(f"OBB tensor must have last dim=5, got {tuple(t.shape)}")
+                raise ValueError(f"OBB tensor last dim must be 5; got {tuple(t.shape)}")
             return t
 
         device = feats[0].device
@@ -189,23 +197,23 @@ class YOLO11_OBBPOSE_TD(nn.Module):
             self.kpt_head = _CropKptHead(in_ch=in_ch, hidden=self._kpt_head_hidden).to(device).float()
             self._kpt_head_in_ch = in_ch
 
-        uv_chunks = []
-        meta_all = []
+        uv_chunks: List[torch.Tensor] = []
+        meta_all: List[dict] = []
 
         if len(boxes_list) != B:
             raise ValueError(f"boxes_list length {len(boxes_list)} must equal batch size {B}")
 
         for bix in range(B):
             rois = boxes_list[bix]
-
-            # normalize to tensor (N,5) on the correct device/dtype
             if rois is None:
                 continue
+
+            # ---- normalize to (N,5) on correct device/dtype
             rois = _to_2d_tensor(rois, device=device, dtype=P3.dtype)
             if rois.numel() == 0:
                 continue
 
-            # optional score-based per-image top-k
+            # (optional) score-based per-image top-k
             if scores_list is not None and isinstance(scores_list[bix], torch.Tensor):
                 sc = scores_list[bix].to(device=device)
                 if sc.numel() and sc.numel() == rois.shape[0]:
@@ -216,15 +224,23 @@ class YOLO11_OBBPOSE_TD(nn.Module):
                 if rois.shape[0] > kpt_topk:
                     rois = rois[:kpt_topk]
 
+            # ensure at least kpt_min_per_img crops unless empty
+            if rois.shape[0] < kpt_min_per_img and rois.shape[0] > 0:
+                # simple fallback: repeat first few boxes
+                rep = kpt_min_per_img - rois.shape[0]
+                rois = torch.cat([rois, rois[:rep]], dim=0)
+
+            # chunking to limit memory
             N = int(rois.shape[0])
             s = 0
             while s < N:
                 e = min(s + int(chunk), N)
                 rois_slice = rois[s:e]
-                # if a single ROI slips through as 1-D (e.g., from list slicing), fix it:
+                # ---- STRICT: keep 2-D even for single element slices
                 if rois_slice.ndim == 1:
                     rois_slice = rois_slice.unsqueeze(0)
 
+                # ROI crops on the single-image feature map
                 crops, metas = self.roi(P3[bix:bix + 1], rois_slice)  # (M,C,S,S), list[dict]
                 uv = self.kpt_head(crops)  # (M,2) in [0,1]
 
