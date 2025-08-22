@@ -74,7 +74,7 @@ def build_dataloaders(
         # If Subset, attach to its dataset
         def _set_nc(obj, nc):
             try:
-                obj.nc = nc
+                obj.num_classes = nc
             except Exception:
                 base = getattr(obj, "dataset", None)
                 if base is not None:

@@ -1,7 +1,7 @@
 
 # scripts/train.py
 from __future__ import annotations
-import os, sys, math, time, argparse, random
+import os, sys, math, time, argparse, random, inspect
 from types import SimpleNamespace
 
 # Ensure repo root on sys.path
@@ -21,7 +21,7 @@ from src.data.collate import collate_obbdet
 from src.models.yolo11_obbpose_td import YOLO11_OBBPOSE_TD
 from src.models.losses.td_obb_kpt1_loss import TDOBBWKpt1Criterion
 
-# Evaluator (new file under models/ per your change from evaluator_full.py -> evaluator.py)
+# Evaluator
 try:
     from src.engine.evaluator import Evaluator
 except Exception:
@@ -61,6 +61,34 @@ def build_loaders(root, img_size=640, batch=16, workers=4, mosaic=True, mosaic_p
     return tr_loader, va_loader
 
 
+def build_model(num_classes: int, width: float = 1.0):
+    # Build kwargs only for params supported by the current model signature
+    sig = inspect.signature(YOLO11_OBBPOSE_TD.__init__)
+    params = set(sig.parameters.keys())  # includes 'self'
+    kwargs = {}
+
+    # class count (various aliases across versions)
+    if "num_classes" in params:
+        kwargs["num_classes"] = num_classes
+    elif "nc" in params:
+        kwargs["nc"] = num_classes
+    elif "classes" in params:
+        kwargs["classes"] = num_classes
+
+    # width / scale
+    if "width" in params:
+        kwargs["width"] = width
+    elif "w" in params:
+        kwargs["w"] = width
+
+    # optional keypoint map channels (we try several common names)
+    for k in ("kpt_channels", "kp_channels", "kpm_channels", "n_keypoints"):
+        if k in params:
+            kwargs[k] = 3  # your project uses a 3-channel kpt head
+
+    return YOLO11_OBBPOSE_TD(**kwargs)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, default="datasets", help="dataset root containing images/ and labels/")
@@ -90,9 +118,8 @@ def main():
         hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, mixup_prob=0.10, mixup_alpha=0.20,
     )
 
-    # Model
-    model = YOLO11_OBBPOSE_TD(num_classes=args.classes, width=1.0, kpt_channels=3)
-    model.to(device)
+    # Model (robust to signature differences)
+    model = build_model(num_classes=args.classes, width=1.0).to(device)
 
     # Criterion
     criterion = TDOBBWKpt1Criterion(num_classes=args.classes)
@@ -100,8 +127,7 @@ def main():
     # Optimizer & LR
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # Example cosine schedule per-epoch
-    # If you prefer per-iter stepping, set scheduler.step_on_iter=True and call step() each iteration.
+    # Cosine schedule per-epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scheduler.step_on_iter = False  # our Trainer checks this flag
 

@@ -34,7 +34,7 @@ class TDOBBWKpt1Criterion(nn.Module):
 
     def __init__(
         self,
-        nc: int,
+        num_classes: int,
         strides: Sequence[int] = (8, 16, 32),
         lambda_box: float = 1.0,
         lambda_obj: float = 1.0,
@@ -46,7 +46,7 @@ class TDOBBWKpt1Criterion(nn.Module):
         level_boundaries: Tuple[float, float] = (64.0, 128.0),  # px thresholds to route GTs to p3/p4/p5
     ) -> None:
         super().__init__()
-        self.nc = int(nc)
+        self.num_classes = int(num_classes)
         self.strides = tuple(int(s) for s in strides)
         self.lambda_box = float(lambda_box)
         self.lambda_obj = float(lambda_obj)
@@ -95,7 +95,7 @@ class TDOBBWKpt1Criterion(nn.Module):
                 self.lambda_box * (l_box / total_pos) +
                 self.lambda_obj * l_obj +
                 self.lambda_ang * (l_ang / total_pos) +
-                (self.lambda_cls * (l_cls / total_pos) if self.nc > 1 else 0.0)
+                (self.lambda_cls * (l_cls / total_pos) if self.num_classes > 1 else 0.0)
             )
 
         # Keypoint loss (top-down) if enabled
@@ -116,7 +116,7 @@ class TDOBBWKpt1Criterion(nn.Module):
             "loss_box": float(((l_box / max(1, total_pos))).detach().item() if total_pos else 0.0),
             "loss_obj": float(l_obj.detach().item()),
             "loss_ang": float(((l_ang / max(1, total_pos))).detach().item() if total_pos else 0.0),
-            "loss_cls": float(((l_cls / max(1, total_pos))).detach().item() if (self.nc > 1 and total_pos) else 0.0),
+            "loss_cls": float(((l_cls / max(1, total_pos))).detach().item() if (self.num_classes > 1 and total_pos) else 0.0),
             "loss_kpt": float((self.lambda_kpt * kpt_scale * l_kpt).detach().item()),
             "num_pos": float(total_pos),
             "kpt_pos": float(kpt_pos),
@@ -217,7 +217,7 @@ class TDOBBWKpt1Criterion(nn.Module):
         l_box = torch.zeros((), device=device)
         l_obj = torch.zeros((), device=device)
         l_ang = torch.zeros((), device=device)
-        l_cls = torch.zeros((), device=device) if self.nc > 1 else torch.zeros((), device=device)
+        l_cls = torch.zeros((), device=device) if self.num_classes > 1 else torch.zeros((), device=device)
 
         total_pos = 0
         for li, dm in enumerate(det_maps):
@@ -252,8 +252,8 @@ class TDOBBWKpt1Criterion(nn.Module):
                 l_ang = l_ang + self.smoothl1(p_c, torch.tensor(tgt["cos"], device=device))
 
                 # classification (multi-label BCE per class)
-                if self.nc > 1 and cls_logits is not None:
-                    y = torch.zeros((self.nc,), device=device)
+                if self.num_classes > 1 and cls_logits is not None:
+                    y = torch.zeros((self.num_classes,), device=device)
                     y[tgt["cls"]] = 1.0
                     l_cls = l_cls + F.binary_cross_entropy_with_logits(cls_logits[b, :, j, i], y)
 

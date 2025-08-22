@@ -1,44 +1,55 @@
 
+# src/models/necks/pan_fpn.py
+from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Use the same helper from the backbone
 from src.models.backbones.cspnext11 import conv_bn_act
+
 
 class PANFPN(nn.Module):
     """
-    YOLO-style PAN-FPN
-    Inputs:  p3 (/8), p4 (/16), p5 (/32)
-    Outputs: n3 (/8), d4 (/16), d5 (/32)
-    ch: (C3, C4, C5) channel sizes that match the backbone's outputs.
+    Channel-consistent PAN-FPN:
+      - Project P3, P4, P5 to the same width C (default: C = ch[1], i.e., /16 width).
+      - Top-down: fuse at /16 then /8.
+      - Bottom-up: aggregate back to /16 and /32.
+    Returns (N3=/8, D4=/16, D5=/32) each with C channels.
     """
-    def __init__(self, ch=(128, 256, 512)):
+    def __init__(self, ch=(128, 256, 512), out_ch: int | None = None):
         super().__init__()
         c3, c4, c5 = ch
+        C = int(out_ch) if out_ch is not None else int(c4)  # unify to /16 width by default
 
-        # lateral reduce 1x1
-        self.lat5 = conv_bn_act(c5, c4, 1, 1, 0)
-        self.lat4 = conv_bn_act(c4, c3, 1, 1, 0)
+        # lateral projections to unified width C
+        self.lat3 = conv_bn_act(c3, C, k=1, s=1)
+        self.lat4 = conv_bn_act(c4, C, k=1, s=1)
+        self.lat5 = conv_bn_act(c5, C, k=1, s=1)
 
-        # top-down fusions
-        self.fuse4 = conv_bn_act(c4 + c4, c4, 3, 1, 1)  # up(P5:/32 -> /16) + p4
-        self.fuse3 = conv_bn_act(c3 + c3, c3, 3, 1, 1)  # up(n4:/16 -> /8) + p3
+        # top-down fusions (concat -> 2C, then reduce to C)
+        self.fuse4 = conv_bn_act(C * 2, C, k=3, s=1)
+        self.fuse3 = conv_bn_act(C * 2, C, k=3, s=1)
 
-        # bottom-up PAN
-        self.down4 = conv_bn_act(c3, c4, 3, 2, 1)       # n3 /8 -> /16
-        self.fuse4d = conv_bn_act(c4 + c4, c4, 3, 1, 1) # down(n3)+n4
-        self.down5 = conv_bn_act(c4, c5, 3, 2, 1)       # d4 /16 -> /32
-        self.fuse5d = conv_bn_act(c5 + c5, c5, 3, 1, 1) # down(d4) + p5
+        # bottom-up aggregations
+        self.down4 = conv_bn_act(C * 2, C, k=3, s=1)  # cat(pool(f3), f4)
+        self.down5 = conv_bn_act(C * 2, C, k=3, s=1)  # cat(pool(d4), lat5(p5))
+
+        self._ch_out = (C, C, C)
 
     def forward(self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor):
-        # top-down
-        u4 = F.interpolate(self.lat5(p5), scale_factor=2, mode="nearest")  # /16 -> /8 (c4)
-        n4 = self.fuse4(torch.cat([u4, p4], dim=1))                        # /8  (c4)
+        # Top-down
+        u4 = F.interpolate(self.lat5(p5), scale_factor=2, mode="nearest")   # /32 -> /16
+        f4 = self.fuse4(torch.cat([u4, self.lat4(p4)], dim=1))              # /16, C
+        u3 = F.interpolate(f4, scale_factor=2, mode="nearest")              # /16 -> /8
+        f3 = self.fuse3(torch.cat([u3, self.lat3(p3)], dim=1))              # /8,  C
 
-        u3 = F.interpolate(self.lat4(n4), scale_factor=2, mode="nearest")  # /8 -> /4 (c3)
-        n3 = self.fuse3(torch.cat([u3, p3], dim=1))                        # /4  (c3)
+        # Bottom-up
+        d4 = self.down4(torch.cat([F.max_pool2d(f3, 2), f4], dim=1))        # /16, C
+        d5 = self.down5(torch.cat([F.max_pool2d(d4, 2), self.lat5(p5)], dim=1))  # /32, C
 
-        # bottom-up
-        d4 = self.fuse4d(torch.cat([self.down4(n3), n4], dim=1))           # /8  (c4)
-        d5 = self.fuse5d(torch.cat([self.down5(d4), p5], dim=1))           # /16 (c5)
+        return f3, d4, d5
 
-        return n3, d4, d5
+    @property
+    def ch_out(self):
+        return self._ch_out
