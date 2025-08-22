@@ -38,14 +38,14 @@ class LazyPANFPN(nn.Module):
 
 # ---------------------- Top-down keypoint head ----------------------
 class KptTDHead(nn.Module):
-    """Predicts (u,v) in [0,1] from rotated crops (C,S,S)."""
     def __init__(self, in_ch: int = 256):
         super().__init__()
+        self.in_ch = int(in_ch)  # <- store explicitly
         b = 64
         self.net = nn.Sequential(
-            conv_bn_act(in_ch, b, 3, 1), nn.MaxPool2d(2),
-            conv_bn_act(b, b*2, 3, 1),   nn.MaxPool2d(2),
-            conv_bn_act(b*2, b*4, 3, 1), nn.AdaptiveAvgPool2d(1),
+            conv_bn_act(self.in_ch, b, 3, 1, 1), nn.MaxPool2d(2),
+            conv_bn_act(b, b*2, 3, 1, 1),       nn.MaxPool2d(2),
+            conv_bn_act(b*2, b*4, 3, 1, 1),     nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(b*4, 64), nn.SiLU(),
             nn.Linear(64, 2), nn.Sigmoid()
@@ -179,7 +179,11 @@ class YOLO11_OBBPOSE_TD(nn.Module):
                 cy = (ty + yv) * stride
                 w  = tw * stride
                 h  = th * stride
-                ang = torch.atan2(si, co)  # radians
+                # normalize (si, co) before atan2
+                vec_norm = torch.clamp((si * si + co * co).sqrt(), min=1e-6)
+                si_n = si / vec_norm
+                co_n = co / vec_norm
+                ang = torch.atan2(si_n, co_n)  # radians
 
                 if cls_logits is None or cls_logits.shape[0] == 0:
                     # single-class
@@ -235,10 +239,20 @@ class YOLO11_OBBPOSE_TD(nn.Module):
                 scores = scores.to(torch.float32).contiguous()
 
                 keep_idx = None
+                # Prefer MMCV once; if missing, try TorchVision
                 try:
                     from mmcv.ops import nms_rotated as mmcv_nms_rot
                 except Exception:
                     mmcv_nms_rot = None
+
+                tv_nms_rot = None
+                if mmcv_nms_rot is None:
+                    try:
+                        import torchvision
+                        tv_nms_rot = getattr(torchvision.ops, "nms_rotated", None)
+                    except Exception:
+                        tv_nms_rot = None
+
                 if mmcv_nms_rot is not None:
                     if agnostic:
                         _, keep_idx = mmcv_nms_rot(obb, scores, float(iou_thres))
@@ -248,27 +262,25 @@ class YOLO11_OBBPOSE_TD(nn.Module):
                             idx = (labels == c).nonzero(as_tuple=True)[0]
                             if idx.numel():
                                 _, k = mmcv_nms_rot(obb[idx], scores[idx], float(iou_thres))
+                                chunks.append(idx[k.to(idx.device)])  # ensure device match
+                        keep_idx = torch.cat(chunks, 0) if chunks else torch.arange(0, obb.shape[0], device=obb.device)
+                elif callable(tv_nms_rot):
+                    if agnostic:
+                        keep_idx = tv_nms_rot(obb, scores, float(iou_thres))
+                    else:
+                        chunks = []
+                        for c in labels.unique():
+                            idx = (labels == c).nonzero(as_tuple=True)[0]
+                            if idx.numel():
+                                k = tv_nms_rot(obb[idx], scores[idx], float(iou_thres))
+                                if k.device != idx.device:
+                                    k = k.to(idx.device)
                                 chunks.append(idx[k])
                         keep_idx = torch.cat(chunks, 0) if chunks else torch.arange(0, obb.shape[0], device=obb.device)
-                else:
-                    try:
-                        import torchvision
-                        tv_nms_rot = getattr(torchvision.ops, "nms_rotated", None)
-                    except Exception:
-                        tv_nms_rot = None
-                    if callable(tv_nms_rot):
-                        if agnostic:
-                            keep_idx = tv_nms_rot(obb, scores, float(iou_thres))
-                        else:
-                            chunks = []
-                            for c in labels.unique():
-                                idx = (labels == c).nonzero(as_tuple=True)[0]
-                                if idx.numel():
-                                    k = tv_nms_rot(obb[idx], scores[idx], float(iou_thres))
-                                    chunks.append(idx[k])
-                            keep_idx = torch.cat(chunks, 0) if chunks else torch.arange(0, obb.shape[0], device=obb.device)
 
                 if keep_idx is not None:
+                    if keep_idx.device != scores.device:
+                        keep_idx = keep_idx.to(scores.device)
                     keep_idx = keep_idx[scores[keep_idx].argsort(descending=True)]
                     if keep_idx.numel() > max_det:
                         keep_idx = keep_idx[:max_det]
@@ -279,6 +291,7 @@ class YOLO11_OBBPOSE_TD(nn.Module):
                         topk = torch.topk(scores, k=max_det, sorted=True)
                         keep_idx = topk.indices
                         boxes, obb, scores, labels = boxes[keep_idx], obb[keep_idx], scores[keep_idx], labels[keep_idx]
+
             else:
                 # no NMS requested; cap to max_det
                 if boxes.shape[0] > max_det:
@@ -351,8 +364,8 @@ class YOLO11_OBBPOSE_TD(nn.Module):
             crops, metas = self.roi(P3, per_img)  # expect (N,C,S,S), metas list
             if crops.numel() == 0:
                 continue
-            if (self.kpt_head is None) or (getattr(self.kpt_head.net[0][0], "in_channels", None) != P3.shape[1]):
-                self.kpt_head = KptTDHead(in_ch=P3.shape[1]).to(P3.device).float()
+            if (self.kpt_head is None) or (self.kpt_head.in_ch != int(P3.shape[1])):
+                self.kpt_head = KptTDHead(in_ch=int(P3.shape[1])).to(P3.device).float()
             uv = self.kpt_head(crops)  # (n,2) in [0,1]
             uv_list.append(uv)
             meta_all.extend(metas)

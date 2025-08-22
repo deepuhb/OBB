@@ -59,8 +59,8 @@ def _cfg_to_params(cfg: Any, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
     for k in ("max_det", "topk_kpt", "print_every"): d[k] = int(d[k])
     if d["score_thresh"] is not None: d["conf_thres"] = float(d["score_thresh"])
     del d["score_thresh"]
-    d["map_iou_st"] = float(d["map_iou_st"]);
-    d["map_iou_ed"] = float(d["map_iou_ed"]);
+    d["map_iou_st"] = float(d["map_iou_st"])
+    d["map_iou_ed"] = float(d["map_iou_ed"])
     d["map_iou_step"] = float(d["map_iou_step"])
     return d
 
@@ -121,7 +121,7 @@ class Evaluator:
         for batch in val_loader:
             if max_images is not None and img_seen >= max_images: break
             if not isinstance(batch, dict) or ("image" not in batch):
-                self.log.warning("[eval] Unexpected batch format; skipping.");
+                self.log.warning("[eval] Unexpected batch format; skipping.")
                 continue
 
             imgs = batch["image"].to(device, non_blocking=True).float()
@@ -183,14 +183,14 @@ class Evaluator:
                         feat_down = getattr(getattr(model_eval, "roi", None), "feat_down", 8)
                         for (uv, meta) in zip(uv_all, metas):
                             if not isinstance(meta, dict) or ("M" not in meta) or ("bix" not in meta): continue
-                            M = meta["M"];
+                            M = meta["M"]
                             bix = int(meta["bix"]) if isinstance(meta["bix"], int) else int(meta["bix"].item())
                             if not torch.is_tensor(M): M = torch.as_tensor(M, dtype=torch.float32, device=device)
                             M = M.to(device).float()
-                            x = uv[0] * 2.0 - 1.0;
+                            x = uv[0] * 2.0 - 1.0
                             y = uv[1] * 2.0 - 1.0
                             xy1 = torch.stack([x, y, torch.tensor(1.0, device=device)], dim=0)
-                            xy_feat = (M @ xy1);
+                            xy_feat = (M @ xy1)
                             xy_img = xy_feat * float(feat_down)
                             uv_img_by_b[bix] = torch.cat([uv_img_by_b[bix], xy_img[None, :]], dim=0)
                 except Exception as e:
@@ -201,9 +201,9 @@ class Evaluator:
 
             for b in range(B):
                 try:
-                    img_seen += 1;
+                    img_seen += 1
                     stats["images_eval"] += 1
-                    gt_boxes = gtb_list[b].to(device);
+                    gt_boxes = gtb_list[b].to(device)
                     gt_kpts = gtk_list[b].to(device)
                     gt_labels = None
                     if gtl_list[b] is not None:
@@ -216,7 +216,7 @@ class Evaluator:
                     if labels is not None:
                         labels = torch.as_tensor(labels, device=device, dtype=torch.long).view(-1)
 
-                    stats["pred_count"] += int(boxes.shape[0]);
+                    stats["pred_count"] += int(boxes.shape[0])
                     stats["gt_total"] += int(gt_boxes.shape[0])
 
                     iou_mat = self._iou_matrix(boxes, gt_boxes)
@@ -230,8 +230,8 @@ class Evaluator:
                         tp, fp = [], []
                         for i in order.tolist():
                             if gt_boxes.shape[0] == 0:
-                                tp.append(0);
-                                fp.append(1);
+                                tp.append(0)
+                                fp.append(1)
                                 continue
 
                             has_cls = (labels is not None) and (gt_labels is not None) and (int(gt_labels.numel()) > 0)
@@ -239,8 +239,8 @@ class Evaluator:
                                 li = labels[i].view(-1)[0]
                                 same_class = (gt_labels == li)
                                 if not bool(same_class.any().item()):
-                                    tp.append(0);
-                                    fp.append(1);
+                                    tp.append(0)
+                                    fp.append(1)
                                     continue
                                 cand_idx = same_class.nonzero(as_tuple=True)[0]
                                 if iou_mat.numel() and cand_idx.numel():
@@ -258,11 +258,11 @@ class Evaluator:
                                     j, iou_ij = 0, 0.0
 
                             if (iou_ij >= t) and (not bool(used[j].item())):
-                                tp.append(1);
-                                fp.append(0);
+                                tp.append(1)
+                                fp.append(0)
                                 used[j] = True
                             else:
-                                fp.append(1);
+                                fp.append(1)
                                 tp.append(0)
                         stats["tp_by_thr"][t].extend(tp)
                         stats["fp_by_thr"][t].extend(fp)
@@ -314,6 +314,11 @@ class Evaluator:
         return self._finalize_and_log(stats)
 
     def _iou_matrix(self, boxes: torch.Tensor, gts: torch.Tensor) -> torch.Tensor:
+
+        use_aabb = bool(int(os.getenv("EVAL_USE_AABB", "0")))
+        if use_aabb:
+            return self._iou_aabb_pair(boxes, gts).clamp_(0, 1).to(boxes.device)
+
         device = boxes.device if torch.is_tensor(boxes) else torch.device("cpu")
         N = int(boxes.shape[0])
         M = int(gts.shape[0])
@@ -324,7 +329,7 @@ class Evaluator:
             b = boxes.detach().clone()
             g = gts.detach().clone()
             # mmcv uses degrees
-            b[:, 4] = torch.rad2deg(b[:, 4]);
+            b[:, 4] = torch.rad2deg(b[:, 4])
             g[:, 4] = torch.rad2deg(g[:, 4])
             try:
                 iou = mmcv_box_iou_rotated(b, g, aligned=False).detach().float().clamp_(0, 1)
@@ -345,8 +350,8 @@ class Evaluator:
             dx, dy = w / 2.0, h / 2.0
             pts = np.array([[-dx, -dy], [dx, -dy], [dx, dy], [-dx, dy]], dtype=np.float32)
             R = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
-            rot = pts @ R.T;
-            rot[:, 0] += cx;
+            rot = pts @ R.T
+            rot[:, 0] += cx
             rot[:, 1] += cy
             try:
                 from shapely.geometry import Polygon
@@ -362,9 +367,9 @@ class Evaluator:
             from shapely.geometry import Polygon
         except Exception:
             return torch.zeros((a.shape[0], b.shape[0]), dtype=torch.float32)
-        an = a.detach().cpu().numpy();
+        an = a.detach().cpu().numpy()
         bn = b.detach().cpu().numpy()
-        ap = self._to_poly(an);
+        ap = self._to_poly(an)
         bp = self._to_poly(bn)
         out = np.zeros((an.shape[0], bn.shape[0]), dtype=np.float32)
         for i, pa in enumerate(ap):
@@ -383,20 +388,20 @@ class Evaluator:
             cx, cy, w, h = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
             return cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
 
-        a1, a2, a3, a4 = aabb(a);
+        a1, a2, a3, a4 = aabb(a)
         b1, b2, b3, b4 = aabb(b)
         A, B = a.shape[0], b.shape[0]
         out = torch.zeros((A, B), dtype=torch.float32)
         for i in range(A):
             for j in range(B):
-                xx1 = max(float(a1[i]), float(b1[j]));
+                xx1 = max(float(a1[i]), float(b1[j]))
                 yy1 = max(float(a2[i]), float(b2[j]))
-                xx2 = min(float(a3[i]), float(b3[j]));
+                xx2 = min(float(a3[i]), float(b3[j]))
                 yy2 = min(float(a4[i]), float(b4[j]))
-                iw = max(0.0, xx2 - xx1);
+                iw = max(0.0, xx2 - xx1)
                 ih = max(0.0, yy2 - yy1)
                 inter = iw * ih
-                ua = (float(a3[i] - a1[i]) * float(a4[i] - a2[i]));
+                ua = (float(a3[i] - a1[i]) * float(a4[i] - a2[i]))
                 ub = (float(b3[j] - b1[j]) * float(b4[j] - b2[j]))
                 union = ua + ub - inter
                 out[i, j] = float(inter / union) if union > 0 else 0.0
@@ -404,15 +409,15 @@ class Evaluator:
 
     def _ap_from_pr(self, tp: np.ndarray, fp: np.ndarray, sc: np.ndarray) -> float:
         if tp.size == 0: return 0.0
-        order = np.argsort(-sc);
-        tp = tp[order].astype(np.float32);
+        order = np.argsort(-sc)
+        tp = tp[order].astype(np.float32)
         fp = fp[order].astype(np.float32)
-        ctp = np.cumsum(tp);
+        ctp = np.cumsum(tp)
         cfp = np.cumsum(fp)
         denom = max(1.0, float(tp.sum()))
-        recall = ctp / denom;
+        recall = ctp / denom
         precision = ctp / np.maximum(ctp + cfp, 1e-9)
-        rec_points = np.linspace(0, 1, 101);
+        rec_points = np.linspace(0, 1, 101)
         prec_at_rec = np.zeros_like(rec_points)
         for i, r in enumerate(rec_points):
             inds = np.where(recall >= r)[0]
@@ -429,7 +434,7 @@ class Evaluator:
             aps.append(self._ap_from_pr(tp, fp, sc))
         mAP = float(np.mean(aps)) if aps else 0.0
         try:
-            i50 = list(self.iou_thrs).index(0.5);
+            i50 = list(self.iou_thrs).index(0.5)
             mAP50 = float(aps[i50]) if aps else 0.0
         except ValueError:
             mAP50 = 0.0
@@ -448,7 +453,7 @@ class Evaluator:
             pck = float(st["pck_ok"]) / float(st["pck_total"])
             pck_any = float(st["pck_any_ok"]) / float(st["pck_total"])
         else:
-            pck = 0.0;
+            pck = 0.0
             pck_any = 0.0
 
         metrics = {
@@ -472,7 +477,7 @@ class Evaluator:
 
 def _iou_matrix(self, boxes: torch.Tensor, gts: torch.Tensor) -> torch.Tensor:
     device = boxes.device if torch.is_tensor(boxes) else torch.device("cpu")
-    N = int(boxes.shape[0]);
+    N = int(boxes.shape[0])
     M = int(gts.shape[0])
     if N == 0 or M == 0:
         return torch.zeros((N, M), device=device)
@@ -481,7 +486,7 @@ def _iou_matrix(self, boxes: torch.Tensor, gts: torch.Tensor) -> torch.Tensor:
         b = boxes.detach().clone()
         g = gts.detach().clone()
         # mmcv uses degrees
-        b[:, 4] = torch.rad2deg(b[:, 4]);
+        b[:, 4] = torch.rad2deg(b[:, 4])
         g[:, 4] = torch.rad2deg(g[:, 4])
         try:
             iou = mmcv_box_iou_rotated(b, g, aligned=False).detach().float().clamp_(0, 1)
@@ -503,17 +508,17 @@ def _to_poly(self, obb_np: np.ndarray) -> List["Polygon"]:
         dx, dy = w / 2.0, h / 2.0
         pts = np.array([[-dx, -dy], [dx, -dy], [dx, dy], [-dx, dy]], dtype=np.float32)
         R = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
-        rot = pts @ R.T;
-        rot[:, 0] += cx;
+        rot = pts @ R.T
+        rot[:, 0] += cx
         rot[:, 1] += cy
         out.append(Polygon(rot))
     return out
 
 
 def _iou_shapely(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    an = a.detach().cpu().numpy();
+    an = a.detach().cpu().numpy()
     bn = b.detach().cpu().numpy()
-    ap = self._to_poly(an);
+    ap = self._to_poly(an)
     bp = self._to_poly(bn)
     out = np.zeros((an.shape[0], bn.shape[0]), dtype=np.float32)
     for i, pa in enumerate(ap):
@@ -531,20 +536,20 @@ def _iou_aabb_pair(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         cx, cy, w, h = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
         return cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
 
-    a1, a2, a3, a4 = aabb(a);
+    a1, a2, a3, a4 = aabb(a)
     b1, b2, b3, b4 = aabb(b)
-    A, B = a.shape[0], b.shape[0];
+    A, B = a.shape[0], b.shape[0]
     out = torch.zeros((A, B))
     for i in range(A):
         for j in range(B):
-            xx1 = max(float(a1[i]), float(b1[j]));
+            xx1 = max(float(a1[i]), float(b1[j]))
             yy1 = max(float(a2[i]), float(b2[j]))
-            xx2 = min(float(a3[i]), float(b3[j]));
+            xx2 = min(float(a3[i]), float(b3[j]))
             yy2 = min(float(a4[i]), float(b4[j]))
-            iw = max(0.0, xx2 - xx1);
+            iw = max(0.0, xx2 - xx1)
             ih = max(0.0, yy2 - yy1)
             inter = iw * ih
-            ua = (float(a3[i] - a1[i]) * float(a4[i] - a2[i]));
+            ua = (float(a3[i] - a1[i]) * float(a4[i] - a2[i]))
             ub = (float(b3[j] - b1[j]) * float(b4[j] - b2[j]))
             union = ua + ub - inter
             out[i, j] = float(inter / union) if union > 0 else 0.0
@@ -553,15 +558,15 @@ def _iou_aabb_pair(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def _ap_from_pr(self, tp: np.ndarray, fp: np.ndarray, sc: np.ndarray) -> float:
     if tp.size == 0: return 0.0
-    order = np.argsort(-sc);
-    tp = tp[order].astype(np.float32);
+    order = np.argsort(-sc)
+    tp = tp[order].astype(np.float32)
     fp = fp[order].astype(np.float32)
-    ctp = np.cumsum(tp);
+    ctp = np.cumsum(tp)
     cfp = np.cumsum(fp)
     denom = max(1.0, float(tp.sum()))
-    recall = ctp / denom;
+    recall = ctp / denom
     precision = ctp / np.maximum(ctp + cfp, 1e-9)
-    rec_points = np.linspace(0, 1, 101);
+    rec_points = np.linspace(0, 1, 101)
     prec_at_rec = np.zeros_like(rec_points)
     for i, r in enumerate(rec_points):
         inds = np.where(recall >= r)[0]
@@ -579,7 +584,7 @@ def _finalize_and_log(self, st: Dict[str, Any]) -> Dict[str, Any]:
         aps.append(self._ap_from_pr(tp, fp, sc))
     mAP = float(np.mean(aps)) if aps else 0.0
     try:
-        i50 = list(self.iou_thrs).index(0.5);
+        i50 = list(self.iou_thrs).index(0.5)
         mAP50 = float(aps[i50]) if aps else 0.0
     except ValueError:
         mAP50 = 0.0
@@ -598,7 +603,7 @@ def _finalize_and_log(self, st: Dict[str, Any]) -> Dict[str, Any]:
         pck = float(st["pck_ok"]) / float(st["pck_total"])
         pck_any = float(st["pck_any_ok"]) / float(st["pck_total"])
     else:
-        pck = 0.0;
+        pck = 0.0
         pck_any = 0.0
 
     metrics = {

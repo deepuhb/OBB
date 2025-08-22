@@ -23,9 +23,9 @@ class PANFPN(nn.Module):
         C = int(out_ch) if out_ch is not None else int(c4)  # unify to /16 width by default
 
         # lateral projections to unified width C
-        self.lat3 = conv_bn_act(c3, C, k=1, s=1)
-        self.lat4 = conv_bn_act(c4, C, k=1, s=1)
-        self.lat5 = conv_bn_act(c5, C, k=1, s=1)
+        self.lat3 = conv_bn_act(c3, C, k=1, s=1, p=0)
+        self.lat4 = conv_bn_act(c4, C, k=1, s=1, p=0)
+        self.lat5 = conv_bn_act(c5, C, k=1, s=1, p=0)
 
         # top-down fusions (concat -> 2C, then reduce to C)
         self.fuse4 = conv_bn_act(C * 2, C, k=3, s=1)

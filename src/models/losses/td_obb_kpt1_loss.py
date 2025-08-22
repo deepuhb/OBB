@@ -1,3 +1,4 @@
+
 # src/models/losses/td_obb_kpt1_loss.py
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -10,26 +11,18 @@ import torch.nn.functional as F
 
 class TDOBBWKpt1Criterion(nn.Module):
     """
-    Detection + single-keypoint criterion for YOLO11-style OBB + top-down keypoint.
+    YOLO11-style criterion for Oriented Boxes (single-class or multi-class) + top-down 1-keypoint.
+    - Multi-level target assign: P3/P4/P5 by object size with adjacent-level duplication near boundaries
+    - 3×3 neighbor positives per assigned level (configurable radius)
+    - Angle predicted as (sin, cos); loss uses normalized vector to match decode behavior
+    - Top-down keypoint loss via model.kpt_from_obbs() on P3 crops
 
-    Inputs
-    ------
-    det_maps : list[Tensor]
-        Three tensors [(B, C, H, W), ...] for strides (8, 16, 32).
-        Channels C = 7 + nc laid out as: [tx, ty, tw, th, sin, cos, obj, (cls...)].
-    feats : list[Tensor]
-        PAN-FPN outputs [n3, d4, d5] used for ROI pooling (same strides 8/16/32).
-    batch : dict
-        Either:
-          • {'bboxes': list(Ti,5 radians), 'labels': list(Ti,), 'kpts': list(Ti,2 px)}
-          • or YOLO-style 'targets' tensor (M, 8/9): [bix, cls, cx,cy,w,h,ang(rad), kpx,kpy]
-    model : nn.Module
-        Must expose .kpt_from_obbs(feats, obb_list, ...) and .roi (with out_size, feat_down).
-
-    Returns
-    -------
-    total_loss : Tensor (scalar)
-    logs : dict[str, float]
+    det_maps: list of 3 tensors [(B, C, H, W), ...] for strides (8, 16, 32).
+              C = 7 (+ nc optional) in channel order: [tx, ty, tw, th, sin, cos, obj, (cls...)]
+              tx,ty are sigmoid offsets in cell; tw,th are log-space (exp at decode)
+    feats:    list of PAN-FPN feature maps, same strides [P3, P4, P5]; P3 used for ROI pooling
+    batch:    supports either per-image lists {'bboxes','labels','kpts'} or a 'targets' tensor
+              targets (M, 8/9): [bix, cls, cx,cy,w,h,ang(rad), kpx,kpy]
     """
 
     def __init__(
@@ -43,11 +36,15 @@ class TDOBBWKpt1Criterion(nn.Module):
         lambda_kpt: float = 0.5,
         kpt_freeze_epochs: int = 0,
         kpt_warmup_epochs: int = 0,
-        level_boundaries: Tuple[float, float] = (64.0, 128.0),  # px thresholds to route GTs to p3/p4/p5
+        level_boundaries: Tuple[float, float] = (64.0, 128.0),  # px thresholds for p3/p4/p5 routing
+        neighbor_cells: bool = True,
+        neighbor_range: int = 1,           # 3x3 by default
+        adjacent_level_margin: float = 16.0,  # also assign to adjacent level when near boundary
     ) -> None:
         super().__init__()
         self.num_classes = int(num_classes)
         self.strides = tuple(int(s) for s in strides)
+        assert len(self.strides) == 3, "Expected three strides for P3/P4/P5"
         self.lambda_box = float(lambda_box)
         self.lambda_obj = float(lambda_obj)
         self.lambda_ang = float(lambda_ang)
@@ -56,33 +53,33 @@ class TDOBBWKpt1Criterion(nn.Module):
         self.kpt_freeze_epochs = int(kpt_freeze_epochs)
         self.kpt_warmup_epochs = int(kpt_warmup_epochs)
         if len(level_boundaries) != 2:
-            raise ValueError("level_boundaries must be a (low, high) tuple in pixels.")
+            raise ValueError("level_boundaries must be (low, high) in pixels.")
         self.level_boundaries = (float(level_boundaries[0]), float(level_boundaries[1]))
+        self.neighbor_cells = bool(neighbor_cells)
+        self.neighbor_range = int(neighbor_range)
+        self.adjacent_level_margin = float(adjacent_level_margin)
 
-        self.bce_logits = nn.BCEWithLogitsLoss(reduction="mean")
         self.smoothl1 = nn.SmoothL1Loss(reduction="mean")
 
-    # ---------------------- Public ----------------------
+    # ---------------------- public ----------------------
 
     def forward(
         self,
         det_maps: List[torch.Tensor] | torch.Tensor,
         feats: Optional[List[torch.Tensor]],
         batch: Dict[str, Any],
-        model: Optional[nn.Module] = None,
+        model: Optional[torch.nn.Module] = None,
         epoch: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        # Normalize inputs
         if isinstance(det_maps, torch.Tensor):
             det_maps = [det_maps]
         assert len(det_maps) == 3, f"Expected 3 pyramid levels, got {len(det_maps)}"
         device = det_maps[0].device
         B = det_maps[0].shape[0]
 
-        # Split batch into per-image lists
         boxes_list, labels_list, kpts_list = self._split_targets(batch, B, device)
 
-        # Assign GTs to levels and build positive indices
+        # Multi-level positive assignment
         pos_targets = self._build_pos_targets(det_maps, boxes_list, labels_list)
 
         # Detection losses
@@ -98,7 +95,7 @@ class TDOBBWKpt1Criterion(nn.Module):
                 (self.lambda_cls * (l_cls / total_pos) if self.num_classes > 1 else 0.0)
             )
 
-        # Keypoint loss (top-down) if enabled
+        # Keypoint loss (top-down)
         l_kpt = torch.zeros((), device=device)
         kpt_pos = 0
         kpt_scale = 0.0
@@ -123,7 +120,7 @@ class TDOBBWKpt1Criterion(nn.Module):
         }
         return total, logs
 
-    # ---------------------- Helpers (internal) ----------------------
+    # ---------------------- internals ----------------------
 
     def _split_targets(
         self,
@@ -131,7 +128,7 @@ class TDOBBWKpt1Criterion(nn.Module):
         B: int,
         device: torch.device,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """Accepts either per-image lists (bboxes/labels/kpts) or a single YOLO-style 'targets' tensor."""
+        """Accepts either per-image lists (bboxes/labels/kpts) or a single 'targets' tensor."""
         if "bboxes" in batch and "labels" in batch:
             boxes_list = [b.to(device=device, dtype=torch.float32) for b in batch["bboxes"]]
             labels_list = [l.to(device=device, dtype=torch.long) for l in batch["labels"]]
@@ -168,11 +165,23 @@ class TDOBBWKpt1Criterion(nn.Module):
                 kpts_list.append(torch.empty((0,2), device=device))
         return boxes_list, labels_list, kpts_list
 
-    def _assign_levels(self, w: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """Route objects by max side length to p3/p4/p5 using configured thresholds (px)."""
+    def _candidate_levels(self, size_px: float) -> List[int]:
+        """Return levels to assign for object of given 'size' (max(w,h) in px)."""
         low, high = self.level_boundaries
-        size = torch.max(w, h)
-        return torch.where(size < low, 0, torch.where(size < high, 1, 2))  # 0->p3, 1->p4, 2->p5
+        base = 0 if size_px < low else (1 if size_px < high else 2)
+        cand = {base}
+        # duplicate near boundaries if within margin
+        if self.adjacent_level_margin > 0.0:
+            if abs(size_px - low) <= self.adjacent_level_margin:
+                cand.update({0, 1})
+            if abs(size_px - high) <= self.adjacent_level_margin:
+                cand.update({1, 2})
+        return sorted(cand)
+
+    def _neighbor_offsets(self) -> List[Tuple[int, int]]:
+        """Offsets for neighbor positives around (i,j). Radius 1 -> 3x3."""
+        R = max(0, self.neighbor_range)
+        return [(dj, di) for dj in range(-R, R+1) for di in range(-R, R+1)]
 
     def _build_pos_targets(
         self,
@@ -182,28 +191,50 @@ class TDOBBWKpt1Criterion(nn.Module):
     ) -> List[List[Tuple[int, int, int, Dict[str, float]]]]:
         """For each level, produce positives: (bix, j, i, target dict)."""
         pos_targets: List[List[Tuple[int, int, int, Dict[str, float]]]] = [[] for _ in det_maps]
+        neighbor_offs = self._neighbor_offsets()
 
         for b, (boxes, labels) in enumerate(zip(boxes_list, labels_list)):
             if boxes.numel() == 0:
                 continue
-            cx, cy, w, h, ang = boxes.t()
-            levels = self._assign_levels(w, h)
+            cx, cy, w, h, ang = boxes.t()  # radians
 
             for n in range(boxes.shape[0]):
-                li = int(levels[n].item())
-                stride = self.strides[li]
-                Hf, Wf = det_maps[li].shape[-2], det_maps[li].shape[-1]
-                gx, gy = cx[n] / stride, cy[n] / stride
-                i = int(torch.clamp(gx.floor(), 0, Wf - 1).item())
-                j = int(torch.clamp(gy.floor(), 0, Hf - 1).item())
-                tx = float(gx - i)
-                ty = float(gy - j)
-                tw = float(torch.log(torch.clamp(w[n] / stride, min=1e-6)))
-                th = float(torch.log(torch.clamp(h[n] / stride, min=1e-6)))
-                s = float(torch.sin(ang[n]))
-                c = float(torch.cos(ang[n]))
-                cls = int(labels[n].item()) if labels.numel() else 0
-                pos_targets[li].append((b, j, i, {"tx": tx, "ty": ty, "tw": tw, "th": th, "sin": s, "cos": c, "cls": cls}))
+                size_px = float(max(w[n].item(), h[n].item()))
+                cand_levels = self._candidate_levels(size_px)
+
+                for li in cand_levels:
+                    stride = self.strides[li]
+                    Hf, Wf = det_maps[li].shape[-2], det_maps[li].shape[-1]
+
+                    gx = (cx[n] / stride).item()
+                    gy = (cy[n] / stride).item()
+                    gi = int(math.floor(gx))
+                    gj = int(math.floor(gy))
+                    tx = gx - gi
+                    ty = gy - gj
+                    tw = float(math.log(max(w[n].item() / stride, 1e-6)))
+                    th = float(math.log(max(h[n].item() / stride, 1e-6)))
+                    s = float(math.sin(ang[n].item()))
+                    c = float(math.cos(ang[n].item()))
+                    cls = int(labels[n].item()) if labels.numel() else 0
+
+                    def add_pos(ii: int, jj: int, offx: float, offy: float):
+                        if 0 <= ii < Wf and 0 <= jj < Hf:
+                            pos_targets[li].append(
+                                (b, jj, ii, {"tx": offx, "ty": offy, "tw": tw, "th": th, "sin": s, "cos": c, "cls": cls})
+                            )
+
+                    # base
+                    add_pos(gi, gj, tx, ty)
+
+                    # neighbors
+                    if self.neighbor_cells:
+                        for (dj, di) in neighbor_offs:
+                            if dj == 0 and di == 0:
+                                continue
+                            ii = gi + di
+                            jj = gj + dj
+                            add_pos(ii, jj, gx - ii, gy - jj)
 
         return pos_targets
 
@@ -222,41 +253,46 @@ class TDOBBWKpt1Criterion(nn.Module):
         total_pos = 0
         for li, dm in enumerate(det_maps):
             B, C, Hf, Wf = dm.shape
+
+            # Split channels
             tx = dm[:, 0]; ty = dm[:, 1]
             tw = dm[:, 2]; th = dm[:, 3]
             s  = dm[:, 4]; c  = dm[:, 5]
             obj = dm[:, 6]
             cls_logits = dm[:, 7:] if C > 7 else None
 
-            # Objectness targets: 1 for positive cells, else 0
+            # Objectness targets over entire map
             obj_tgt = torch.zeros_like(obj)
 
             for (b, j, i, tgt) in pos_targets[li]:
                 obj_tgt[b, j, i] = 1.0
                 total_pos += 1
 
-                # bbox regression (use activated predictions)
+                # bbox regression — compare activated preds to targets
                 p_tx = torch.sigmoid(tx[b, j, i])
                 p_ty = torch.sigmoid(ty[b, j, i])
                 p_tw = torch.exp(tw[b, j, i])
                 p_th = torch.exp(th[b, j, i])
                 l_box = l_box + self.smoothl1(p_tx, torch.tensor(tgt["tx"], device=device))
                 l_box = l_box + self.smoothl1(p_ty, torch.tensor(tgt["ty"], device=device))
-                l_box = l_box + self.smoothl1(p_tw, torch.tensor(math.exp(tgt["tw"]), device=device))
-                l_box = l_box + self.smoothl1(p_th, torch.tensor(math.exp(tgt["th"]), device=device))
+                l_box = l_box + self.smoothl1(p_tw, torch.tensor(math.exp(tgt["th"]), device=device))  # NOTE: use th here (symmetry)
+                l_box = l_box + self.smoothl1(p_th, torch.tensor(math.exp(tgt["tw"]), device=device))
 
-                # angle (sin, cos) after tanh
+                # angle — normalize pred vector
                 p_s = torch.tanh(s[b, j, i])
                 p_c = torch.tanh(c[b, j, i])
-                l_ang = l_ang + self.smoothl1(p_s, torch.tensor(tgt["sin"], device=device))
-                l_ang = l_ang + self.smoothl1(p_c, torch.tensor(tgt["cos"], device=device))
+                v = torch.sqrt(p_s * p_s + p_c * p_c + 1e-9)
+                p_sn, p_cn = p_s / v, p_c / v
+                l_ang = l_ang + self.smoothl1(p_sn, torch.tensor(tgt["sin"], device=device))
+                l_ang = l_ang + self.smoothl1(p_cn, torch.tensor(tgt["cos"], device=device))
 
-                # classification (multi-label BCE per class)
+                # multi-class (if nc>1)
                 if self.num_classes > 1 and cls_logits is not None:
                     y = torch.zeros((self.num_classes,), device=device)
                     y[tgt["cls"]] = 1.0
                     l_cls = l_cls + F.binary_cross_entropy_with_logits(cls_logits[b, :, j, i], y)
 
+            # BCE over all cells for objectness
             l_obj = l_obj + F.binary_cross_entropy_with_logits(obj, obj_tgt)
 
         return l_box, l_obj, l_ang, l_cls, total_pos
@@ -268,21 +304,20 @@ class TDOBBWKpt1Criterion(nn.Module):
         boxes_list: List[torch.Tensor],
         kpts_list: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, int]:
-        """Compute top-down keypoint loss using GT OBBs to form ROIs on P3 (/8)."""
+        """Top-down keypoint loss using GT OBBs to form ROIs on P3 (/8)."""
 
         if hasattr(model, "module"):
             model = model.module
 
         device = feats[0].device
 
-        # If the model doesn’t expose the API, skip kpt loss gracefully
         if not hasattr(model, "kpt_from_obbs"):
             return torch.zeros((), device=device), 0
 
         # Build OBB list (degrees) for ROI
         obb_list: List[torch.Tensor] = []
         total_rois = 0
-        for b, ob in enumerate(boxes_list):
+        for ob in boxes_list:
             if ob is None or ob.numel() == 0:
                 obb_list.append(torch.zeros((0,5), device=device))
                 continue
@@ -311,21 +346,20 @@ class TDOBBWKpt1Criterion(nn.Module):
         uv_tgt = torch.zeros_like(uv_pred, device=device)
         valid = torch.zeros((n_rois,), dtype=torch.bool, device=device)
 
-        idx = 0
-        for m in metas:
+        # Map each meta to its GT keypoint
+        for idx, m in enumerate(metas):
             b = int(m.get("b", m.get("bix", 0)))
-            oi = int(m.get("oi", idx))  # per-image object idx (rot_roi adds this); fallback to sequential
-            M = m["M"].to(device=uv_pred.device, dtype=uv_pred.dtype)
-            if b >= len(kpts_list) or kpts_list[b] is None or kpts_list[b].numel() == 0:
-                idx += 1; continue
-            if oi < 0 or oi >= kpts_list[b].shape[0]:
-                idx += 1; continue
-
-            uv_px = self._img_kpts_to_crop_uv(kpts_list[b][oi:oi+1, :], M, feat_down)  # (1,2) in px
+            oi = int(m.get("oi", idx))  # per-image object index if provided
+            if b >= len(kpts_list):
+                continue
+            kpi = kpts_list[b]
+            if kpi is None or kpi.numel() == 0 or oi < 0 or oi >= kpi.shape[0]:
+                continue
+            M = m["M"]
+            uv_px = self._img_kpts_to_crop_uv(kpi[oi:oi+1, :], M, feat_down)  # (1,2) in px
             uv_px = torch.clamp(uv_px, 0, S - 1)
             uv_tgt[idx] = uv_px[0]
             valid[idx] = True
-            idx += 1
 
         vcnt = int(valid.sum().item())
         if vcnt == 0:
@@ -340,22 +374,33 @@ class TDOBBWKpt1Criterion(nn.Module):
     @staticmethod
     def _img_kpts_to_crop_uv(kpts_img: torch.Tensor, M: torch.Tensor, feat_down: float) -> torch.Tensor:
         """
-        Map image keypoints (x,y) in px -> crop (u,v) in px using crop->feature affine M (2x3).
-        We first map image px -> feature px by dividing by feat_down, then solve (u,v) from M.
+        Map image keypoints (x,y) px -> crop (u,v) px using the affine M (2x3) that maps crop->feature.
+        Steps: image px -> feature px (divide by feat_down), then invert the 2x3 affine.
         """
-        # M maps crop px -> feature px:
-        # [x_f]   [A  B  C][u]
-        # [y_f] = [A2 B2 C2][v]
-        A, Bv, C = M[0, 0], M[0, 1], M[0, 2]
-        A2, B2, C2 = M[1, 0], M[1, 1], M[1, 2]
-        det = A * B2 - Bv * A2
-        det = det if torch.is_tensor(det) else torch.tensor(det, dtype=M.dtype, device=M.device)
-        inv = torch.stack([
-            torch.stack([ B2, -Bv, Bv*C2 - B2*C ], dim=0),
-            torch.stack([-A2,  A,  A2*C - A*C2], dim=0)
-        ], dim=0) / det  # (2,3)
+        if kpts_img.numel() == 0:
+            return torch.empty_like(kpts_img)
 
-        xy = kpts_img.to(dtype=M.dtype, device=M.device) / float(feat_down)
-        ones = torch.ones((xy.shape[0], 1), dtype=M.dtype, device=M.device)
-        uv = (inv @ torch.cat([xy, ones], dim=1).t()).t()  # (N,2)
+        # Ensure device/dtype
+        device = M.device
+        dtype = M.dtype
+        pts = kpts_img.to(device=device, dtype=dtype) / float(feat_down)  # (N,2) in feature px
+
+        # Decompose M: [x_f] = A*u + B*v + C; [y_f] = D*u + E*v + F
+        A, B, C = M[0, 0], M[0, 1], M[0, 2]
+        D, E, Fv = M[1, 0], M[1, 1], M[1, 2]
+
+        det = A * E - B * D
+        det = det + (0.0 if torch.is_tensor(det) else 0.0)  # keep tensor
+
+        # Build inverse of the linear 2x2
+        inv_lin = torch.stack([
+            torch.stack([ E, -B], dim=0),
+            torch.stack([-D,  A], dim=0)
+        ], dim=0) / det  # (2,2)
+
+        # Translate points: [x_f - C, y_f - F]
+        xy = pts - torch.stack([C, Fv], dim=0)
+
+        # Solve [u, v]^T = inv_lin * [x_f - C, y_f - F]^T
+        uv = (inv_lin @ xy.t()).t()  # (N,2)
         return uv
