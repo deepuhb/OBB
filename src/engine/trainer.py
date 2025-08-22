@@ -163,6 +163,10 @@ class Trainer:
                 pass
         torch.save(tosave, path)
 
+    @staticmethod
+    def _unwrap_ddp(m):
+        return m.module if hasattr(m, "module") else m
+
     def _call_criterion(self, criterion, outputs, batch, device, epoch: int):
         """
         Adapt to different loss signatures.
@@ -185,6 +189,8 @@ class Trainer:
             sig = inspect.signature(criterion.forward)
         except Exception:
             pass
+
+        core_model = self._unwrap_ddp(self.model)
 
         if sig is not None:
             params = [p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
@@ -211,6 +217,8 @@ class Trainer:
                     values[name] = epoch
                 elif low == "device":
                     values[name] = device
+                elif low == "model":
+                    values[name] = core_model
 
             # Try keyword call first
             try:
@@ -222,7 +230,7 @@ class Trainer:
         # 1) Modern loss signature: (det_maps, feats, batch, model=None, epoch=0)
         if det_maps is not None and feats is not None:
             try:
-                return criterion(det_maps, feats, batch, model=self.model, epoch=epoch)
+                return criterion(det_maps, feats, batch, model=core_model, epoch=epoch)
             except TypeError:
                 try:
                     return criterion(det_maps, feats, batch)
@@ -259,6 +267,7 @@ class Trainer:
 
         epochs = int(self.tc.epochs)
         accum_steps = max(1, int(self.tc.accum_steps))
+        core_model = self._unwrap_ddp(model)
 
         self._log(f"[EVAL cfg] interval={self.tc.eval_interval}  warmup_noeval={self.tc.warmup_noeval}  select='{self.ec.select}' mode='{self.ec.mode}'")
 
@@ -367,7 +376,7 @@ class Trainer:
                 with torch.no_grad():
                     with autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
                         try:
-                            metrics = evaluator.evaluate(model, val_loader, device=device)
+                            metrics = evaluator.evaluate(core_model, val_loader, device=device)
                             if not isinstance(metrics, dict):
                                 metrics = {"metric": float(metrics)}
                         except Exception as e:

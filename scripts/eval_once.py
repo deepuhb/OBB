@@ -13,24 +13,29 @@ from types import SimpleNamespace
 
 BASE_STEM_OUT = 64.0  # reference out-ch of stem for width=1.0
 
-def _safe_torch_load(path):
+def _safe_torch_load(path, trust=False, quiet=False):
     # Robust loader for PyTorch 2.6+ 'weights_only' default and older checkpoints.
+    if trust:
+        # Direct unsafe load (no warnings). Use only for checkpoints you trust.
+        return torch.load(path, map_location='cpu', weights_only=False)
     try:
-        return torch.load(path, map_location='cpu')
-    except Exception as e1:
-        print('[EVAL-ONCE] torch.load(weights_only=True) failed: {}: {}'.format(type(e1).__name__, e1), flush=True)
+        # Best effort: allowlist common NumPy globals used in older checkpoints
+        import numpy as np
         try:
-            import numpy as np
-            try:
-                from torch.serialization import add_safe_globals  # PyTorch 2.6+
-                add_safe_globals([np.core.multiarray.scalar, np.dtype])
-            except Exception:
-                pass
-            return torch.load(path, map_location='cpu')
-        except Exception as e2:
-            print('[EVAL-ONCE] retry with safe globals failed: {}: {}'.format(type(e2).__name__, e2), flush=True)
-            print('[EVAL-ONCE] WARNING: falling back to weights_only=False. Only do this if you trust the checkpoint.', flush=True)
-            return torch.load(path, map_location='cpu', weights_only=False)
+            from torch.serialization import add_safe_globals
+            allow = [np.core.multiarray.scalar, np.dtype]
+            # Some environments need these too; ignore if not present
+            for maybe in [getattr(getattr(np, 'dtypes', None), 'Float64DType', None)]:
+                if maybe is not None:
+                    allow.append(maybe)
+            add_safe_globals(allow)
+        except Exception:
+            pass
+        return torch.load(path, map_location='cpu')  # weights_only=True default in PyTorch 2.6+
+    except Exception:
+        if not quiet:
+            print('[EVAL-ONCE] falling back to weights_only=False for ckpt (set --trust_ckpt to hide this).', flush=True)
+        return torch.load(path, map_location='cpu', weights_only=False)
 
 def _guess_width_from_ckpt_state(state_dict):
     cand = ['backbone.stem.0.weight', 'backbone.stem.conv.weight', 'backbone.stem.conv.0.weight']
@@ -73,31 +78,39 @@ def _shape(x):
     if x is None: return None
     return tuple(x.shape) if torch.is_tensor(x) else type(x).__name__
 
-def _invert_affine_2x3(M):
-    # Invert a 2x3 affine to 2x3 of the inverse mapping.
-    A = np.eye(3, dtype=np.float32)
-    A[:2, :3] = np.asarray(M, dtype=np.float32)[:2, :3]
-    Ai = np.linalg.inv(A)
-    return Ai[:2, :3]
-
-def _uv_to_image_points(uv, metas, crop_size):
-    # Map normalized (u,v) in [0,1] to image coordinates using inverse affine from metas.
+def _uv_to_image_points(uv, metas, feat_down=8):
+    # Map normalized uv in [0,1] -> normalized [-1,1] and apply affine from metas (torch/numpy ok).
     out = []
-    if uv is None or uv.numel() == 0 or len(metas) == 0:
+    if uv is None or (hasattr(uv, "numel") and uv.numel() == 0) or not metas:
         return out
-    uv_np = uv.detach().cpu().numpy()
+    # ensure tensor on CPU for safe scalar access
+    uv_cpu = uv.detach().cpu() if torch.is_tensor(uv) else torch.tensor(uv, dtype=torch.float32)
     for i, meta in enumerate(metas):
         M = meta.get('M', None)
         bix = int(meta.get('bix', 0))
         if M is None:
             continue
-        # uv->crop pixels
-        u, v = float(uv_np[i, 0]) * crop_size, float(uv_np[i, 1]) * crop_size
-        Mi = _invert_affine_2x3(M)
-        x = Mi[0,0]*u + Mi[0,1]*v + Mi[0,2]
-        y = Mi[1,0]*u + Mi[1,1]*v + Mi[1,2]
+        # make M a 2x3 torch tensor on CPU
+        if not torch.is_tensor(M):
+            M_t = torch.as_tensor(M, dtype=torch.float32)
+        else:
+            M_t = M.detach().float().cpu()
+        if M_t.ndim == 3 and M_t.shape[0] == 2:
+            # already 2x3? handle accidental extra dim
+            M_t = M_t
+        elif M_t.ndim != 2 or M_t.shape[:2] != (2,3):
+            # try to coerce last dims
+            M_t = M_t.view(2,3)
+        # uv -> [-1,1]
+        u = uv_cpu[i, 0] * 2.0 - 1.0
+        v = uv_cpu[i, 1] * 2.0 - 1.0
+        xy1 = torch.stack([u, v, torch.tensor(1.0)], dim=0)  # (3,)
+        xy_feat = M_t @ xy1  # (2,)
+        x = float(xy_feat[0] * float(feat_down))
+        y = float(xy_feat[1] * float(feat_down))
         out.append((bix, x, y))
     return out
+
 
 def main():
     ap = argparse.ArgumentParser('Eval once')
@@ -114,6 +127,8 @@ def main():
     ap.add_argument('--limit', type=int, default=8, help='max images to evaluate')
     ap.add_argument('--kpt_crop', type=int, default=64)
     ap.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    ap.add_argument('--trust_ckpt', action='store_true', help='Skip safe-globals dance; load with weights_only=False silently')
+    ap.add_argument('--quiet_ckpt', action='store_true', help='Suppress checkpoint load fallbacks/warnings')
     args = ap.parse_args()
 
     os.environ.setdefault('EVAL_DEBUG', '1')
@@ -150,7 +165,7 @@ def main():
     ckpt_state = None
     if args.ckpt and width is None:
         print("[EVAL-ONCE] probing checkpoint '{}' for width...".format(args.ckpt), flush=True)
-        tmp = _safe_torch_load(args.ckpt)
+        tmp = _safe_torch_load(args.ckpt, trust=args.trust_ckpt, quiet=args.quiet_ckpt)
         ckpt_state = tmp.get('model', tmp)
         w_guess = _guess_width_from_ckpt_state(ckpt_state)
         if w_guess is not None:
@@ -163,7 +178,7 @@ def main():
     if args.ckpt:
         print("[EVAL-ONCE] loading checkpoint '{}'...".format(args.ckpt), flush=True)
         if ckpt_state is None:
-            ckpt_state = _safe_torch_load(args.ckpt).get('model', _safe_torch_load(args.ckpt))
+            ckpt_state = _safe_torch_load(args.ckpt, trust=args.trust_ckpt, quiet=args.quiet_ckpt).get('model', _safe_torch_load(args.ckpt, trust=args.trust_ckpt, quiet=args.quiet_ckpt))
         _load_ckpt_safely(model, ckpt_state)
 
     from src.engine.evaluator import Evaluator
@@ -199,7 +214,8 @@ def main():
             obb_list = [p.get('obb', p.get('boxes')) for p in preds_list]
             score_list = [p.get('scores') for p in preds_list]
             uv_all, metas = model.kpt_from_obbs(feats, obb_list, scores_list=score_list, topk=128, chunk=128, score_thresh=args.conf_thres)
-            kpts_img = _uv_to_image_points(uv_all, metas, args.kpt_crop)  # list of (bix, x, y)
+            feat_down = getattr(getattr(model, 'roi', None), 'feat_down', 8)
+            kpts_img = _uv_to_image_points(uv_all, metas, feat_down)  # list of (bix, x, y)
             kpts_pred = kpts_img
 
     print('[EVAL-ONCE] DETS :', [tuple(d.shape) for d in det_maps], flush=True)

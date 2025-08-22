@@ -269,7 +269,15 @@ class TDOBBWKpt1Criterion(nn.Module):
         kpts_list: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, int]:
         """Compute top-down keypoint loss using GT OBBs to form ROIs on P3 (/8)."""
+
+        if hasattr(model, "module"):
+            model = model.module
+
         device = feats[0].device
+
+        # If the model doesn’t expose the API, skip kpt loss gracefully
+        if not hasattr(model, "kpt_from_obbs"):
+            return torch.zeros((), device=device), 0
 
         # Build OBB list (degrees) for ROI
         obb_list: List[torch.Tensor] = []
