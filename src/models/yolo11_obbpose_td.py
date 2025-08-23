@@ -242,6 +242,11 @@ class YOLO11_OBBPOSE_TD(nn.Module):
 
                 # ROI crops on the single-image feature map
                 crops, metas = self.roi(P3[bix:bix + 1], rois_slice)  # (M,C,S,S), list[dict]
+                # keep params dtype as source of truth
+                head_dtype = next(self.kpt_head.parameters()).dtype
+                if crops.dtype != head_dtype:
+                    crops = crops.to(head_dtype)
+
                 uv = self.kpt_head(crops)  # (M,2) in [0,1]
 
                 for m in metas:
