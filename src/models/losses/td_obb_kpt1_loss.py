@@ -349,98 +349,126 @@ class TDOBBWKpt1Criterion(nn.Module):
         """
         Top-down 1-keypoint loss on P3 crops.
 
-        Assumptions:
+        Requirements from model side:
           - model.kpt_from_obbs(feats, boxes_list, scores_list=None) -> (uv_pred, metas)
-          - metas carry per-ROI affine 'M' (2x3, crop->feat) and model.roi.feat_down
-          - kpts_list[i] aligns with boxes_list[i] within image i (same ordering)
+          - len(boxes_list) must equal batch size
+          - metas (per ROI) expose 'M' (2x3 crop->feat affine); feat_down from model.roi.feat_down
         """
-        # Guard rails
+        # No-op safeguards
         if model is None or feats is None or len(feats) == 0:
-            # No features / no model: no keypoint supervision
             dev = boxes_list[0].device if len(boxes_list) else torch.device("cpu")
             return torch.zeros((), device=dev), 0
 
+        B = int(feats[0].shape[0])
         device = feats[0].device
         dtype = feats[0].dtype
 
-        uv_losses: List[torch.Tensor] = []
+        # small helper
+        def _ensure_2d(x: torch.Tensor, last: int) -> torch.Tensor:
+            x = torch.as_tensor(x, device=device, dtype=torch.float32)
+            return x.reshape(-1, last)
+
+        total_losses: List[torch.Tensor] = []
         n_pos = 0
 
-        # Helper: build UV target in crop pixels from image pixels using ROI meta
-        def _uv_from_meta(kpt_xy_img: torch.Tensor, M_crop_to_feat: torch.Tensor, feat_down: float) -> torch.Tensor:
-            # image px -> feature px
-            xy_feat = kpt_xy_img.to(device=device, dtype=dtype) / float(feat_down)
-            # invert 2x3
-            A = M_crop_to_feat[:, :2]
-            t = M_crop_to_feat[:, 2:]
-            det = A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0]
-            # safe inverse
-            invA00 = torch.where(det.abs() > 1e-12,  A[:, 1, 1] / det, torch.ones_like(det))
-            invA01 = torch.where(det.abs() > 1e-12, -A[:, 0, 1] / det, torch.zeros_like(det))
-            invA10 = torch.where(det.abs() > 1e-12, -A[:, 1, 0] / det, torch.zeros_like(det))
-            invA11 = torch.where(det.abs() > 1e-12,  A[:, 0, 0] / det, torch.ones_like(det))
-            invA = torch.stack([torch.stack([invA00, invA01], dim=-1),
-                                torch.stack([invA10, invA11], dim=-1)], dim=1)  # (N,2,2)
-            invt = -(invA @ t)  # (N,2,1)
-            uv = (invA @ xy_feat.unsqueeze(-1) + invt).squeeze(-1)  # (N,2)
-            return uv
-
-        # Iterate per image to avoid the earlier batch/length mismatch
-        for bix, (boxes, kpts) in enumerate(zip(boxes_list, kpts_list)):
-            # Normalize shapes to (N,5) and (N,2)
-            if boxes.numel() == 0 or kpts.numel() == 0:
+        # Iterate per image but satisfy kpt_from_obbs() with a full-length boxes_list
+        for bix in range(B):
+            # Skip if this image has no GT boxes or no GT kpts
+            if bix >= len(boxes_list) or bix >= len(kpts_list):
                 continue
-            boxes = boxes.reshape(-1, 5).to(device=device, dtype=dtype)
-            kpts = kpts.reshape(-1, 2).to(device=device, dtype=dtype)
-
-            # Call model for *this image only* (singleton list to match its API)
-            with torch.cuda.amp.autocast(enabled=False):
-                uv_pred, metas = model.kpt_from_obbs(feats, [boxes], scores_list=None)
-
-            if uv_pred is None or (isinstance(uv_pred, torch.Tensor) and uv_pred.numel() == 0):
+            boxes_b = boxes_list[bix]
+            kpts_b  = kpts_list[bix]
+            if boxes_b is None or kpts_b is None:
+                continue
+            boxes_b = _ensure_2d(boxes_b, 5).to(device=device, dtype=dtype)   # (N,5) [cx,cy,w,h,ang]
+            kpts_b  = _ensure_2d(kpts_b, 2).to(device=device, dtype=dtype)    # (N,2) [x,y] in image px
+            if boxes_b.numel() == 0 or kpts_b.numel() == 0:
                 continue
 
-            # Unwrap metas to a flat list[dict] aligned with the input OBBs
-            metas_img = metas
-            if isinstance(metas_img, (list, tuple)) and len(metas_img) == 1:
-                metas_img = metas_img[0]
-            if isinstance(metas_img, dict) and "list" in metas_img:
-                metas_img = metas_img["list"]
-            assert isinstance(metas_img, (list, tuple)), "ROI metas must be a list aligned with OBBs."
-
-            # Trim to the common length just in case
-            N = min(len(metas_img), boxes.shape[0], kpts.shape[0])
+            # Trim to common length to avoid mismatch
+            N = min(boxes_b.shape[0], kpts_b.shape[0])
             if N == 0:
                 continue
-            metas_img = metas_img[:N]
-            kpts_img = kpts[:N]
+            boxes_b = boxes_b[:N]
+            kpts_b  = kpts_b[:N]
 
-            # Collect affine matrices and build uv targets
-            Ms = []
-            for m in metas_img:
-                M = m["M"]
-                M = torch.as_tensor(M, device=device, dtype=dtype)
-                if M.ndim == 2:
-                    M = M.unsqueeze(0)  # (1,2,3)
-                Ms.append(M)
+            # Build a full batch-sized boxes_list with empties everywhere except at bix
+            padded_boxes_list: List[torch.Tensor] = []
+            for i in range(B):
+                if i == bix:
+                    padded_boxes_list.append(boxes_b)
+                else:
+                    padded_boxes_list.append(torch.zeros(0, 5, device=device, dtype=dtype))
+
+            # Call model; keep AMP off for geometry
+            # (use the modern torch.amp.autocast to avoid deprecation warnings)
+            with torch.amp.autocast('cuda', enabled=False):
+                uv_pred, metas = model.kpt_from_obbs(feats, padded_boxes_list, scores_list=None)
+
+            # Unwrap outputs for this image only
+            # uv_pred can be a flat Tensor (all ROIs) or a list per image
+            if isinstance(uv_pred, (list, tuple)):
+                uv_pred_b = uv_pred[bix]
+            else:
+                # If the model returns a flat tensor for just the non-empty image,
+                # it should already be the correct set for bix (others were empty).
+                uv_pred_b = uv_pred
+
+            if uv_pred_b is None or (isinstance(uv_pred_b, torch.Tensor) and uv_pred_b.numel() == 0):
+                continue
+            uv_pred_b = torch.as_tensor(uv_pred_b, device=device, dtype=dtype).reshape(-1, 2)
+            # In rare cases metas may include extra internals; we only take first N
+            if uv_pred_b.shape[0] < N:
+                N = uv_pred_b.shape[0]
+                boxes_b = boxes_b[:N]
+                kpts_b  = kpts_b[:N]
+            else:
+                uv_pred_b = uv_pred_b[:N]
+
+            # Extract the metas for this image
+            metas_b = metas[bix] if isinstance(metas, (list, tuple)) else metas
+            # Some implementations wrap in dicts
+            if isinstance(metas_b, dict) and "list" in metas_b:
+                metas_b = metas_b["list"]
+            assert isinstance(metas_b, (list, tuple)), "ROI metas must be a list aligned with OBBs."
+
+            # Build a (N,2,3) tensor of affines (crop->feat)
+            Ms: List[torch.Tensor] = []
+            for m in metas_b[:N]:
+                M = torch.as_tensor(m["M"], device=device, dtype=dtype)
+                Ms.append(M.unsqueeze(0) if M.ndim == 2 else M)
+            if len(Ms) == 0:
+                continue
             M_cat = torch.cat(Ms, dim=0)  # (N,2,3)
 
-            # feat_down from the ROI module (defaults to 8 if not present)
+            # feat_down from ROI module (default to 8.0 if missing)
             feat_down = float(getattr(getattr(model, "roi", None), "feat_down", 8.0))
-            uv_tgt = _uv_from_meta(kpts_img, M_cat, feat_down)  # (N,2)
 
-            # Ensure predictions line up with N
-            if isinstance(uv_pred, (list, tuple)):
-                # some heads may return list per image
-                uv_pred = uv_pred[0]
-            uv_pred = torch.as_tensor(uv_pred, device=device).to(dtype=uv_tgt.dtype)
-            uv_pred = uv_pred.reshape(-1, 2)[:N]
+            # ---- build UV targets in crop px from image px ----
+            # image px -> feature px
+            xy_feat = kpts_b / float(feat_down)           # (N,2)
+            A = M_cat[:, :2, :]                           # (N,2,3) but we’ll split into A(2x2) and t(2x1)
+            A2 = A[:, :, :2]                              # (N,2,2)
+            t  = A[:, :, 2:]                              # (N,2,1)
+            det = A2[:, 0, 0] * A2[:, 1, 1] - A2[:, 0, 1] * A2[:, 1, 0]
 
-            # Smooth L1 in crop pixels
-            uv_losses.append(F.smooth_l1_loss(uv_pred, uv_tgt, reduction="mean"))
+            invA00 = torch.where(det.abs() > 1e-12,  A2[:, 1, 1] / det, torch.ones_like(det))
+            invA01 = torch.where(det.abs() > 1e-12, -A2[:, 0, 1] / det, torch.zeros_like(det))
+            invA10 = torch.where(det.abs() > 1e-12, -A2[:, 1, 0] / det, torch.zeros_like(det))
+            invA11 = torch.where(det.abs() > 1e-12,  A2[:, 0, 0] / det, torch.ones_like(det))
+            invA = torch.stack(
+                [torch.stack([invA00, invA01], dim=-1),
+                 torch.stack([invA10, invA11], dim=-1)],
+                dim=1
+            )                                             # (N,2,2)
+            invt = -(invA @ t)                            # (N,2,1)
+            uv_tgt = (invA @ xy_feat.unsqueeze(-1) + invt).squeeze(-1)  # (N,2)
+
+            # ---- loss ----
+            total_losses.append(F.smooth_l1_loss(uv_pred_b, uv_tgt, reduction="mean"))
             n_pos += int(N)
 
-        if not uv_losses:
+        if not total_losses:
             return torch.zeros((), device=device, dtype=dtype), 0
 
-        return torch.stack(uv_losses).mean(), n_pos
+        return torch.stack(total_losses).mean(), n_pos
