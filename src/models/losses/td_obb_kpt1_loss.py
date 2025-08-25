@@ -269,21 +269,87 @@ class TDOBBWKpt1Criterion(nn.Module):
         else:
             return 2
 
-    def _loss_det(self,
-                  maps_by_level: Tuple[Dict[str, torch.Tensor], ...],
-                  raw_maps: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                  boxes_list: List[torch.Tensor],
-                  labels_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    # Add this small helper inside the class (near other helpers)
+    def _decode_at_cell(self, mp: dict, b: int, j: int, i: int, stride: int):
+        """Decode one cell like the evaluator: (tx,ty)->sigmoid+grid, (tw,th)->exp*s, θ=atan2(sin,cos), le-90."""
+        import math
+        sx = mp["tx"][b, j, i].sigmoid()
+        sy = mp["ty"][b, j, i].sigmoid()
+        pw = mp["tw"][b, j, i].float().exp() * stride
+        ph = mp["th"][b, j, i].float().exp() * stride
+        ang = torch.atan2(mp["sin"][b, j, i], mp["cos"][b, j, i])
+        cx = (i + sx) * stride
+        cy = (j + sy) * stride
+        # le-90 canonicalisation
+        if float(pw) < float(ph):
+            pw, ph = ph, pw
+            ang = ang + (math.pi / 2.0)
+        ang = (ang + math.pi / 2.0) % math.pi - math.pi / 2.0
+        return cx, cy, pw, ph, ang
+
+    def _iou_rot(self, a, b):
+        # a,b: [N,5] (cx,cy,w,h,theta radians)
+        try:
+            from mmcv.ops import box_iou_rotated
+            A = a.clone()
+            B = b.clone()
+            A[:, 4] = torch.rad2deg(A[:, 4])
+            B[:, 4] = torch.rad2deg(B[:, 4])
+            return box_iou_rotated(A, B, aligned=False).clamp_(0, 1)
+        except Exception:
+            # AABB fallback
+            def aabb(x):
+                cx, cy, w, h = x[:, 0], x[:, 1], x[:, 2], x[:, 3]
+                return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=1)
+
+            A = a
+            B = b
+            a1 = aabb(A)
+            b1 = aabb(B)
+            out = torch.zeros((A.shape[0], B.shape[0]), device=A.device)
+            for i in range(A.shape[0]):
+                ax1, ay1, ax2, ay2 = a1[i]
+                bx1, by1, bx2, by2 = b1.unbind(1)
+                xx1 = torch.maximum(ax1, bx1)
+                yy1 = torch.maximum(ay1, by1)
+                xx2 = torch.minimum(ax2, bx2)
+                yy2 = torch.minimum(ay2, by2)
+                iw = (xx2 - xx1).clamp_min(0)
+                ih = (yy2 - yy1).clamp_min(0)
+                inter = iw * ih
+                ua = (ax2 - ax1).clamp_min(0) * (ay2 - ay1).clamp_min(0)
+                ub = (bx2 - bx1).clamp_min(0) * (by2 - by1).clamp_min(0)
+                union = ua + ub - inter + 1e-9
+                out[i] = inter / union
+            return out.clamp_(0, 1)
+
+    def _loss_det(
+            self,
+            maps_by_level: Tuple[Dict[str, torch.Tensor], ...],
+            raw_maps: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            boxes_list: List[torch.Tensor],
+            labels_list: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
 
         B = raw_maps[0].shape[0]
         device = raw_maps[0].device
 
-        # running losses
         l_obj = raw_maps[0].new_zeros(())
         l_box = raw_maps[0].new_zeros(())
         l_ang = raw_maps[0].new_zeros(())
         l_cls = raw_maps[0].new_zeros(())
         total_pos = 0
+
+        # objectness accounting for proper averaging
+        obj_pos_terms = 0
+        obj_neg_terms = 0
+        neg_per_pos = 64  # hard-negative samples per positive (tweakable)
+
+        # debug buckets (first few steps)
+        dbg_pred_w, dbg_pred_h, dbg_gt_w, dbg_gt_h = {0: [], 1: [], 2: []}, {0: [], 1: [], 2: []}, {0: [], 1: [],
+                                                                                                    2: []}, {0: [],
+                                                                                                             1: [],
+                                                                                                             2: []}
 
         for b in range(B):
             boxes = boxes_list[b]  # (N,5)
@@ -296,23 +362,36 @@ class TDOBBWKpt1Criterion(nn.Module):
                 stride = self.strides[lvl]
                 mp = maps_by_level[lvl]  # dict of tensors with shape (B,H,W)
 
-                # grid index
                 H, W = mp["obj"].shape[-2], mp["obj"].shape[-1]
                 gx, gy = cx / stride, cy / stride
                 i, j = int(gx), int(gy)
                 if not (0 <= i < W and 0 <= j < H):
                     continue  # object falls outside map
 
-                # positive objectness target mask
-                with torch.no_grad():
-                    t_obj = torch.zeros_like(mp["obj"][b])
-                    t_obj[j, i] = 1.0
+                # ---------------- objectness: pos + sampled negatives ----------------
+                pos_logit = mp["obj"][b, j, i]
+                l_obj = l_obj + F.binary_cross_entropy_with_logits(pos_logit, pos_logit.new_ones(()))
+                obj_pos_terms += 1
 
-                # objectness (mean over grid)
-                l_obj = l_obj + self.bce(mp["obj"][b:b+1], t_obj.unsqueeze(0))
+                # random hard negatives (avoid the positive cell)
+                if neg_per_pos > 0:
+                    flat = mp["obj"][b].reshape(-1)
+                    pos_idx = j * W + i
+                    Ntot = flat.numel()
+                    if Ntot > 1:
+                        # sample without replacement; simple uniform (can be improved to top-k)
+                        k = min(int(neg_per_pos), Ntot - 1)
+                        idx = torch.randperm(Ntot, device=device)[:k + 1]
+                        idx = idx[idx != pos_idx]
+                        idx = idx[:k]
+                        if idx.numel():
+                            neg_logits = flat[idx]
+                            l_obj = l_obj + 0.5 * F.binary_cross_entropy_with_logits(
+                                neg_logits, torch.zeros_like(neg_logits)
+                            )
+                            obj_neg_terms += 1
 
-                # box regression (log-space tw/th, NO exp in loss)
-                # predicted maps are logits; targets are log(w/stride), log(h/stride)
+                # ---------------- box regression (log tw/th + offsets) ----------------
                 tx_p = mp["tx"][b, j, i]
                 ty_p = mp["ty"][b, j, i]
                 tw_p = mp["tw"][b, j, i]
@@ -328,7 +407,7 @@ class TDOBBWKpt1Criterion(nn.Module):
                 l_box = l_box + self.smoothl1(tw_p, tw_t)
                 l_box = l_box + self.smoothl1(th_p, th_t)
 
-                # angle: normalize (sin,cos) before computing loss
+                # ---------------- angle (sin,cos) normalised ----------------
                 sin_p = mp["sin"][b, j, i]
                 cos_p = mp["cos"][b, j, i]
                 vec = torch.stack([sin_p, cos_p])
@@ -338,23 +417,43 @@ class TDOBBWKpt1Criterion(nn.Module):
                 cos_t = torch.tensor(math.cos(ang), device=device, dtype=cos_p.dtype)
                 l_ang = l_ang + self.smoothl1(sin_p_n, sin_t) + self.smoothl1(cos_p_n, cos_t)
 
-                # class (optional)
-                if maps_by_level[lvl]["cls"] is not None and self.nc > 1:
-                    cls_logits = maps_by_level[lvl]["cls"][b, :, j, i]  # (nc,)
+                # ---------------- class ----------------
+                if mp["cls"] is not None and self.nc > 1:
+                    cls_logits = mp["cls"][b, :, j, i]  # (nc,)
                     t = torch.full_like(cls_logits, 0.0)
                     t[int(labels[n].item())] = 1.0
                     l_cls = l_cls + F.binary_cross_entropy_with_logits(cls_logits, t)
 
+                # ---------------- debug: decode current positive like evaluator ----------------
+                with torch.no_grad():
+                    _, _, pw_hat, ph_hat, _ = self._decode_at_cell(mp, b, j, i, stride)
+                    dbg_pred_w[lvl].append(float(pw_hat))
+                    dbg_pred_h[lvl].append(float(ph_hat))
+                    dbg_gt_w[lvl].append(float(w))
+                    dbg_gt_h[lvl].append(float(h))
+
                 total_pos += 1
 
-        # normalize by positives to keep scale stable
+        # -------- normalisation --------
         norm = max(total_pos, 1)
         l_box = l_box / norm
         l_ang = l_ang / norm
-        l_cls = l_cls / max(total_pos if self.nc > 1 else 1, 1)
+        l_cls = l_cls / max(norm if self.nc > 1 else 1, 1)
 
-        # l_obj already mean-reduced per level; average over batch images implicitly via loop
-        l_obj = l_obj / max(total_pos, 1) if total_pos > 0 else l_obj
+        # objectness: average over counted terms
+        den = max(obj_pos_terms + obj_neg_terms, 1)
+        l_obj = l_obj / den
+
+        # -------- one-time/early debug print --------
+        if (total_pos > 0) and (not hasattr(self, "_DBG_DET_ONCE") or not self._DBG_DET_ONCE):
+            for lvl, name in enumerate(("P3", "P4", "P5")):
+                if dbg_pred_w[lvl]:
+                    pw = np.median(dbg_pred_w[lvl])
+                    ph = np.median(dbg_pred_h[lvl])
+                    gw = np.median(dbg_gt_w[lvl])
+                    gh = np.median(dbg_gt_h[lvl])
+                    print(f"[TRAIN DEBUG] {name} pred_w/h≈{pw:.1f}/{ph:.1f}  vs  GT_w/h≈{gw:.1f}/{gh:.1f}")
+            self._DBG_DET_ONCE = True
 
         return l_obj, l_box, l_ang, l_cls, total_pos
 
