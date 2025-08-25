@@ -13,8 +13,14 @@ import torch.nn as nn
 import torch.distributed as dist
 
 # --- NEW: YOLO LR utilities ---
-
-from utils.lr_utils import build_yolo_scheduler  # preferred package path
+try:
+    from src.training.lr_utils import build_yolo_scheduler  # preferred package path
+except Exception:
+    try:
+        from training.lr_utils import build_yolo_scheduler   # alternative
+    except Exception:
+        # fallback local (assumes lr_utils.py is on PYTHONPATH)
+        from lr_utils import build_yolo_scheduler
 
 Tensor = torch.Tensor
 
