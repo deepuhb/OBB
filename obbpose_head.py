@@ -5,6 +5,7 @@ from typing import List, Tuple, Dict
 
 import torch
 import torch.nn as nn
+import math
 
 class OBBPoseHead(nn.Module):
     """
@@ -158,7 +159,15 @@ class OBBPoseHead(nn.Module):
             cx = (sx + gx) * s
             cy = (sy + gy) * s
 
-            if self.num_classes <= 1 or tcls is None or tcls.shape[1] == 0:
+            
+# --- Canonicalize to le-90: ensure w >= h and theta in [-pi/2, pi/2) ---
+mask = pw < ph
+if mask.any():
+    pw, ph = torch.where(mask, ph, pw), torch.where(mask, pw, ph)
+    ang = ang + (mask.to(ang.dtype) * (math.pi / 2.0))
+# Wrap angle to [-pi/2, pi/2)
+ang = torch.remainder(ang + (math.pi / 2.0), math.pi) - (math.pi / 2.0)
+if self.num_classes <= 1 or tcls is None or tcls.shape[1] == 0:
                 scores_map = obj
                 labels_map = torch.zeros_like(scores_map, dtype=torch.long, device=device)
             else:

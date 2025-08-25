@@ -47,7 +47,6 @@ def _quad_to_obb_radians(quad_xy: np.ndarray):
             if vals is not None and len(vals) >= 5:
                 cx, cy, w, h, th = map(float, vals[:5])
                 # enforce le90 if needed
-                import math, numpy as np
                 if w < h:
                     w, h = h, w
                     th += math.pi / 2.0
