@@ -1,10 +1,12 @@
 # src/models/losses/td_obb_kpt1_loss.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import math
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
 
 # ------------------------- small utils -------------------------
@@ -12,12 +14,29 @@ import torch.nn.functional as F
 def _dist_is_initialized() -> bool:
     return torch.distributed.is_available() and torch.distributed.is_initialized()
 
+def _dist_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
 def _ddp_mean(x: torch.Tensor) -> torch.Tensor:
-    if not _dist_is_initialized():
-        return x
-    y = x.clone()
-    torch.distributed.all_reduce(y, op=torch.distributed.ReduceOp.SUM)
-    y /= torch.distributed.get_world_size()
+    """
+    All-reduce mean for floating tensors. Always computes in float to avoid
+    int/float casting errors across ranks.
+    """
+    y = x.detach().clone()
+    if y.dtype not in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+        y = y.to(torch.float32)
+    if _dist_ready():
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        y = y / float(dist.get_world_size())
+    return y
+
+def _ddp_sum(x: torch.Tensor) -> torch.Tensor:
+    """
+    All-reduce sum for counters (int or float). Keeps dtype.
+    """
+    y = x.detach().clone()
+    if _dist_ready():
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
     return y
 
 def _invert_affine_2x3(M: torch.Tensor) -> torch.Tensor:
@@ -123,6 +142,14 @@ class TDOBBWKpt1Criterion(nn.Module):
         assert isinstance(det_maps, (list, tuple)) and len(det_maps) == 3, \
             "det_maps must be a list of 3 tensors (P3,P4,P5)"
         B = det_maps[0].shape[0]
+        # assert per-level channels = 7+nc
+        if not hasattr(self, '_ASSERT_ONCE_DET'):
+            self._ASSERT_ONCE_DET = False
+        if not self._ASSERT_ONCE_DET:
+            for i,dm in enumerate(det_maps):
+                C = int(dm.shape[1]); expected = 7 + int(self.nc)
+                assert C == expected, f"det_maps[{i}] has C={C}, expected {expected} (=7+nc)."
+            self._ASSERT_ONCE_DET = True
         device = det_maps[0].device
 
         # channel split
@@ -136,11 +163,27 @@ class TDOBBWKpt1Criterion(nn.Module):
 
         P3, P4, P5 = det_maps
         m3, m4, m5 = split_maps(P3), split_maps(P4), split_maps(P5)
+        if not hasattr(self, '_DBG_SINCOS_ONCE'):
+            s3 = float(((m3['sin']**2 + m3['cos']**2).mean()).item())
+            s4 = float(((m4['sin']**2 + m4['cos']**2).mean()).item())
+            s5 = float(((m5['sin']**2 + m5['cos']**2).mean()).item())
+            print(f"[ASSERT] sin^2+cos^2 mean: P3={s3:.3f} P4={s4:.3f} P5={s5:.3f}")
+            self._DBG_SINCOS_ONCE = True
 
         # -------- parse GT (supports two formats) --------
         boxes_list, labels_list, kpts_list = self._read_targets(batch, B, device)
 
         # -------- detection loss (obj, box, angle, cls) --------
+        if not hasattr(self, '_ASSERT_ANGLE_ONCE'):
+            bad = 0; tot = 0
+            for bl in boxes_list:
+                if bl is None or len(bl)==0: continue
+                ang = torch.as_tensor(bl, device=device, dtype=torch.float32)[:, 4]
+                tot += int(ang.numel())
+                bad += int((ang.abs() > 3.1415927 + 1e-3).sum().item())
+            if tot>0:
+                assert bad==0, f"GT angles out of radians range: {bad}/{tot} > pi. Ensure GT is in radians."
+            self._ASSERT_ANGLE_ONCE = True
         l_obj, l_box, l_ang, l_cls, pos = self._loss_det((m3, m4, m5), (P3, P4, P5), boxes_list, labels_list)
 
         # -------- keypoint loss via ROI crops on P3 --------
@@ -330,6 +373,9 @@ class TDOBBWKpt1Criterion(nn.Module):
             return None
         uv_list = []
         for m in metas:
+            assert 'M' in m, "ROI meta must include 2x3 affine 'M'"
+            M = m['M']
+            assert hasattr(M, 'shape') and tuple(M.shape[-2:])==(2,3), f"ROI meta 'M' must be (2,3), got {getattr(M, 'shape', None)}"
             if "gt_kpt" not in m or m["gt_kpt"] is None:
                 # In training we attach per-ROI GT kpt below; if missing, skip
                 return None
@@ -341,106 +387,124 @@ class TDOBBWKpt1Criterion(nn.Module):
 
     def _loss_kpt(
             self,
-            model: Optional[nn.Module],
-            feats: Optional[List[torch.Tensor]],
-            boxes_list: List[torch.Tensor],
-            kpts_list: List[torch.Tensor],
+            model,
+            feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            boxes_list: Sequence[Union[torch.Tensor, np.ndarray, List[List[float]]]],
+            kpts_list: Sequence[Union[torch.Tensor, np.ndarray, List[List[float]]]],
     ) -> Tuple[torch.Tensor, int]:
-        # Guard rails
-        if model is None or feats is None or len(feats) == 0:
-            dev = boxes_list[0].device if len(boxes_list) else torch.device("cpu")
-            return torch.zeros((), device=dev), 0
+        """
+        Compute keypoint (u,v) loss from rotated ROI crops.
 
-        B = int(feats[0].shape[0])
-        device = feats[0].device
+        - Supports metas from model.kpt_from_obbs either as:
+            (a) per-batch list-of-lists of dicts, or
+            (b) a flat list of dicts with 'bix' batch index
+        - Expects exactly 1 keypoint per ROI (kpt1); if kpts have higher rank,
+          the first keypoint is used.
+        """
+        import torch.nn.functional as F
 
-        def _ensure_2d(x: torch.Tensor, last: int) -> torch.Tensor:
-            x = torch.as_tensor(x, device=device, dtype=torch.float32)  # geom in fp32
-            return x.reshape(-1, last)
+        P3 = feats[0]
+        device = P3.device
+        dtype = P3.dtype
+        B = int(P3.shape[0])
 
-        total_losses: List[torch.Tensor] = []
-        n_pos = 0
-
-        for bix in range(B):
-            if bix >= len(boxes_list) or bix >= len(kpts_list):
-                continue
-            boxes_b = boxes_list[bix]
-            kpts_b = kpts_list[bix]
-            if boxes_b is None or kpts_b is None:
-                continue
-
-            boxes_b = _ensure_2d(boxes_b, 5)  # (N,5) [cx,cy,w,h,ang] in px/deg or rad (your convention)
-            kpts_b = _ensure_2d(kpts_b, 2)  # (N,2) [x,y] in img px
-            if boxes_b.numel() == 0 or kpts_b.numel() == 0:
-                continue
-
-            N = min(boxes_b.shape[0], kpts_b.shape[0])
-            if N == 0:
-                continue
-            boxes_b = boxes_b[:N]
-            kpts_b = kpts_b[:N]
-
-            # Build a batch-sized boxes_list so len(list)==B (required by model.kpt_from_obbs)
-            padded_boxes_list: List[torch.Tensor] = []
-            zero = torch.zeros(0, 5, device=device, dtype=torch.float32)
-            for i in range(B):
-                padded_boxes_list.append(boxes_b if i == bix else zero)
-
-            # IMPORTANT: let AMP be ON here (no autocast=False) so conv weights & inputs match
-            uv_pred, metas = model.kpt_from_obbs(feats, padded_boxes_list, scores_list=None)
-
-            # Pull only this image's results
-            uv_pred_b = uv_pred[bix] if isinstance(uv_pred, (list, tuple)) else uv_pred
-            if uv_pred_b is None or (isinstance(uv_pred_b, torch.Tensor) and uv_pred_b.numel() == 0):
-                continue
-            uv_pred_b = torch.as_tensor(uv_pred_b, device=device).reshape(-1, 2)
-            if uv_pred_b.shape[0] < N:
-                N = uv_pred_b.shape[0]
-                boxes_b = boxes_b[:N]
-                kpts_b = kpts_b[:N]
+        # --- Normalize boxes_list to length B and to proper tensor shapes (N,5) ---
+        norm_boxes_list: List[torch.Tensor] = []
+        for b in range(B):
+            if b < len(boxes_list) and boxes_list[b] is not None and len(boxes_list[b]) > 0:
+                rois_b = torch.as_tensor(boxes_list[b], device=device, dtype=dtype)
+                if rois_b.ndim == 1:
+                    rois_b = rois_b.unsqueeze(0)  # (1,5)
+                elif rois_b.ndim > 2:
+                    rois_b = rois_b.reshape(-1, rois_b.shape[-1])
             else:
-                uv_pred_b = uv_pred_b[:N]
+                rois_b = torch.zeros((0, 5), device=device, dtype=dtype)
+            norm_boxes_list.append(rois_b)
 
-            metas_b = metas[bix] if isinstance(metas, (list, tuple)) else metas
-            if isinstance(metas_b, dict) and "list" in metas_b:
-                metas_b = metas_b["list"]
-            assert isinstance(metas_b, (list, tuple)), "ROI metas must be a list aligned with OBBs."
-            Ms: List[torch.Tensor] = []
-            for m in metas_b[:N]:
-                M = torch.as_tensor(m["M"], device=device, dtype=torch.float32)  # geom in fp32
-                Ms.append(M.unsqueeze(0) if M.ndim == 2 else M)
-            if not Ms:
+        # Fast exit if really nothing to do
+        if sum(int(x.shape[0]) for x in norm_boxes_list) == 0:
+            zero = torch.zeros((), device=device, dtype=dtype)
+            return zero, 0
+
+        # --- Run model head to get predicted uv and metas describing each crop ---
+        # NOTE: the model should be AMP-safe; uv_pred's dtype may be float16 under amp.
+        uv_pred, metas = model.kpt_from_obbs(feats, norm_boxes_list, scores_list=None)
+
+        # --- Normalize metas to per-batch lists and also build indices into uv_pred ---
+        per_b_metas: List[List[dict]] = [[] for _ in range(B)]
+        idxs_by_b: List[List[int]] = [[] for _ in range(B)]
+
+        if isinstance(metas, (list, tuple)) and len(metas) > 0 and isinstance(metas[0], (list, tuple)):
+            # metas is already per-batch lists
+            start = 0
+            for b in range(B):
+                mb = list(metas[b]) if b < len(metas) else []
+                per_b_metas[b] = mb
+                idxs_by_b[b] = list(range(start, start + len(mb)))
+                start += len(mb)
+        else:
+            # treat metas as a flat list[dict] with 'bix' keys
+            flat = list(metas) if isinstance(metas, (list, tuple)) else []
+            for i, md in enumerate(flat):
+                bix = int(md.get("bix", md.get("batch_index", 0)))
+                if 0 <= bix < B:
+                    per_b_metas[bix].append(md)
+                    idxs_by_b[bix].append(i)
+
+        # --- Build loss ---
+        total_loss = torch.zeros((), device=device, dtype=uv_pred.dtype)
+        total_pos = 0
+
+        for b in range(B):
+            metas_b = per_b_metas[b]
+            idxs_b = idxs_by_b[b]
+            M_b = len(metas_b)
+            if M_b == 0:
                 continue
-            M_cat = torch.cat(Ms, dim=0)  # (N,2,3)
 
-            # Feature downsample from ROI (defaults to 8.0 if missing)
-            feat_down = float(getattr(getattr(model, "roi", None), "feat_down", 8.0))
+            # uv predictions for this batch image, keeping ROI order
+            uv_b_pred = uv_pred[idxs_b]  # shape (M_b, 2)
+            # Ground-truth keypoints for these ROIs
+            # Accepts shapes: (M_b, 2) or (M_b, K, 2) or (M_b, >=2)
+            kpts_b = torch.as_tensor(kpts_list[b], device=device, dtype=uv_b_pred.dtype)
+            if kpts_b.ndim == 1:
+                kpts_b = kpts_b.view(1, -1)
+            # Reduce to (M_b, 2) using the first keypoint if needed
+            if kpts_b.ndim == 3 and kpts_b.shape[1] >= 1:
+                kpts_b = kpts_b[:, 0, :2]
+            elif kpts_b.shape[-1] >= 2:
+                kpts_b = kpts_b[:, :2]
+            # Guard against count mismatch; trim/pad GT to match metas order
+            if kpts_b.shape[0] != M_b:
+                # Trim extra or pad missing with zeros (they will get low loss weight anyway)
+                if kpts_b.shape[0] > M_b:
+                    kpts_b = kpts_b[:M_b]
+                else:
+                    pad = torch.zeros((M_b - kpts_b.shape[0], 2), device=device, dtype=kpts_b.dtype)
+                    kpts_b = torch.cat([kpts_b, pad], dim=0)
 
-            # ---- build UV targets (crop coords) in fp32 ----
-            xy_feat = kpts_b / feat_down  # (N,2)
-            A = M_cat[:, :2, :]
-            A2 = A[:, :, :2]
-            t = A[:, :, 2:]
-            det = A2[:, 0, 0] * A2[:, 1, 1] - A2[:, 0, 1] * A2[:, 1, 0]
-            eps = 1e-12
-            invA00 = torch.where(det.abs() > eps, A2[:, 1, 1] / det, torch.ones_like(det))
-            invA01 = torch.where(det.abs() > eps, -A2[:, 0, 1] / det, torch.zeros_like(det))
-            invA10 = torch.where(det.abs() > eps, -A2[:, 1, 0] / det, torch.zeros_like(det))
-            invA11 = torch.where(det.abs() > eps, A2[:, 0, 0] / det, torch.ones_like(det))
-            invA = torch.stack(
-                [torch.stack([invA00, invA01], dim=-1),
-                 torch.stack([invA10, invA11], dim=-1)],
-                dim=1
-            )  # (N,2,2)
-            invt = -(invA @ t)  # (N,2,1)
-            uv_tgt = (invA @ xy_feat.unsqueeze(-1) + invt).squeeze(-1)  # (N,2) fp32
+            # Compute GT (u,v) for each ROI using the affine meta
+            uv_gt_list = []
+            for j, md in enumerate(metas_b):
+                M_crop_to_feat = torch.as_tensor(md["M"], device=device, dtype=uv_b_pred.dtype)  # (2,3)
+                feat_down = float(md.get("feat_down", 8))
+                xy_img = kpts_b[j:j + 1, :2]  # (1,2)
+                uv_j = _img_kpts_to_crop_uv(xy_img, M_crop_to_feat, feat_down=feat_down)  # (1,2)
+                uv_gt_list.append(uv_j)
 
-            # ---- loss (match dtypes) ----
-            uv_pred_b = uv_pred_b.to(torch.float32)
-            total_losses.append(F.smooth_l1_loss(uv_pred_b, uv_tgt, reduction="mean"))
-            n_pos += int(N)
+            uv_b_gt = torch.cat(uv_gt_list, dim=0) if uv_gt_list else torch.zeros((0, 2), device=device,
+                                                                                  dtype=uv_b_pred.dtype)
 
-        if not total_losses:
-            return torch.zeros((), device=device, dtype=torch.float32), 0
+            # Smooth L1 over (u,v) in [0,1]; clamp GT softly just in case
+            uv_b_gt = uv_b_gt.clamp(0.0, 1.0)
+            # Align dtypes
+            if uv_b_gt.dtype != uv_b_pred.dtype:
+                uv_b_gt = uv_b_gt.to(uv_b_pred.dtype)
 
-        return torch.stack(total_losses).mean(), n_pos
+            loss_b = F.smooth_l1_loss(uv_b_pred, uv_b_gt, reduction="mean")
+            total_loss = total_loss + loss_b
+            total_pos += int(M_b)
+
+        # Scale by configured lambda
+        total_loss = total_loss * float(self.lambda_kpt)
+        return total_loss, total_pos

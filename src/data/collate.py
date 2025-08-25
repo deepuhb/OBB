@@ -16,8 +16,6 @@ def _to_tensor(x, dtype=torch.float32):
     return torch.as_tensor(x, dtype=dtype)
 
 
-
-
 def _coerce_angles_like(cx: torch.Tensor, ang) -> torch.Tensor:
     """Return an angle tensor shaped like `cx`.
     - None or empty -> zeros_like(cx)

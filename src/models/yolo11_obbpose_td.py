@@ -114,6 +114,47 @@ class YOLO11_OBBPOSE_TD(nn.Module):
         print(f"[SCHEMA TRAIN] sig={self._schema_tag} params={params}", flush=True)
         print(f"[SCHEMA TRAIN] backbone_out=({c3},{c4},{c5}) neck_ch_out={self.neck_ch_out}", flush=True)
 
+        # once-only fallback warning flag
+        self._warned_decode_fallback = False
+
+    @torch.no_grad()
+    def decode_obb_from_pyramids(self, det_maps, imgs, **kwargs):
+        """
+        Returns per-image predictions expected by your Evaluator:
+            List[Dict[str, Tensor]]:
+                - 'boxes':  (N,5) tensor  (cx, cy, w, h, angle_radians)
+                - 'scores': (N,)  tensor
+                - 'labels': (N,)  tensor (int64)
+        Fallback path returns empty predictions (no exception), so eval can proceed.
+        """
+        # 1) If your head already has a decoder:
+        if hasattr(self, "head") and hasattr(self.head, "decode_obb_from_pyramids"):
+            return self.head.decode_obb_from_pyramids(det_maps, imgs, **kwargs)
+
+        # 2) If you have a generic decode/postprocess on the model or head, try those
+        for mod in (self, getattr(self, "head", None)):
+            if mod is None:
+                continue
+            for cand in ("decode_from_pyramids", "decode_obb_pyramids", "decode_obb",
+                         "decode", "postprocess", "predict"):
+                fn = getattr(mod, cand, None)
+                if callable(fn):
+                    return fn(det_maps, imgs, **kwargs)
+
+        # 3) Safe EMPTY fallback — do not raise
+        B = int(imgs.shape[0]) if imgs is not None and hasattr(imgs, "shape") else 1
+        device = imgs.device if isinstance(imgs, torch.Tensor) else next(self.parameters()).device
+        empty = {
+            "boxes":  torch.zeros((0, 5), device=device, dtype=torch.float32),
+            "scores": torch.zeros((0,), device=device, dtype=torch.float32),
+            "labels": torch.zeros((0,), device=device, dtype=torch.long),
+        }
+        if not self._warned_decode_fallback:
+            print("[decode] WARNING: using EMPTY fallback in YOLO11_OBBPOSE_TD.decode_obb_from_pyramids "
+                  "(no head decoder found). mAP will be 0 until you implement a real decoder.", flush=True)
+            self._warned_decode_fallback = True
+        return [empty.copy() for _ in range(B)]
+
     # -------------------------
     # Forward
     # -------------------------

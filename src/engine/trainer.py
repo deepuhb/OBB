@@ -2,15 +2,13 @@
 # Robust training loop with AMP + (optional) DDP and flexible criterion API.
 from __future__ import annotations
 
-import math
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 from numbers import Number
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-
 
 Tensor = torch.Tensor
 
@@ -27,11 +25,12 @@ def _world_size() -> int:
     return dist.get_world_size() if _is_dist() else 1
 
 
-def _ddp_mean_scalar(x: float) -> float:
+def _ddp_mean_scalar(x: float, device: Optional[torch.device] = None) -> float:
     """Average a scalar across ranks for logging."""
     if not _is_dist():
-        return x
-    t = torch.tensor([x], dtype=torch.float32, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        return float(x)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    t = torch.tensor([float(x)], dtype=torch.float32, device=device)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return (t.item() / float(_world_size()))
 
@@ -48,28 +47,24 @@ def _stack_if_list(x: Union[Tensor, Sequence[Tensor]]) -> Tensor:
         if len(x) == 0:
             raise ValueError("Empty image list in batch.")
         if all(isinstance(t, Tensor) for t in x):
-            # Accept either [B,C,H,W] already or list of [C,H,W].
-            if x[0].ndim == 3:  # [C,H,W] -> stack to [B,C,H,W]
+            if x[0].ndim == 3:  # [C,H,W] -> [B,C,H,W]
                 return torch.stack(x, dim=0)
             elif x[0].ndim == 4:
-                return torch.stack(x, dim=0)  # rare case of per-sample batched tensors
+                return torch.stack(x, dim=0)
     raise TypeError(f"Unsupported image container type: {type(x)}")
 
-def _as_float(x):
-    # Accepts float/int, numpy scalar, or torch.Tensor
+
+def _as_float(x: Any) -> float:
     if isinstance(x, Number):
         return float(x)
     if isinstance(x, torch.Tensor):
         if x.numel() == 1:
             return x.item()
-        # If someone accidentally returns a vector/tensor metric, reduce safely
         return x.detach().mean().item()
     try:
-        # numpy scalar or anything float-able
         return float(x)
     except Exception:
-        # last resort: stringify warning
-        print(f"[WARN] metric '{x}' not scalar-like; forcing mean/0.0", flush=True)
+        print(f"[WARN] metric '{x}' not scalar-like; forcing 0.0", flush=True)
         return 0.0
 
 
@@ -77,12 +72,41 @@ def _extract_images_from_batch(batch: Dict[str, Any]) -> Tensor:
     """Find images in common keys without boolean-chaining on tensors."""
     for k in ("image", "images", "img", "imgs"):
         if k in batch and batch[k] is not None:
-            imgs = batch[k]
-            return _stack_if_list(imgs)
-    # Some datasets put it under 'inputs'
+            return _stack_if_list(batch[k])
     if "inputs" in batch and batch["inputs"] is not None:
         return _stack_if_list(batch["inputs"])
     raise KeyError("Could not find image tensor in batch. Tried: image/images/img/imgs/inputs")
+
+
+def _ensure_tensor(x: Union[Tensor, float], device: torch.device) -> Tensor:
+    if isinstance(x, Tensor):
+        return x
+    return torch.as_tensor(float(x), dtype=torch.float32, device=device)
+
+
+def _parts_to_floats(d: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for k, v in d.items():
+        if isinstance(v, Tensor):
+            out[k] = float(v.detach().item())
+        elif isinstance(v, (float, int)):
+            out[k] = float(v)
+        else:
+            continue
+    return out
+
+
+def _merge_add(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
+    if not a:
+        return dict(b)
+    out = dict(a)
+    for k, v in b.items():
+        out[k] = out.get(k, 0.0) + float(v)
+    return out
+
+
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
 
 
 class Trainer:
@@ -114,12 +138,15 @@ class Trainer:
         logger: Optional[Any] = None,
         scaler: Optional[torch.amp.GradScaler] = None,
     ) -> None:
+        # Freeze a copy of cfg so later external mutations cannot affect us
+        self.cfg: Dict[str, Any] = dict(cfg or {})
+        self.max_epochs: int = int(self.cfg.get("epochs", 1))  # frozen at init
+
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
-        self.cfg = cfg or {}
         self.logger = logger
 
         # DDP info
@@ -133,22 +160,16 @@ class Trainer:
             self.scaler = scaler
         else:
             if use_amp and device.type == "cuda":
-                # torch>=2.4 uses torch.amp.GradScaler(device)
                 try:
                     self.scaler = torch.amp.GradScaler("cuda")
                 except TypeError:
-                    # Older signature
                     self.scaler = torch.cuda.amp.GradScaler(enabled=True)
             else:
-                # disabled scaler acts like identity
                 try:
                     self.scaler = torch.amp.GradScaler("cuda", enabled=False)
                 except TypeError:
                     self.scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    # -------------------------
-    #  public API
-    # -------------------------
     def fit(
         self,
         train_loader: Iterable[Dict[str, Any]],
@@ -161,21 +182,27 @@ class Trainer:
         optimizer = self.optimizer
         scheduler = self.scheduler
 
-        # Epoch settings
-        epochs = int(self.cfg.get("epochs", 1))
+        # Epoch settings (use frozen values)
+        epochs = self.max_epochs
         log_interval = int(self.cfg.get("log_interval", 50))
         use_amp = bool(self.cfg.get("amp", False)) and self.device.type == "cuda"
 
+        # Eval settings
+        eval_interval = int(self.cfg.get("eval_interval", 1))
+        warmup_noeval = int(self.cfg.get("warmup_noeval", 0))
+        select_name = str(self.cfg.get("eval_select", "mAP50"))
+        mode = str(self.cfg.get("eval_mode", "max"))
+
         best_metric: Optional[float] = None
         model.train()
+
+        if self.is_main:
+            print(f"[TRAIN] epochs={epochs} amp={use_amp} world={self.world_size}", flush=True)
 
         for epoch in range(1, epochs + 1):
             if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
                 train_sampler.set_epoch(epoch)
 
-            # -----------------
-            #   Train epoch
-            # -----------------
             t0 = time.time()
             running_total = 0.0
             parts_accum: Dict[str, float] = {}
@@ -206,77 +233,69 @@ class Trainer:
                     loss.backward()
                     optimizer.step()
 
-                # Logging accumulators (CPU floats)
+                # Logging accumulators
                 loss_item = float(loss.detach().item())
                 running_total += loss_item
                 parts_accum = _merge_add(parts_accum, parts)
                 steps += 1
 
-                if log_interval > 0 and (step % log_interval == 0):
+                if log_interval > 0 and (step % log_interval == 0) and self.is_main:
                     avg_loss = running_total / max(1, steps)
-                    if self.is_main:
-                        print(f"[rank{self.rank}] epoch {epoch} step {step}: loss={avg_loss:.4f}", flush=True)
+                    print(f"[rank{self.rank}] epoch {epoch} step {step}: loss={avg_loss:.4f}", flush=True)
 
             # End epoch logging
             epoch_loss = running_total / max(1, steps)
-            # Average across DDP ranks for cleaner logs
-            epoch_loss_avg = _ddp_mean_scalar(epoch_loss)
+            epoch_loss_avg = _ddp_mean_scalar(epoch_loss, device=self.device)
 
             if self.is_main:
                 print(f"[{_ts()}] Epoch {epoch}: loss={epoch_loss_avg:.4f}", flush=True)
 
-            # Step scheduler (per-epoch)
+            # Scheduler (optional)
             if scheduler is not None:
                 try:
                     scheduler.step()
                 except Exception:
-                    # Some schedulers require metric: pass epoch_loss_avg
                     try:
                         scheduler.step(epoch_loss_avg)
                     except Exception:
                         pass
 
-            # -----------------
-            #   Evaluate (main rank only)
-            # -----------------
+            # -------- evaluation (runs regardless of scheduler) --------
             if evaluator is not None and val_loader is not None:
-                if _is_dist():
-                    dist.barrier()
-                metrics = None
-                if self.is_main:
-                    model.eval()
-                    with torch.inference_mode():
-                        # Evaluator can wrap its own autocast if needed.
-                        metrics = evaluator.evaluate(model, val_loader, device=self.device)
-                    model.train()
+                do_eval = (epoch % eval_interval == 0) and (epoch > warmup_noeval)
+                if do_eval:
+                    core_model = self.model.module if isinstance(
+                        self.model, torch.nn.parallel.DistributedDataParallel
+                    ) else self.model
+                    core_model.eval()
+                    with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+                        # Be robust to both signatures: (model, val_loader, device) or (model, dataloader, device)
+                        try:
+                            metrics = evaluator.evaluate(model=core_model, val_loader=val_loader, device=self.device)
+                        except TypeError:
+                            metrics = evaluator.evaluate(model=core_model, dataloader=val_loader, device=self.device)
 
-                    # Basic display of a chosen metric (scalar-safe)
-                    if isinstance(metrics, dict):
-                        select_name = str(self.cfg.get("eval_select", "mAP50"))
-                        sel_raw = metrics.get(select_name, None)
-                        if sel_raw is not None:
-                            sel = _as_float(sel_raw)
-                            print(f"[{_ts()}] Eval: {select_name}={sel:.6f}  (mode={self.cfg.get('eval_mode', 'max')})",
-                                  flush=True)
-                            # Track best on main rank
-                            if best_metric is None:
-                                best_metric = sel
-                            else:
-                                mode = str(self.cfg.get("eval_mode", "max"))
-                                better = (sel > best_metric) if mode == "max" else (sel < best_metric)
-                                if better:
-                                    best_metric = sel
+                    # DDP: average scalar metrics across ranks
+                    metrics = self._ddp_allreduce_metrics(metrics if isinstance(metrics, dict) else {})
+                    # Print a selected metric each epoch we evaluate
+                    sel = metrics.get(select_name, None)
+                    if sel is not None and self.is_main:
+                        print(f"[{time.strftime('%H:%M:%S')}] Eval: {select_name}={sel:.6f} (mode={mode})", flush=True)
+                        if best_metric is None:
+                            best_metric = sel
                         else:
-                            print(f"[{_ts()}] Eval: key '{select_name}' missing; metrics={metrics}", flush=True)
-                    else:
-                        print(f"[{_ts()}] Eval returned non-dict: {type(metrics)}", flush=True)
+                            if (mode == "max" and sel > best_metric) or (mode == "min" and sel < best_metric):
+                                best_metric = sel
+                    core_model.train()
 
-                # Sync after eval
                 if _is_dist():
                     dist.barrier()
+            else:
+                if self.is_main and epoch == 1:
+                    print("[WARN] No evaluator or val_loader provided; mAP will not be computed.", flush=True)
+            # ----------------------------------------------------------
 
             if self.is_main:
-                # brief epoch timing
                 print(f"[{_ts()}] Epoch {epoch} finished in {(time.time()-t0):.2f}s", flush=True)
 
         return best_metric
@@ -292,10 +311,8 @@ class Trainer:
         epoch: int,
     ) -> Tuple[Tensor, Dict[str, float]]:
         """Call criterion flexibly and return (loss_tensor, parts_dict_of_floats)."""
-        # Unwrap the model so criterion can access custom methods (e.g., kpt_from_obbs)
         core_model = _unwrap_model(self.model)
 
-        # Unpack common output shapes
         if isinstance(outputs, (list, tuple)) and len(outputs) >= 2:
             det_maps, feats = outputs[0], outputs[1]
         else:
@@ -306,7 +323,6 @@ class Trainer:
 
         result = criterion(det_maps, feats, batch, model=core_model, epoch=epoch)
 
-        # Normalize result to (Tensor loss, Dict[str,float] parts)
         if isinstance(result, tuple) and len(result) == 2:
             loss, parts = result
             loss = _ensure_tensor(loss, device=self.device)
@@ -318,7 +334,6 @@ class Trainer:
             if "total" in result and isinstance(result["total"], Tensor):
                 loss = result["total"]
             else:
-                # sum all tensor values as total
                 total = 0.0
                 for v in result.values():
                     if isinstance(v, Tensor):
@@ -331,34 +346,16 @@ class Trainer:
 
         raise TypeError(f"Unsupported criterion return type: {type(result)}")
 
-
-def _ensure_tensor(x: Union[Tensor, float], device: torch.device) -> Tensor:
-    if isinstance(x, Tensor):
-        return x
-    return torch.as_tensor(float(x), dtype=torch.float32, device=device)
-
-
-def _parts_to_floats(d: Dict[str, Any]) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    for k, v in d.items():
-        if isinstance(v, Tensor):
-            out[k] = float(v.detach().item())
-        elif isinstance(v, (float, int)):
-            out[k] = float(v)
-        else:
-            # ignore non-numerical parts for logging
-            continue
-    return out
-
-
-def _merge_add(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
-    if not a:
-        return dict(b)
-    out = dict(a)
-    for k, v in b.items():
-        out[k] = out.get(k, 0.0) + float(v)
-    return out
-
-
-def _ts() -> str:
-    return time.strftime("%H:%M:%S")
+    def _ddp_allreduce_metrics(self, m: dict) -> dict:
+        """Average scalar metrics dict across ranks; returns result on all ranks."""
+        if not _is_dist():
+            return m
+        out = {}
+        for k, v in (m or {}).items():
+            if v is None:
+                continue
+            t = torch.tensor(float(v), device=self.device, dtype=torch.float32)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t = t / float(_world_size())
+            out[k] = float(t.item())
+        return out

@@ -2,6 +2,7 @@
 # src/data/datasets.py
 import os
 import cv2
+import math
 import logging
 import numpy as np
 import torch
@@ -69,7 +70,6 @@ def _quad_to_obb_radians(quad_xy: np.ndarray):
         angle_deg = angle_deg + 90.0
     angle_rad = np.deg2rad(angle_deg)
     # Normalize to [-pi/2, pi/2)
-    import math
     while angle_rad < -math.pi/2:
         angle_rad += math.pi
     while angle_rad >= math.pi/2:
