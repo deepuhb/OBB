@@ -33,7 +33,7 @@ def parse_args():
     p.add_argument("--classes", type=int, default=1)
     p.add_argument("--width", type=float, default=1.0)
     # --- Optimizer choice ---
-    p.add_argument("--optim", type=str, default="sgd", choices=["adamw", "sgd"],
+    p.add_argument("--optim", type=str, default="adamw", choices=["adamw", "sgd"],
                    help="optimizer to use; 'sgd' matches classic YOLO settings")
     p.add_argument("--nesterov", action="store_true", help="use Nesterov with SGD")
     # --- LR & Warmup (YOLO-style) ---
@@ -138,7 +138,7 @@ def main():
     elif args.lr is not None:
         lr0 = float(args.lr)
     else:
-        lr0 = 0.005 if args.optim.lower() == "sgd" else 0.002
+        lr0 = 0.01 if args.optim.lower() == "sgd" else 0.002
 
     cfg = {
         "data_root": args.data_root,

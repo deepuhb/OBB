@@ -95,208 +95,178 @@ class OBBPoseHead(nn.Module):
         kpm = [self.kp3(n3), self.kp4(d4), self.kp5(d5)]
         return det, kpm
 
-
-    @torch.no_grad()
     def decode_obb_from_pyramids(
             self,
             det_maps,
             imgs,
             *,
-            conf_thres: float = 0.25,
-            iou_thres: float = 0.45,
-            max_det: int = 300,
-            use_nms: bool = True,
-            multi_label: bool = False,
-            agnostic: bool = False,  # kept for signature compat
-            strides=(8, 16, 32),  # ignored (we auto-infer stride)
+            strides=(8, 16, 32),
+            conf_thres=None,  # old name
+            score_thr=None,  # evaluator's name
+            max_det=300,
+            multi_label=False,
+            agnostic=False,
+            use_nms=False,  # evaluator handles NMS; keep False here
+            **kwargs,
     ):
         """
-        det_maps: list of 3 tensors [B,C,H,W] with channels [tx,ty,tw,th,sin,cos,obj,(cls...)]
-        imgs:     input batch [B,3,Himg,Wimg]
-        Returns:  list of length B with dict(boxes [N,5: cx,cy,w,h,θ], scores [N], labels [N])
+        Returns per-image dicts:
+          {"boxes": (N,5) [cx,cy,w,h,theta(rad)], "scores": (N,), "labels": (N,)}
+        Channels per level are [tx,ty,tw,th,sin,cos,obj,(cls...)]  (7 + nc)
+        Notes:
+          - Robust fp32 decode (safe exp, angle normalisation, LE-90 canonicalisation).
+          - Accepts both 'conf_thres' and 'score_thr' for compatibility.
         """
-        device = imgs.device
-        dtype = imgs.dtype
-        B, _, Himg, Wimg = imgs.shape
-        assert isinstance(det_maps, (list, tuple)) and len(det_maps) == 3, "expected 3 FPN levels"
+        import math
+        import torch
 
-        def make_grid(h, w, dev):
-            # [1,1,H,W] integer grid
-            yv, xv = torch.meshgrid(
-                torch.arange(h, device=dev),
-                torch.arange(w, device=dev),
-                indexing="ij",
-            )
-            return xv.view(1, 1, h, w), yv.view(1, 1, h, w)
+        # pick threshold compatibly
+        thr = conf_thres if conf_thres is not None else score_thr
+        if thr is None:
+            thr = 0.25  # sensible default
 
-        def aabb_from_obb(xywhθ):
-            # xywhθ: [N,5] -> [N,4] (x1,y1,x2,y2) (axis-aligned)
-            cx, cy, w, h = xywhθ[:, 0], xywhθ[:, 1], xywhθ[:, 2], xywhθ[:, 3]
-            return torch.stack([cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5], dim=1)
+        B, _, H, W = imgs.shape
+        img_h, img_w = int(H), int(W)
 
-        def nms_aabb(xyxy, scores, iou_thr):
-            # Pure-torch NMS on axis-aligned boxes
-            if xyxy.numel() == 0:
-                return torch.empty((0,), dtype=torch.long, device=xyxy.device)
-            x1, y1, x2, y2 = xyxy.unbind(1)
-            areas = (x2 - x1).clamp_min(0) * (y2 - y1).clamp_min(0)
-            order = torch.argsort(scores, descending=True)
-            keep = []
-            while order.numel():
-                i = order[0]
-                keep.append(i.item())
-                if order.numel() == 1:
-                    break
-                xx1 = torch.maximum(x1[i], x1[order[1:]])
-                yy1 = torch.maximum(y1[i], y1[order[1:]])
-                xx2 = torch.minimum(x2[i], x2[order[1:]])
-                yy2 = torch.minimum(y2[i], y2[order[1:]])
-                w = (xx2 - xx1).clamp_min(0)
-                h = (yy2 - yy1).clamp_min(0)
-                inter = w * h
-                union = areas[i] + areas[order[1:]] - inter + 1e-9
-                iou = inter / union
-                order = order[1:][iou <= iou_thr]
-            return torch.as_tensor(keep, device=xyxy.device, dtype=torch.long)
+        def _safe_exp(x, lo=-6.0, hi=6.0):
+            # clamp logits to avoid fp16 overflow; exp(6) ≈ 403
+            return torch.exp(x.clamp(min=lo, max=hi))
 
-        # one-time assert print
-        if not hasattr(self, "_decode_once"):
-            self._decode_once = False
+        def _le90(w, h, ang):
+            # tensor-safe LE-90: ensure w >= h; rotate θ by +π/2 where swapped; wrap to [-π/2, π/2)
+            swap = (w < h)  # torch.bool mask
+            w2 = torch.where(swap, h, w)
+            h2 = torch.where(swap, w, h)
+            ang2 = torch.where(swap, ang + math.pi / 2.0, ang)
+            ang2 = torch.remainder(ang2 + math.pi / 2.0, math.pi) - math.pi / 2.0
+            return w2, h2, ang2
 
-        # per-image accumulators
-        out_boxes = [[] for _ in range(B)]
-        out_scores = [[] for _ in range(B)]
-        out_labels = [[] for _ in range(B)]
+        outs_per_level = []
+        # Do all math in fp32 for numerical safety (even under AMP)
+        with torch.cuda.amp.autocast(enabled=False):
+            for li, (m, s) in enumerate(zip(det_maps, strides)):
+                # m: [B, C, h, w], C=(7+nc)
+                p = m.float().contiguous()
+                b, c, h, w = p.shape
+                nc = c - 7
+                if b != B:
+                    raise RuntimeError(f"Batch mismatch at level {li}: det_maps has B={b}, imgs has B={B}")
 
-        L = len(det_maps)
-        max_det_per_level = max(1, math.ceil(max_det / L))
+                # one-time debug
+                if not hasattr(self, "_DBG_DECODE_ONCE"):
+                    print(f"[DECODE ASSERT] level#{li} fmap={h}x{w}  auto_stride={s}")
+                    if li == len(det_maps) - 1:
+                        self._DBG_DECODE_ONCE = True
 
-        for level_idx, dm in enumerate(det_maps):
-            assert dm.dim() == 4, "det map must be (B,C,H,W)"
-            Bb, C, H, W = dm.shape
-            assert Bb == B
-            nc = C - 7
-            assert C == 7 + nc, f"Decoder got C={C}, expected 7+nc (got nc={nc})"
+                # grid (fp32)
+                gy, gx = torch.meshgrid(
+                    torch.arange(h, device=p.device, dtype=torch.float32),
+                    torch.arange(w, device=p.device, dtype=torch.float32),
+                    indexing="ij",
+                )
+                gx = gx.view(1, 1, h, w).expand(b, -1, -1, -1)  # [B,1,h,w]
+                gy = gy.view(1, 1, h, w).expand(b, -1, -1, -1)  # [B,1,h,w]
 
-            # ---- AUTO-STRIDE (robust to order) ----
-            s_h = int(round(Himg / H)) if H > 0 else 1
-            s_w = int(round(Wimg / W)) if W > 0 else 1
-            s = s_w if s_w == s_h else int(round((Himg / max(1, H) + Wimg / max(1, W)) * 0.5))
-            if not self._decode_once:
-                print(f"[DECODE ASSERT] level#{level_idx} fmap={H}x{W}  auto_stride={s}")
+                # split channels
+                tx = p[:, 0:1]  # [B,1,h,w]
+                ty = p[:, 1:2]
+                tw = p[:, 2:3]
+                th = p[:, 3:4]
+                sn = p[:, 4:5]
+                cs = p[:, 5:6]
+                obj = p[:, 6:7]
+                cls = p[:, 7:] if nc > 0 else None  # [B,nc,h,w] or None
 
-            # slices
-            tx = dm[:, 0:1]  # [B,1,H,W]
-            ty = dm[:, 1:2]
-            tw = dm[:, 2:3]
-            th = dm[:, 3:4]
-            tsin = dm[:, 4:5]
-            tcos = dm[:, 5:6]
-            tobj = dm[:, 6:7]
-            tcls = dm[:, 7:] if nc > 0 else None
+                # normalise (sin,cos) to unit circle
+                denom = torch.sqrt(sn * sn + cs * cs + 1e-9)
+                sn = sn / denom
+                cs = cs / denom
+                ang = torch.atan2(sn, cs)  # [B,1,h,w], radians
 
-            # grid
-            gx, gy = make_grid(H, W, dm.device)
+                # YOLO-style decode
+                cx = (gx + torch.sigmoid(tx)) * float(s)
+                cy = (gy + torch.sigmoid(ty)) * float(s)
+                pw = _safe_exp(tw) * float(s)
+                ph = _safe_exp(th) * float(s)
 
-            # map to image coords
-            sx = tx.sigmoid()
-            sy = ty.sigmoid()
-            pw = tw.float().exp() * float(s)
-            ph = th.float().exp() * float(s)
-            ang = torch.atan2(tsin, tcos)
+                # clamp sizes to avoid pathological IoU/NMS behavior
+                max_wh = float(2.0 * max(img_h, img_w))
+                pw = pw.clamp_(min=1.0, max=max_wh)
+                ph = ph.clamp_(min=1.0, max=max_wh)
 
-            cx = (sx + gx) * float(s)
-            cy = (sy + gy) * float(s)
+                # LE-90 canonicalisation
+                pw, ph, ang = _le90(pw, ph, ang)
 
-            # le-90 canonicalisation
-            mask = (pw < ph)
-            pw, ph = torch.where(mask, ph, pw), torch.where(mask, pw, ph)
-            pi_over_2 = ang.new_tensor(math.pi / 2.0)
-            pi = ang.new_tensor(math.pi)
-            ang = ang + mask.to(ang.dtype) * pi_over_2
-            ang = torch.remainder(ang + pi_over_2, pi) - pi_over_2
-
-            # scores / labels
-            if (nc <= 0) or (tcls is None) or (tcls.shape[1] == 0):
-                scores_map = tobj.sigmoid()  # [B,1,H,W]
-                labels_map = torch.zeros_like(scores_map, dtype=torch.long, device=dm.device)
-            else:
-                cls = tcls.sigmoid()  # [B,nc,H,W]
-                if multi_label:
-                    scores_map = cls * tobj.sigmoid()  # [B,nc,H,W]
-                    labels_map = None
+                # scores & labels
+                obj_prob = torch.sigmoid(obj)  # [B,1,h,w]
+                if cls is not None and cls.numel():
+                    cls_prob = torch.sigmoid(cls)  # [B,nc,h,w]
+                    cls_score, cls_idx = cls_prob.max(dim=1, keepdim=True)  # [B,1,h,w]
+                    score = obj_prob * cls_score
+                    labels = cls_idx.to(torch.long)  # [B,1,h,w]
                 else:
-                    scores_map, labels_map = (cls * tobj.sigmoid()).max(dim=1, keepdim=True)  # [B,1,H,W], [B,1,H,W]
+                    score = obj_prob
+                    labels = torch.zeros_like(obj, dtype=torch.long)  # [B,1,h,w]
 
-            # flatten per image
-            cx = cx.view(B, -1).to(dtype)
-            cy = cy.view(B, -1).to(dtype)
-            pw = pw.view(B, -1).to(dtype)
-            ph = ph.view(B, -1).to(dtype)
-            ang = ang.view(B, -1).to(dtype)
+                # threshold
+                keep = score > float(thr)  # [B,1,h,w]
+                if not keep.any():
+                    outs_per_level.append([
+                        {
+                            "boxes": torch.zeros((0, 5), device=p.device, dtype=torch.float32),
+                            "scores": torch.zeros((0,), device=p.device, dtype=torch.float32),
+                            "labels": torch.zeros((0,), device=p.device, dtype=torch.long),
+                        }
+                        for _ in range(B)
+                    ])
+                    continue
 
-            if multi_label and (nc > 0) and (labels_map is None):
-                # Multi-label path: per-class thresholds (kept for completeness)
-                B_, Cc, H_, W_ = scores_map.shape
-                scores_map = scores_map.view(B, Cc, -1)
-                for b in range(B):
-                    s_b = scores_map[b]  # [nc, HW]
-                    keep = s_b > conf_thres
-                    if keep.any():
-                        cls_idx, pos_idx = keep.nonzero(as_tuple=True)
-                        # per-level cap
-                        if cls_idx.numel() > max_det_per_level:
-                            vals = s_b[cls_idx, pos_idx]
-                            topv, topi = torch.topk(vals, k=max_det_per_level, largest=True, sorted=False)
-                            cls_idx = cls_idx[topi];
-                            pos_idx = pos_idx[topi]
-                        out_boxes[b].append(torch.stack([cx[b, pos_idx], cy[b, pos_idx],
-                                                         pw[b, pos_idx], ph[b, pos_idx], ang[b, pos_idx]], dim=1))
-                        out_scores[b].append(s_b[cls_idx, pos_idx])
-                        out_labels[b].append(cls_idx.to(torch.long))
+                # flatten selected
+                cx = cx[keep].view(-1)
+                cy = cy[keep].view(-1)
+                pw = pw[keep].view(-1)
+                ph = ph[keep].view(-1)
+                ang = ang[keep].view(-1)
+                sc = score[keep].view(-1)
+                lb = labels[keep].view(-1)
+
+                # split by batch
+                by, _, jy, ix = keep.nonzero(as_tuple=True)
+                lvl_outs = []
+                for bi in range(B):
+                    sel = (by == bi)
+                    if sel.any():
+                        boxes = torch.stack([cx[sel], cy[sel], pw[sel], ph[sel], ang[sel]], dim=1)
+                        scores = sc[sel]
+                        labs = lb[sel]
+                        if boxes.shape[0] > int(max_det):
+                            topk = torch.topk(scores, k=int(max_det), dim=0).indices
+                            boxes, scores, labs = boxes[topk], scores[topk], labs[topk]
+                    else:
+                        boxes = torch.zeros((0, 5), device=p.device, dtype=torch.float32)
+                        scores = torch.zeros((0,), device=p.device, dtype=torch.float32)
+                        labs = torch.zeros((0,), device=p.device, dtype=torch.long)
+                    lvl_outs.append({"boxes": boxes, "scores": scores, "labels": labs})
+                outs_per_level.append(lvl_outs)
+
+        # fuse levels per image
+        fused = []
+        for bi in range(B):
+            bi_boxes, bi_scores, bi_labels = [], [], []
+            for lvl_outs in outs_per_level:
+                bi_boxes.append(lvl_outs[bi]["boxes"])
+                bi_scores.append(lvl_outs[bi]["scores"])
+                bi_labels.append(lvl_outs[bi]["labels"])
+            if bi_boxes:
+                boxes = torch.cat(bi_boxes, dim=0)
+                scores = torch.cat(bi_scores, dim=0)
+                labels = torch.cat(bi_labels, dim=0)
+                if boxes.shape[0] > int(max_det):
+                    topk = torch.topk(scores, k=int(max_det), dim=0).indices
+                    boxes, scores, labels = boxes[topk], scores[topk], labels[topk]
             else:
-                scores = scores_map.view(B, -1)
-                labels = (labels_map.view(B, -1).long()
-                          if (labels_map is not None) else torch.zeros_like(scores, dtype=torch.long, device=dm.device))
-                keep = scores > conf_thres
-                for b in range(B):
-                    k = keep[b].nonzero(as_tuple=False).squeeze(1)
-                    if k.numel() == 0:
-                        continue
-                    # per-level cap so P3 cannot dominate
-                    nb = min(int(max_det_per_level), int(k.numel()))
-                    topk = torch.topk(scores[b, k], k=nb, largest=True, sorted=False).indices
-                    idx = k[topk]
-                    out_boxes[b].append(torch.stack([cx[b, idx], cy[b, idx],
-                                                     pw[b, idx], ph[b, idx], ang[b, idx]], dim=1))
-                    out_scores[b].append(scores[b, idx])
-                    out_labels[b].append(labels[b, idx])
-
-        self._decode_once = True
-
-        # pack per-image + light NMS + final global cap
-        results = []
-        for b in range(B):
-            if out_boxes[b]:
-                boxes = torch.cat(out_boxes[b], dim=0)
-                scores = torch.cat(out_scores[b], dim=0)
-                labels = torch.cat(out_labels[b], dim=0)
-                # AABB NMS (fast, keeps level diversity while scores are flat)
-                if use_nms and boxes.shape[0] > 0:
-                    aabb = aabb_from_obb(boxes)
-                    keep = nms_aabb(aabb, scores, iou_thres)
-                    if keep.numel() > 0:
-                        boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
-                # final cap
-                if boxes.shape[0] > max_det:
-                    topk = torch.topk(scores, k=max_det, largest=True, sorted=False).indices
-                    boxes = boxes[topk]
-                    scores = scores[topk]
-                    labels = labels[topk]
-            else:
-                boxes = torch.zeros((0, 5), device=device, dtype=dtype)
-                scores = torch.zeros((0,), device=device, dtype=dtype)
-                labels = torch.zeros((0,), device=device, dtype=torch.long)
-            results.append({"boxes": boxes, "scores": scores, "labels": labels})
-
-        return results
+                boxes = torch.zeros((0, 5), device=imgs.device, dtype=torch.float32)
+                scores = torch.zeros((0,), device=imgs.device, dtype=torch.float32)
+                labels = torch.zeros((0,), device=imgs.device, dtype=torch.long)
+            fused.append({"boxes": boxes, "scores": scores, "labels": labels})
+        return fused

@@ -37,7 +37,7 @@ class WarmupState:
 def build_yolo_scheduler(
     optimizer: Optimizer,
     epochs: int,
-    lr0: float = 0.002,
+    lr0: float = 0.01,
     lrf: float = 0.01,
     warmup_epochs: float = 3.0,
     momentum: float = 0.937,
