@@ -1,4 +1,3 @@
-
 # src/engine/evaluator.py
 from __future__ import annotations
 
@@ -104,6 +103,13 @@ class Evaluator:
 
     @torch.no_grad()
     def evaluate(self, model: torch.nn.Module, val_loader, device: torch.device, max_images: Optional[int] = None) -> Dict[str, float]:
+        # ---------- rank-safe: do nothing on non-zero ranks (trainer should call only on rank-0, but guard anyway) ----------
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return {"mAP50": 0.0, "mAP": 0.0, "pck@0.05": 0.0, "pck_any@0.05": 0.0,
+                        "tps": 0.0, "pred_per_img": 0.0, "images": 0, "best_iou": 0.0,
+                        "recall@0.1": 0.0, "recall@0.3": 0.0, "recall@0.5": 0.0}
+
         try:
             _ = _get_first_batch(val_loader)
         except StopIteration:
@@ -141,16 +147,15 @@ class Evaluator:
             # ---- Decode; always produce list of len B, even on failure ----
             try:
                 preds_list = model_eval.decode_obb_from_pyramids(
-                    det_maps, imgs,
-                    conf_thres=self.cfg["conf_thres"],
-                    iou_thres=self.cfg["iou_thres"],
-                    multi_label=self.cfg["multi_label"],
-                    agnostic=self.cfg["agnostic"],
-                    max_det=self.cfg["max_det"],
-                    use_nms=self.cfg["use_nms"],
+                    det_maps,
+                    imgs,
+                    strides=(8, 16, 32),
+                    score_thr=self.cfg.get("conf_thres", 0.25),  # lenient early threshold
+                    max_det=self.cfg.get("max_det", 300),
+                    use_nms=True,
                 )
             except TypeError:
-                # Older signature compatibility
+                # Older signature compatibility (score_thr)
                 try:
                     preds_list = model_eval.decode_obb_from_pyramids(
                         det_maps, imgs,
@@ -307,7 +312,7 @@ class Evaluator:
 
                     # Optional PCK (if you have kpts & roi pipeline)
                     uv_img = torch.empty((0, 2), device=device)
-                    uv_img_by_b = []  # kept to mirror your earlier structure; no-op here
+                    _ = uv_img  # placeholder to mirror structure
 
                     if self.cfg["print_every"]:
                         img_seen += 1
@@ -334,7 +339,7 @@ class Evaluator:
 
         return self._finalize_and_log(stats)
 
-    # --------- IoU helpers (unchanged from your working file) ---------
+    # --------- IoU helpers (unchanged) ---------
     def _iou_matrix(self, boxes: torch.Tensor, gts: torch.Tensor) -> torch.Tensor:
         use_aabb = bool(int(os.getenv("EVAL_USE_AABB", "0")))
         if use_aabb:

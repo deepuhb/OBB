@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import math
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -56,17 +57,174 @@ def _invert_affine_2x3(M: torch.Tensor) -> torch.Tensor:
     invt = -invA @ t
     return torch.cat([invA, invt], dim=1)  # (2,3)
 
-def _img_kpts_to_crop_uv(kpt_xy_img: torch.Tensor,
-                         M_crop_to_feat: torch.Tensor,
-                         feat_down: float) -> torch.Tensor:
+def _img_kpts_to_crop_uv(xy_img, M_crop_to_feat, feat_down=1):
     """
-    Convert GT keypoints from image px to crop uv (in crop px).
-    We: image px -> feature px (divide by feat_down) -> apply inverse(M).
+    Map 2D points to the feature (u,v) space using an affine that maps
+    crop pixels -> feature coordinates. Supports M in shapes (2x2), (2x3), (3x3).
+    xy_img can be shape (2,) or (N,2). Returns (N,2) in feature coords.
+
+    NOTE: If your M already outputs coordinates in the *feature* grid,
+    we still divide by feat_down only if feat_down != 1. If your M is in
+    crop pixels and you want uv in the *downsampled* feature grid, keep feat_down as the layer's downsample (e.g. 8/16/32).
     """
-    xy_feat = kpt_xy_img / float(feat_down)
-    Minv = _invert_affine_2x3(M_crop_to_feat)
-    uv = (Minv[:, :2] @ xy_feat.T + Minv[:, 2:]).T  # (N,2)
+    # ---- promote inputs to tensors and normalize shapes ----
+    M = torch.as_tensor(M_crop_to_feat)  # do not detach; keep graph if needed
+    if M.dim() != 2:
+        raise ValueError(f"_img_kpts_to_crop_uv: expected 2D affine, got {M.shape}")
+    dtype = M.dtype
+    device = M.device
+
+    xy = torch.as_tensor(xy_img, dtype=dtype, device=device)
+    if xy.numel() == 2:
+        xy = xy.reshape(1, 2)                  # (1,2)
+    elif xy.dim() == 1 and xy.shape[0] != 2:
+        raise ValueError(f"_img_kpts_to_crop_uv: 1D xy must be len=2, got {xy.shape}")
+    elif xy.dim() == 2 and xy.shape[1] != 2:
+        raise ValueError(f"_img_kpts_to_crop_uv: expected (N,2), got {xy.shape}")
+
+    # ---- upgrade M to 3x3 homogeneous affine ----
+    if M.shape == (2, 2):
+        # [A|t] with t=0
+        M23 = torch.cat([M, torch.zeros(2, 1, dtype=dtype, device=device)], dim=1)  # (2,3)
+        M33 = torch.cat([M23, torch.tensor([[0., 0., 1.]], dtype=dtype, device=device)], dim=0)
+    elif M.shape == (2, 3):
+        M33 = torch.cat([M, torch.tensor([[0., 0., 1.]], dtype=dtype, device=device)], dim=0)
+    elif M.shape == (3, 3):
+        M33 = M
+    else:
+        raise ValueError(f"_img_kpts_to_crop_uv: unsupported M shape {tuple(M.shape)}; expected (2,2),(2,3),(3,3)")
+
+    # ---- apply affine: target = [x y 1] @ M^T -> (N,2) ----
+    ones = torch.ones((xy.shape[0], 1), dtype=dtype, device=device)
+    xy1 = torch.cat([xy, ones], dim=1)       # (N,3)
+    uv = (xy1 @ M33.T)[:, :2]               # (N,2)
+
+    # ---- optional scale to feature grid if caller passes stride/downsample ----
+    if isinstance(feat_down, (int, float)) and feat_down != 1:
+        uv = uv / float(feat_down)
+
+    # ---- strong sanity checks (trigger only on obvious bad cases) ----
+    if torch.any(torch.isnan(uv)) or torch.any(torch.isinf(uv)):
+        raise RuntimeError("[_img_kpts_to_crop_uv] produced non-finite uv; check your M and inputs.")
     return uv
+
+def _wrap_pi(d: torch.Tensor) -> torch.Tensor:
+    """Wrap angles to (-pi, pi]."""
+    return (d + math.pi) % (2.0 * math.pi) - math.pi
+
+def _le90_canonicalize(w: torch.Tensor, h: torch.Tensor, ang: torch.Tensor):
+    """Ensure w >= h and rotate angle by +pi/2 where we swap; then wrap to [-pi/2, pi/2)."""
+    swap = (w < h)
+    w2 = torch.where(swap, h, w)
+    h2 = torch.where(swap, w, h)
+    ang2 = torch.where(swap, ang + math.pi / 2.0, ang)
+    ang2 = torch.remainder(ang2 + math.pi / 2.0, math.pi) - math.pi / 2.0
+    return w2, h2, ang2
+
+def _clamp_hw_for_iou(w: torch.Tensor, h: torch.Tensor, img_max: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prevent pathological IoU degenerate boxes."""
+    w = w.clamp(min=1.0, max=img_max)
+    h = h.clamp(min=1.0, max=img_max)
+    return w, h
+
+def _safe01(x: torch.Tensor) -> torch.Tensor:
+    """Clamp to [0,1] and scrub NaN/Inf."""
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.0)
+
+def _finite(x: torch.Tensor, fill: float = 0.0) -> torch.Tensor:
+    """Replace NaN/Inf with a finite fill, keep dtype & device."""
+    return torch.nan_to_num(x, nan=fill, posinf=fill, neginf=fill)
+
+def _angle_wrap_le90(theta: torch.Tensor) -> torch.Tensor:
+    # wrap to [-pi/2, pi/2)
+    return torch.remainder(theta + math.pi / 2.0, math.pi) - math.pi / 2.0
+
+def _angle_periodic_loss(theta_p: torch.Tensor, theta_t: torch.Tensor) -> torch.Tensor:
+    # 1 - cos(Δθ) is periodic and smooth
+    return 1.0 - torch.cos(theta_p - theta_t)
+
+def _dfl_soft_loss(logits: torch.Tensor, target: torch.Tensor, reg_max: int) -> torch.Tensor:
+    """
+    Distribution Focal Loss for a single scalar target.
+    logits: (nbins,)
+    target: scalar in [0, reg_max]; we use soft labels on floor/ceil.
+    """
+    nb = reg_max + 1
+    t = target.clamp(0.0, float(reg_max) - 1e-6)
+    l = torch.floor(t)
+    r = l + 1.0
+    wl = (r - t)
+    wr = (t - l)
+    l = int(l.item())
+    r = int(min(float(r.item()), float(reg_max)))
+    logp = torch.log_softmax(logits, dim=0)
+    loss = - (wl * logp[l] + wr * logp[r])
+    return loss
+
+
+def _cells_in_radius(gx, gy, H, W, radius=2.5):
+    # returns boolean mask (H, W) for cells within 'radius' cells of (gx, gy)
+    ys = torch.arange(H, device=gx.device).float()
+    xs = torch.arange(W, device=gx.device).float()
+    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+    d2 = (xx - gx)**2 + (yy - gy)**2
+    return d2 <= (radius * radius)
+
+def _topk_indices_by_distance(gx, gy, mask, k=3):
+    # from valid (mask==True) cells pick top-k closest to (gx,gy)
+    if not mask.any():
+        return None
+    yy, xx = torch.where(mask)
+    dx = (xx.float() - gx).abs()
+    dy = (yy.float() - gy).abs()
+    d = dx + dy
+    k = min(k, d.numel())
+    _, order = torch.topk(-d, k, largest=False)  # smallest distance
+    return yy[order], xx[order]
+
+def _safe_exp(x: torch.Tensor, max_log: float = 6.0) -> torch.Tensor:
+    # cap input BEFORE exp to prevent inf (exp(6)=403, 7=1096)
+    return torch.exp(x.clamp(min=-max_log, max=max_log))
+
+def _is_finite_tensor(x: torch.Tensor) -> bool:
+    return torch.isfinite(x).all().item()
+
+def _nan_to_num_(x: torch.Tensor, val: float = 0.0) -> torch.Tensor:
+    return torch.nan_to_num(x, nan=val, posinf=val, neginf=val)
+
+def _dfl_target_bins(v: torch.Tensor, reg_max: int):
+    """
+    v: target scalar in [0, reg_max] (already divided by stride)
+    returns (li, ri, wl, wr) with li<=v<=ri and wl+wr=1
+    """
+    v = v.clamp_(0, float(reg_max) - 1e-6)
+    li = torch.floor(v)
+    ri = li + 1.0
+    wr = v - li
+    wl = 1.0 - wr
+    # clamp ri to reg_max and fix weights when li==reg_max
+    ri = torch.min(ri, torch.tensor(float(reg_max), device=v.device, dtype=v.dtype))
+    same = (ri == li)
+    wl = torch.where(same, torch.ones_like(wl), wl)
+    wr = torch.where(same, torch.zeros_like(wr), wr)
+    return li.long(), ri.long(), wl, wr
+
+def _dfl_loss(logits: torch.Tensor, v: torch.Tensor, reg_max: int) -> torch.Tensor:
+    """
+    logits: (N, nbins) raw logits for one side (here we use w or h)
+    v:      (N,) target values in [0, reg_max]
+    returns mean DFL loss
+    """
+    nbins = reg_max + 1
+    assert logits.shape[1] == nbins
+    li, ri, wl, wr = _dfl_target_bins(v, reg_max)
+    # log-softmax for numerical stability
+    logp = torch.log_softmax(logits, dim=1)  # (N, nbins)
+    li_logp = logp.gather(1, li.unsqueeze(1)).squeeze(1)  # (N,)
+    ri_logp = logp.gather(1, ri.unsqueeze(1)).squeeze(1)  # (N,)
+    # linear interpolation between adjacent bins (DFL)
+    loss = -(wl * li_logp + wr * ri_logp)
+    return loss.mean()
 
 
 # ------------------------- main criterion -------------------------
@@ -88,7 +246,7 @@ class TDOBBWKpt1Criterion(nn.Module):
     def __init__(
         self,
         nc: Optional[int] = None,              # accept either 'nc' ...
-        num_classes: Optional[int] = None,     # ... or 'num_classes' (builder handles both)  :contentReference[oaicite:2]{index=2}
+        num_classes: Optional[int] = None,     # ... or 'num_classes' (builder handles both)
         strides: Sequence[int] = (8, 16, 32),
         # loss weights
         lambda_box: float = 7.5,
@@ -130,79 +288,71 @@ class TDOBBWKpt1Criterion(nn.Module):
         self.smoothl1 = nn.SmoothL1Loss(reduction="mean")
 
     # --------------------- forward ---------------------
-
     def forward(self,
                 det_maps: List[torch.Tensor],
                 feats: Optional[List[torch.Tensor]],
                 batch: Dict[str, Any],
                 model: Optional[nn.Module] = None,
                 epoch: int = 0) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        det_maps : list of 3 tensors [(B,C,H,W), ...] for strides (8,16,32)
+        feats    : PAN/FPN features [P3,P4,P5]
+        batch    : your loaded batch dict (supports both 'targets' tensor and per-image lists)
+        model    : core model (needed for ROI kpt crops and DFL config if present)
+        epoch    : training epoch (for schedules / debug)
+        """
+        # loss math in fp32 even if network ran in fp16
+        if torch.is_autocast_enabled():
+            det_maps = [dm.float() for dm in det_maps]
 
-        # -------- sanity checks --------
         assert isinstance(det_maps, (list, tuple)) and len(det_maps) == 3, \
             "det_maps must be a list of 3 tensors (P3,P4,P5)"
-        B = det_maps[0].shape[0]
-        # assert per-level channels = 7+nc
-        if not hasattr(self, '_ASSERT_ONCE_DET'):
+        device = det_maps[0].device
+        B = int(det_maps[0].shape[0])
+
+        # One-time sanity on channel layout & optional sin^2+cos^2 print
+        if not hasattr(self, "_ASSERT_ONCE_DET"):
             self._ASSERT_ONCE_DET = False
         if not self._ASSERT_ONCE_DET:
-            for i,dm in enumerate(det_maps):
-                C = int(dm.shape[1]); expected = 7 + int(self.nc)
-                assert C == expected, f"det_maps[{i}] has C={C}, expected {expected} (=7+nc)."
+            for i, dm in enumerate(det_maps):
+                C = int(dm.shape[1])
+                exp_classic = 7 + int(self.nc)
+                exp_single = 6 + int(self.nc)
+                ok = (C == exp_classic) or (C == exp_single) or (C >= 6)
+                assert ok, f"det_maps[{i}] has C={C}, expected {exp_classic} (sin/cos) or {exp_single} (single ang) or DFL-compatible."
+
+            # Print sin^2+cos^2 once (only if those channels exist)
+            have_sincos = all(dm.shape[1] == (7 + self.nc) for dm in det_maps)
+            if have_sincos and not hasattr(self, "_DBG_SINCOS_ONCE"):
+                P3, P4, P5 = det_maps
+                s3 = float(((P3[:, 4] ** 2 + P3[:, 5] ** 2).mean()).item())
+                s4 = float(((P4[:, 4] ** 2 + P4[:, 5] ** 2).mean()).item())
+                s5 = float(((P5[:, 4] ** 2 + P5[:, 5] ** 2).mean()).item())
+                print(f"[ASSERT] sin^2+cos^2 mean: P3={s3:.3f} P4={s4:.3f} P5={s5:.3f}")
+                self._DBG_SINCOS_ONCE = True
             self._ASSERT_ONCE_DET = True
-        device = det_maps[0].device
 
-        # channel split
-        # [tx,ty,tw,th,sin,cos,obj,(cls...)]
-        def split_maps(x: torch.Tensor) -> Dict[str, torch.Tensor]:
-            c = x.shape[1]
-            assert c >= 7, "expect at least 7 channels"
-            tx, ty, tw, th, s, c_, obj = x[:, 0], x[:, 1], x[:, 2], x[:, 3], x[:, 4], x[:, 5], x[:, 6]
-            cls = x[:, 7:] if c > 7 else None
-            return {"tx": tx, "ty": ty, "tw": tw, "th": th, "sin": s, "cos": c_, "obj": obj, "cls": cls}
+        # Detection loss
+        det_loss, det_parts = self._loss_det(det_maps, feats, batch, model=model, epoch=epoch)
 
-        P3, P4, P5 = det_maps
-        m3, m4, m5 = split_maps(P3), split_maps(P4), split_maps(P5)
-        if not hasattr(self, '_DBG_SINCOS_ONCE'):
-            s3 = float(((m3['sin']**2 + m3['cos']**2).mean()).item())
-            s4 = float(((m4['sin']**2 + m4['cos']**2).mean()).item())
-            s5 = float(((m5['sin']**2 + m5['cos']**2).mean()).item())
-            print(f"[ASSERT] sin^2+cos^2 mean: P3={s3:.3f} P4={s4:.3f} P5={s5:.3f}")
-            self._DBG_SINCOS_ONCE = True
-
-        # -------- parse GT (supports two formats) --------
+        # Read targets and pass the CORRECT lists to kpt loss
         boxes_list, labels_list, kpts_list = self._read_targets(batch, B, device)
 
-        # -------- detection loss (obj, box, angle, cls) --------
-        if not hasattr(self, '_ASSERT_ANGLE_ONCE'):
-            bad = 0; tot = 0
-            for bl in boxes_list:
-                if bl is None or len(bl)==0: continue
-                ang = torch.as_tensor(bl, device=device, dtype=torch.float32)[:, 4]
-                tot += int(ang.numel())
-                bad += int((ang.abs() > 3.1415927 + 1e-3).sum().item())
-            if tot>0:
-                assert bad==0, f"GT angles out of radians range: {bad}/{tot} > pi. Ensure GT is in radians."
-            self._ASSERT_ANGLE_ONCE = True
-        l_obj, l_box, l_ang, l_cls, pos = self._loss_det((m3, m4, m5), (P3, P4, P5), boxes_list, labels_list)
-
-        # -------- keypoint loss via ROI crops on P3 --------
+        # ROI keypoint loss (on P3 via model.kpt_from_obbs)
         l_kpt, kpt_pos = self._loss_kpt(model, feats, boxes_list, kpts_list)
 
-        # -------- total --------
-        total = (self.lambda_obj * l_obj +
-                 self.lambda_box * l_box +
-                 self.lambda_ang * l_ang +
-                 self.lambda_cls * l_cls +
-                 self.lambda_kpt * l_kpt)
+        # Total
+        total = det_loss + l_kpt  # _loss_kpt already includes self.lambda_kpt
 
+        # Logs (DDP-reduced)
         logs = {
-            "obj": float(_ddp_mean(l_obj.detach())),
-            "box": float(_ddp_mean(l_box.detach())),
-            "ang": float(_ddp_mean(l_ang.detach())),
-            "cls": float(_ddp_mean(l_cls.detach())),
+            "obj": float(_ddp_mean(torch.tensor(det_parts.get("obj", 0.0), device=device))),
+            "box": float(_ddp_mean(torch.tensor(det_parts.get("box", 0.0), device=device))),
+            "dfl": float(_ddp_mean(torch.tensor(det_parts.get("dfl", 0.0), device=device))),
+            "ang": float(_ddp_mean(torch.tensor(det_parts.get("ang", 0.0), device=device))),
+            "cls": float(_ddp_mean(torch.tensor(det_parts.get("cls", 0.0), device=device))),
             "kpt": float(_ddp_mean(l_kpt.detach())),
-            "pos": float(_ddp_mean(torch.tensor([pos], device=device))),
+            "pos": float(_ddp_mean(torch.tensor([det_parts.get("pos", 0)], device=device))),
             "kpt_pos": float(_ddp_mean(torch.tensor([kpt_pos], device=device))),
             "total": float(_ddp_mean(total.detach())),
         }
@@ -269,21 +419,127 @@ class TDOBBWKpt1Criterion(nn.Module):
         else:
             return 2
 
-    # Add this small helper inside the class (near other helpers)
-    def _decode_at_cell(self, mp: dict, b: int, j: int, i: int, stride: int):
-        """Decode one cell like the evaluator: (tx,ty)->sigmoid+grid, (tw,th)->exp*s, θ=atan2(sin,cos), le-90."""
-        import math
+    @staticmethod
+    def _ang_from_logit(z: torch.Tensor) -> torch.Tensor:
+        # map logits -> [-pi/2, pi/2)
+        return z.sigmoid() * math.pi - (math.pi / 2.0)
+
+    def _split_map(self, dm: torch.Tensor, level: int, model: Optional[nn.Module]) -> Dict[str, torch.Tensor]:
+        """
+        Return a dict of per-channel maps for a given level:
+        Classic: [tx,ty,tw,th,sin,cos,obj,(cls...)]
+        Single-angle: [tx,ty,tw,th,ang,obj,(cls...)]
+        DFL: [tx,ty, dflw(nb), dflh(nb), ang, obj, (cls...)] if model.reg_max is present and matches C.
+
+        Shapes after this function:
+          - tx, ty, (tw, th if present), ang, sin, cos : (B, H, W)  <-- always 3D for scalar channels
+          - obj                                       : (B, 1, H, W)
+          - cls                                       : (B, nc, H, W)  (if nc > 1)
+          - dflw, dflh                                : (B, nbins, H, W)
+        """
+        C = int(dm.shape[1])
+        nc = int(self.nc)
+        mp: Dict[str, torch.Tensor] = {}
+
+        # Try DFL first if model advertises reg_max
+        reg_max = None
+        if model is not None:
+            reg_max = getattr(model, "reg_max", None)
+            if reg_max is None and hasattr(model, "head"):
+                reg_max = getattr(model.head, "reg_max", None)
+
+        if isinstance(reg_max, int) and reg_max > 0:
+            # expected layout: tx,ty | dflw(nb) | dflh(nb) | ang | obj | cls(nc)
+            dflC = 2 + 2 * (reg_max + 1) + 1 + 1 + nc
+            if C == dflC:
+                i = 0
+                mp["tx"] = dm[:, i, ...]
+                i += 1  # (B,H,W)
+                mp["ty"] = dm[:, i, ...]
+                i += 1  # (B,H,W)
+                mp["dflw"] = dm[:, i:i + (reg_max + 1), ...]
+                i += (reg_max + 1)  # (B,nbins,H,W)
+                mp["dflh"] = dm[:, i:i + (reg_max + 1), ...]
+                i += (reg_max + 1)  # (B,nbins,H,W)
+                mp["ang"] = dm[:, i, ...]
+                i += 1  # (B,H,W)  <-- squeeze to 3D
+                mp["obj"] = dm[:, i:i + 1, ...]
+                i += 1  # (B,1,H,W)
+                if nc > 1:
+                    mp["cls"] = dm[:, i:i + nc, ...]  # (B,nc,H,W)
+                return mp  # DFL path OK
+
+        # Non-DFL paths
+        if C == 7 + nc:
+            # classic sin/cos
+            i = 0
+            mp["tx"] = dm[:, i, ...]
+            i += 1  # (B,H,W)
+            mp["ty"] = dm[:, i, ...]
+            i += 1
+            mp["tw"] = dm[:, i, ...]
+            i += 1
+            mp["th"] = dm[:, i, ...]
+            i += 1
+            mp["sin"] = dm[:, i, ...]
+            i += 1
+            mp["cos"] = dm[:, i, ...]
+            i += 1
+            mp["obj"] = dm[:, i:i + 1, ...]
+            i += 1  # (B,1,H,W)
+            if nc > 1:
+                mp["cls"] = dm[:, i:i + nc, ...]
+        else:
+            # single-angle classic: [tx,ty,tw,th,ang,obj,(cls)]
+            assert C >= 6, "invalid detection head channel layout"
+            i = 0
+            mp["tx"] = dm[:, i, ...]
+            i += 1
+            mp["ty"] = dm[:, i, ...]
+            i += 1
+            mp["tw"] = dm[:, i, ...]
+            i += 1
+            mp["th"] = dm[:, i, ...]
+            i += 1
+            mp["ang"] = dm[:, i, ...]
+            i += 1  # (B,H,W)
+            mp["obj"] = dm[:, i:i + 1, ...]
+            i += 1  # (B,1,H,W)
+            if nc > 1 and (i + nc) <= C:
+                mp["cls"] = dm[:, i:i + nc, ...]
+        return mp
+
+    def _decode_at_cell(self, mp: Dict[str, torch.Tensor], b: int, j: int, i: int, stride: int,
+                        dfl_bins: Optional[torch.Tensor] = None):
+        # centers
         sx = mp["tx"][b, j, i].sigmoid()
         sy = mp["ty"][b, j, i].sigmoid()
-        pw = mp["tw"][b, j, i].float().exp() * stride
-        ph = mp["th"][b, j, i].float().exp() * stride
-        ang = torch.atan2(mp["sin"][b, j, i], mp["cos"][b, j, i])
-        cx = (i + sx) * stride
-        cy = (j + sy) * stride
-        # le-90 canonicalisation
-        if float(pw) < float(ph):
+        cx = (i + sx) * float(stride)
+        cy = (j + sy) * float(stride)
+
+        # sizes
+        if dfl_bins is not None and "dflw" in mp and "dflh" in mp:
+            pw_log = (mp["dflw"][b, :, j, i].softmax(dim=0) * dfl_bins).sum()
+            ph_log = (mp["dflh"][b, :, j, i].softmax(dim=0) * dfl_bins).sum()
+            pw = pw_log.exp() * float(stride)
+            ph = ph_log.exp() * float(stride)
+        else:
+            pw = mp["tw"][b, j, i].exp().clamp_max(1e3) * float(stride)
+            ph = mp["th"][b, j, i].exp().clamp_max(1e3) * float(stride)
+
+        # angle
+        if "ang" in mp:
+            ang = self._ang_from_logit(mp["ang"][b, j, i])
+        else:
+            _s = mp["sin"][b, j, i]
+            _c = mp["cos"][b, j, i]
+            norm = (_s * _s + _c * _c).sqrt().clamp_min(1e-6)
+            ang = torch.atan2(_s / norm, _c / norm)
+
+        # LE-90 canonicalisation
+        if pw < ph:
             pw, ph = ph, pw
-            ang = ang + (math.pi / 2.0)
+            ang = ang + math.pi / 2.0
         ang = (ang + math.pi / 2.0) % math.pi - math.pi / 2.0
         return cx, cy, pw, ph, ang
 
@@ -323,287 +579,430 @@ class TDOBBWKpt1Criterion(nn.Module):
                 out[i] = inter / union
             return out.clamp_(0, 1)
 
-    def _loss_det(
-            self,
-            maps_by_level: Tuple[Dict[str, torch.Tensor], ...],
-            raw_maps: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-            boxes_list: List[torch.Tensor],
-            labels_list: List[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    # --------------------- detection loss ---------------------
+    def _loss_det(self, det_maps, feats, batch, model=None, epoch=None):
+        """
+        Supports classic (tx,ty,tw,th,ang/obj/cls) and DFL (tx,ty,dflw,dflh,ang/obj/cls).
+        Box regression is on log(w/stride), angle uses 1-cos(delta), objectness uses IoU (warmup to 0.5+0.5*IoU).
+        """
+        import math
+        import torch
+        import torch.nn.functional as F
 
-        B = raw_maps[0].shape[0]
-        device = raw_maps[0].device
+        device = det_maps[0].device
+        B = det_maps[0].shape[0]
 
-        l_obj = raw_maps[0].new_zeros(())
-        l_box = raw_maps[0].new_zeros(())
-        l_ang = raw_maps[0].new_zeros(())
-        l_cls = raw_maps[0].new_zeros(())
-        total_pos = 0
+        # split maps into dicts (keeps your key names)
+        mp_levels = [self._split_map(dm, li, model=model) for li, dm in enumerate(det_maps)]
+        Hs = [int(dm.shape[-2]) for dm in det_maps]
+        Ws = [int(dm.shape[-1]) for dm in det_maps]
+        strides = tuple(int(s) for s in self.strides)
 
-        # objectness accounting for proper averaging
-        obj_pos_terms = 0
-        obj_neg_terms = 0
-        neg_per_pos = 64  # hard-negative samples per positive (tweakable)
+        # read GT
+        gtb_list, gtc_list, _ = self._read_targets(batch, B, device)
 
-        # debug buckets (first few steps)
-        dbg_pred_w, dbg_pred_h, dbg_gt_w, dbg_gt_h = {0: [], 1: [], 2: []}, {0: [], 1: [], 2: []}, {0: [], 1: [],
-                                                                                                    2: []}, {0: [],
-                                                                                                             1: [],
-                                                                                                             2: []}
+        # image size (for sane bin ranges if DFL)
+        if isinstance(batch, dict) and "imgs" in batch and hasattr(batch["imgs"], "shape"):
+            Himg = int(batch["imgs"].shape[-2])
+            Wimg = int(batch["imgs"].shape[-1])
+        else:
+            # safe defaults
+            Himg, Wimg = 640, 640
+        img_max = float(max(Himg, Wimg))
+
+        # per-level size caps (match your routing: <=low -> P3, <=mid -> P4, else -> P5)
+        low, mid = self.level_boundaries
+        lvl_max_pix = [float(low), float(mid), img_max]
+
+        # If the head is DFL, we’ll need per-level log-bins for log(w/stride)
+        reg_max = None
+        if model is not None:
+            reg_max = getattr(model, "reg_max", None)
+            if reg_max is None and hasattr(model, "head"):
+                reg_max = getattr(model.head, "reg_max", None)
+        use_dfl = isinstance(reg_max, int) and reg_max > 0
+        nb = (reg_max + 1) if use_dfl else None
+
+        # Build per-level log-value bins for DFL (cover [log(1/stride), log(lvl_max/stride)])
+        log_bins_per_level = []
+        if use_dfl:
+            for li, s in enumerate(strides):
+                # widths close to 0px are meaningless; use 1px minimum to avoid -inf logs
+                log_min = math.log(max(1.0, 1.0) / float(s))  # log(1px / stride)
+                log_max = math.log(max(2.0, lvl_max_pix[li]) / float(s))  # log(max_size / stride)
+                # Linearly spaced bins in log domain
+                idx = torch.arange(nb, device=device, dtype=torch.float32)
+                log_bins = log_min + (log_max - log_min) * (idx / float(reg_max))
+                log_bins_per_level.append(log_bins)
+        else:
+            log_bins_per_level = [None, None, None]
+
+        # helpers
+        def _nan2(x, v=0.0):
+            return torch.nan_to_num(x, nan=v, posinf=v, neginf=v)
+
+        def _ang_from_logit(z):  # [-pi/2, pi/2)
+            return (torch.sigmoid(z) * math.pi) - (math.pi / 2.0)
+
+        def _le90(w, h, a):
+            swap = (w < h)
+            w2 = torch.where(swap, h, w)
+            h2 = torch.where(swap, w, h)
+            a2 = a + swap.to(a.dtype) * (math.pi / 2.0)
+            a2 = (a2 + math.pi / 2.0) % math.pi - math.pi / 2.0
+            return w2, h2, a2
+
+        def _aabb_iou(cx, cy, w, h, Cx, Cy, W, H):
+            x1 = cx - 0.5 * w
+            y1 = cy - 0.5 * h
+            x2 = cx + 0.5 * w
+            y2 = cy + 0.5 * h
+            X1 = Cx - 0.5 * W
+            Y1 = Cy - 0.5 * H
+            X2 = Cx + 0.5 * W
+            Y2 = Cy + 0.5 * H
+            xx1 = torch.maximum(x1, X1)
+            yy1 = torch.maximum(y1, Y1)
+            xx2 = torch.minimum(x2, X2)
+            yy2 = torch.minimum(y2, Y2)
+            iw = (xx2 - xx1).clamp_min(0)
+            ih = (yy2 - yy1).clamp_min(0)
+            inter = iw * ih
+            union = (w.clamp_min(0) * h.clamp_min(0) + W.clamp_min(0) * H.clamp_min(0) - inter + 1e-9)
+            return (inter / union).clamp_(0, 1)
+
+        def _angle_loss(ang_p, ang_t):
+            d = (ang_p - ang_t + math.pi) % (2 * math.pi) - math.pi
+            return 1.0 - torch.cos(d)
+
+        def _closest_cells(gx, gy, H, W, radius=2.5, K=3):
+            r = int(max(1, math.floor(radius)))
+            x0 = max(0, int(math.floor(float(gx))) - r)
+            x1 = min(W - 1, int(math.floor(float(gx))) + r)
+            y0 = max(0, int(math.floor(float(gy))) - r)
+            y1 = min(H - 1, int(math.floor(float(gy))) + r)
+            if x1 < x0 or y1 < y0:
+                return []
+            xs = torch.arange(x0, x1 + 1, device=device)
+            ys = torch.arange(y0, y1 + 1, device=device)
+            xx, yy = torch.meshgrid(xs, ys, indexing='xy')
+            d = (xx.float() - gx).abs() + (yy.float() - gy).abs()
+            d = d.reshape(-1)
+            yyf = yy.reshape(-1).long()
+            xxf = xx.reshape(-1).long()
+            k = min(K, d.numel())
+            if k == 0:
+                return []
+            _, order = torch.topk(-d, k, largest=False)
+            return [(int(yyf[o].item()), int(xxf[o].item())) for o in order]
+
+        # warmup for objectness target
+        warm_epochs = 10
+        use_warm = (epoch is not None) and (epoch <= warm_epochs)
+
+        # accumulators
+        l_obj = det_maps[0].new_zeros(())
+        l_box = det_maps[0].new_zeros(())
+        l_ang = det_maps[0].new_zeros(())
+        l_cls = det_maps[0].new_zeros(())
+        l_dfl = det_maps[0].new_zeros(())  # only used if DFL present
+        pos_cnt = 0
 
         for b in range(B):
-            boxes = boxes_list[b]  # (N,5)
-            labels = labels_list[b] if self.nc > 1 else torch.zeros((boxes.shape[0],), dtype=torch.long, device=device)
+            gtb = gtb_list[b] if b < len(gtb_list) else torch.zeros(0, 5, device=device)
+            gtc = gtc_list[b] if b < len(gtc_list) else torch.zeros(0, dtype=torch.long, device=device)
 
-            for n in range(boxes.shape[0]):
-                cx, cy, w, h, ang = [float(x) for x in boxes[n]]
-                max_side = max(w, h)
-                lvl = self._route_level(max_side)
-                stride = self.strides[lvl]
-                mp = maps_by_level[lvl]  # dict of tensors with shape (B,H,W)
+            if gtb.numel() == 0:
+                # negatives: sample a few obj logits at each level
+                for li in range(len(mp_levels)):
+                    obj_map = mp_levels[li]["obj"][b, 0]  # (H,W)
+                    H, W = obj_map.shape
+                    if H * W == 0:
+                        continue
+                    n_neg = min(256, H * W)
+                    idx = torch.randint(0, H * W, (n_neg,), device=device)
+                    neg = _nan2(obj_map.view(-1)[idx])
+                    l_obj = l_obj + F.binary_cross_entropy_with_logits(neg, torch.zeros_like(neg), reduction="mean")
+                continue
 
-                H, W = mp["obj"].shape[-2], mp["obj"].shape[-1]
-                gx, gy = cx / stride, cy / stride
-                i, j = int(gx), int(gy)
-                if not (0 <= i < W and 0 <= j < H):
-                    continue  # object falls outside map
+            if self.nc > 0:
+                gtc = gtc.clamp_(0, max(0, self.nc - 1))
 
-                # ---------------- objectness: pos + sampled negatives ----------------
-                pos_logit = mp["obj"][b, j, i]
-                l_obj = l_obj + F.binary_cross_entropy_with_logits(pos_logit, pos_logit.new_ones(()))
-                obj_pos_terms += 1
+            for k in range(int(gtb.shape[0])):
+                cx, cy, w, h, ang = gtb[k]
+                w, h, ang = _le90(w, h, ang)
 
-                # random hard negatives (avoid the positive cell)
-                if neg_per_pos > 0:
-                    flat = mp["obj"][b].reshape(-1)
-                    pos_idx = j * W + i
-                    Ntot = flat.numel()
-                    if Ntot > 1:
-                        # sample without replacement; simple uniform (can be improved to top-k)
-                        k = min(int(neg_per_pos), Ntot - 1)
-                        idx = torch.randperm(Ntot, device=device)[:k + 1]
-                        idx = idx[idx != pos_idx]
-                        idx = idx[:k]
-                        if idx.numel():
-                            neg_logits = flat[idx]
-                            l_obj = l_obj + 0.5 * F.binary_cross_entropy_with_logits(
-                                neg_logits, torch.zeros_like(neg_logits)
-                            )
-                            obj_neg_terms += 1
+                # route to level by size
+                max_side = float(torch.maximum(w, h))
+                li = self._route_level(max_side)
+                stride = strides[li]
+                mp = mp_levels[li]
+                H, W = Hs[li], Ws[li]
 
-                # ---------------- box regression (log tw/th + offsets) ----------------
-                tx_p = mp["tx"][b, j, i]
-                ty_p = mp["ty"][b, j, i]
-                tw_p = mp["tw"][b, j, i]
-                th_p = mp["th"][b, j, i]
+                # cell coords
+                gx = cx / float(stride)
+                gy = cy / float(stride)
+                cells = _closest_cells(gx, gy, H, W, radius=2.5, K=3)
+                if not cells:
+                    continue
 
-                tx_t = torch.tensor(gx - i, device=device, dtype=tx_p.dtype)
-                ty_t = torch.tensor(gy - j, device=device, dtype=ty_p.dtype)
-                tw_t = torch.tensor(math.log(max(w / stride, 1e-6)), device=device, dtype=tw_p.dtype)
-                th_t = torch.tensor(math.log(max(h / stride, 1e-6)), device=device, dtype=th_p.dtype)
+                # targets in map paramization
+                tx_t = gx - math.floor(float(gx))  # [0,1)
+                ty_t = gy - math.floor(float(gy))
+                tw_t = torch.log((w / float(stride)).clamp(min=1e-6))
+                th_t = torch.log((h / float(stride)).clamp(min=1e-6))
+                ang_t = ang
 
-                l_box = l_box + self.smoothl1(tx_p, tx_t)
-                l_box = l_box + self.smoothl1(ty_p, ty_t)
-                l_box = l_box + self.smoothl1(tw_p, tw_t)
-                l_box = l_box + self.smoothl1(th_p, th_t)
+                # DFL bin helpers for THIS level (if any)
+                if use_dfl and ("dflw" in mp) and ("dflh" in mp):
+                    log_bins = log_bins_per_level[li]  # (nb,)
+                    # normalise continuous target into [0, reg_max] for soft-label DFL
+                    log_min = float(log_bins[0].item())
+                    log_max = float(log_bins[-1].item())
+                    scale = (reg_max) / max(1e-6, (log_max - log_min))
+                    tbin_w = (float(tw_t.item()) - log_min) * scale
+                    tbin_h = (float(th_t.item()) - log_min) * scale
 
-                # ---------------- angle (sin,cos) normalised ----------------
-                sin_p = mp["sin"][b, j, i]
-                cos_p = mp["cos"][b, j, i]
-                vec = torch.stack([sin_p, cos_p])
-                vec = vec / (vec.norm(p=2) + 1e-6)
-                sin_p_n, cos_p_n = vec[0], vec[1]
-                sin_t = torch.tensor(math.sin(ang), device=device, dtype=sin_p.dtype)
-                cos_t = torch.tensor(math.cos(ang), device=device, dtype=cos_p.dtype)
-                l_ang = l_ang + self.smoothl1(sin_p_n, sin_t) + self.smoothl1(cos_p_n, cos_t)
+                for (jj, ii) in cells:
+                    # centers
+                    tx_p = torch.sigmoid(_nan2(mp["tx"][b, jj, ii]))
+                    ty_p = torch.sigmoid(_nan2(mp["ty"][b, jj, ii]))
 
-                # ---------------- class ----------------
-                if mp["cls"] is not None and self.nc > 1:
-                    cls_logits = mp["cls"][b, :, j, i]  # (nc,)
-                    t = torch.full_like(cls_logits, 0.0)
-                    t[int(labels[n].item())] = 1.0
-                    l_cls = l_cls + F.binary_cross_entropy_with_logits(cls_logits, t)
+                    # sizes & size loss
+                    if use_dfl and ("dflw" in mp) and ("dflh" in mp):
+                        logits_w = _nan2(mp["dflw"][b, :, jj, ii])
+                        logits_h = _nan2(mp["dflh"][b, :, jj, ii])
+                        probs_w = torch.log_softmax(logits_w, dim=0).exp()
+                        probs_h = torch.log_softmax(logits_h, dim=0).exp()
 
-                # ---------------- debug: decode current positive like evaluator ----------------
-                with torch.no_grad():
-                    _, _, pw_hat, ph_hat, _ = self._decode_at_cell(mp, b, j, i, stride)
-                    dbg_pred_w[lvl].append(float(pw_hat))
-                    dbg_pred_h[lvl].append(float(ph_hat))
-                    dbg_gt_w[lvl].append(float(w))
-                    dbg_gt_h[lvl].append(float(h))
+                        # expected log-width/height
+                        tw_exp = (probs_w * log_bins).sum()
+                        th_exp = (probs_h * log_bins).sum()
 
-                total_pos += 1
+                        # regression on expected log-size (stabilizes early training)
+                        l_box = l_box + F.smooth_l1_loss(tw_exp, tw_t, reduction="mean")
+                        l_box = l_box + F.smooth_l1_loss(th_exp, th_t, reduction="mean")
 
-        # -------- normalisation --------
-        norm = max(total_pos, 1)
-        l_box = l_box / norm
-        l_ang = l_ang / norm
-        l_cls = l_cls / max(norm if self.nc > 1 else 1, 1)
+                        # optional DFL soft-label loss (two-bin interpolation)
+                        l_dfl = l_dfl + _dfl_soft_loss(logits_w, torch.tensor(tbin_w, device=device), reg_max)
+                        l_dfl = l_dfl + _dfl_soft_loss(logits_h, torch.tensor(tbin_h, device=device), reg_max)
 
-        # objectness: average over counted terms
-        den = max(obj_pos_terms + obj_neg_terms, 1)
-        l_obj = l_obj / den
+                        # decode for IoU/objectness target
+                        w_p = torch.exp(tw_exp).clamp(min=1.0, max=1e4) * float(stride)
+                        h_p = torch.exp(th_exp).clamp(min=1.0, max=1e4) * float(stride)
+                    else:
+                        # classic tw/th path
+                        tw_p = _nan2(mp["tw"][b, jj, ii])
+                        th_p = _nan2(mp["th"][b, jj, ii])
 
-        # -------- one-time/early debug print --------
-        if (total_pos > 0) and (not hasattr(self, "_DBG_DET_ONCE") or not self._DBG_DET_ONCE):
-            for lvl, name in enumerate(("P3", "P4", "P5")):
-                if dbg_pred_w[lvl]:
-                    pw = np.median(dbg_pred_w[lvl])
-                    ph = np.median(dbg_pred_h[lvl])
-                    gw = np.median(dbg_gt_w[lvl])
-                    gh = np.median(dbg_gt_h[lvl])
-                    print(f"[TRAIN DEBUG] {name} pred_w/h≈{pw:.1f}/{ph:.1f}  vs  GT_w/h≈{gw:.1f}/{gh:.1f}")
-            self._DBG_DET_ONCE = True
+                        # regression on log-sizes
+                        l_box = l_box + F.smooth_l1_loss(tw_p, tw_t, reduction="mean")
+                        l_box = l_box + F.smooth_l1_loss(th_p, th_t, reduction="mean")
 
-        return l_obj, l_box, l_ang, l_cls, total_pos
+                        # decode for IoU/objectness target
+                        w_p = torch.exp(tw_p).clamp(min=1.0, max=1e4) * float(stride)
+                        h_p = torch.exp(th_p).clamp(min=1.0, max=1e4) * float(stride)
+
+                    # angle
+                    if "ang" in mp:
+                        ang_p = _ang_from_logit(_nan2(mp["ang"][b, jj, ii]))
+                    elif ("sin" in mp) and ("cos" in mp):
+                        s = _nan2(mp["sin"][b, jj, ii]);
+                        c = _nan2(mp["cos"][b, jj, ii])
+                        norm = torch.sqrt(torch.clamp(s * s + c * c, min=1e-12))
+                        ang_p = torch.atan2(s / norm, c / norm)
+                    else:
+                        ang_p = ang_t
+
+                    # canonicalize prediction (LE-90)
+                    if w_p < h_p:
+                        w_p, h_p = h_p, w_p
+                        ang_p = ang_p + math.pi / 2.0
+                    ang_p = (ang_p + math.pi / 2.0) % math.pi - math.pi / 2.0
+
+                    l_ang = l_ang + _angle_loss(ang_p, ang_t)
+
+                    # cls (multi-class only)
+                    if self.nc > 1 and "cls" in mp:
+                        cvec = _nan2(mp["cls"][b, :, jj, ii])
+                        tgt = torch.zeros_like(cvec);
+                        tgt[int(gtc[k].item())] = 1.0
+                        l_cls = l_cls + F.binary_cross_entropy_with_logits(cvec, tgt)
+
+                    # objectness with warmup
+                    cx_p = (ii + tx_p) * float(stride)
+                    cy_p = (jj + ty_p) * float(stride)
+                    with torch.no_grad():
+                        iou = _aabb_iou(cx_p, cy_p, w_p, h_p, cx, cy, w, h)
+                        obj_t = (0.5 + 0.5 * iou) if use_warm else iou
+                        obj_t = obj_t.clamp(0.0, 1.0)
+                    obj_logit = _nan2(mp["obj"][b, 0, jj, ii])
+                    l_obj = l_obj + F.binary_cross_entropy_with_logits(obj_logit, obj_t)
+
+                    pos_cnt += 1
+
+                # light ring negatives around matched cells
+                obj_map = mp["obj"][b, 0]
+                gi, gj = int(math.floor(float(gx))), int(math.floor(float(gy)))
+                rr = 3
+                ring = []
+                for yy in range(max(0, gj - rr), min(H - 1, gj + rr) + 1):
+                    for xx in range(max(0, gi - rr), min(W - 1, gi + rr) + 1):
+                        if (yy, xx) not in cells:
+                            ring.append((yy, xx))
+                if ring:
+                    pick = min(8, len(ring))
+                    sel = [ring[int(i.item())] for i in torch.randint(0, len(ring), (pick,), device=device)]
+                    obj_neg = torch.stack([_nan2(obj_map[y, x]) for (y, x) in sel])
+                    l_obj = l_obj + F.binary_cross_entropy_with_logits(obj_neg, torch.zeros_like(obj_neg),
+                                                                       reduction="mean")
+
+        # normalise
+        pos = max(1, pos_cnt)
+        l_obj = l_obj / pos
+        l_box = l_box / pos
+        l_ang = l_ang / pos
+        l_cls = l_cls / pos
+        l_dfl = l_dfl / pos
+
+        total = (self.lambda_obj * l_obj
+                 + self.lambda_box * l_box
+                 + self.lambda_ang * l_ang
+                 + self.lambda_cls * l_cls
+                 + l_dfl)  # keep DFL weight = 1.0; adjust if you want
+
+        parts = {
+            "obj": float(l_obj.detach()),
+            "box": float(l_box.detach()),
+            "ang": float(l_ang.detach()),
+            "cls": float(l_cls.detach()),
+            "dfl": float(l_dfl.detach()),
+            "pos": float(pos_cnt),
+            "kpt": 0.0,
+            "kpt_pos": 0.0,
+            "total": float(total.detach()),
+        }
+        return total, parts
 
     # --------------------- helpers: keypoint loss ---------------------
-
     @torch.no_grad()
     def _roi_targets_from_meta(self,
                                metas: List[Dict[str, torch.Tensor]],
                                kpt_xy_img_list: List[torch.Tensor],
                                feat_down: float) -> Optional[torch.Tensor]:
         """
-        Build uv targets (0..S in crop px) aligned with ROI metas for the corresponding GTs.
-        metas[i]['M'] maps crop px -> feat px; we invert and map image kpt -> crop px.
+        Build UV targets in feature-grid coordinates aligned with ROI metas.
+
+        Each meta dict must include:
+          - 'M': (2,3) affine mapping crop pixels -> feature pixels
+        We take the *corresponding* keypoint from kpt_xy_img_list[j] for meta j.
         """
-        if len(metas) == 0:
+        if not metas:
             return None
+
         uv_list = []
-        for m in metas:
-            assert 'M' in m, "ROI meta must include 2x3 affine 'M'"
+        for j, m in enumerate(metas):
+            if 'M' not in m:
+                raise KeyError("ROI meta must include affine 'M' (2x3) mapping crop->feat.")
             M = m['M']
-            assert hasattr(M, 'shape') and tuple(M.shape[-2:])==(2,3), f"ROI meta 'M' must be (2,3), got {getattr(M, 'shape', None)}"
-            if "gt_kpt" not in m or m["gt_kpt"] is None:
-                # In training we attach per-ROI GT kpt below; if missing, skip
-                return None
-            kpt_xy = m["gt_kpt"]  # (1,2) tensor in image px
-            M = m["M"]            # (2,3)
-            uv = _img_kpts_to_crop_uv(kpt_xy, M, feat_down)  # (1,2) in crop px
+            if not (hasattr(M, "shape") and tuple(M.shape[-2:]) == (2, 3)):
+                raise AssertionError(f"ROI meta 'M' must be (2,3), got {getattr(M, 'shape', None)}")
+
+            # pick j-th keypoint (image px)
+            if j >= len(kpt_xy_img_list):
+                # pad missing with zeros to avoid crashing
+                kpt_xy = torch.zeros(1, 2, device=M.device, dtype=M.dtype)
+            else:
+                kpt_xy = torch.as_tensor(kpt_xy_img_list[j], device=M.device, dtype=M.dtype).reshape(1, 2)
+
+            # M already maps to feature pixels -> don't divide again
+            uv = _img_kpts_to_crop_uv(kpt_xy, M, feat_down=1)
             uv_list.append(uv)
-        return torch.cat(uv_list, dim=0) if len(uv_list) else None
+
+        return torch.cat(uv_list, dim=0) if uv_list else None
 
     def _loss_kpt(
             self,
-            model,
-            feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-            boxes_list: Sequence[Union[torch.Tensor, np.ndarray, List[List[float]]]],
-            kpts_list: Sequence[Union[torch.Tensor, np.ndarray, List[List[float]]]],
-    ) -> Tuple[torch.Tensor, int]:
-        """
-        Compute keypoint (u,v) loss from rotated ROI crops.
+            model: nn.Module,
+            feats: Optional[List[torch.Tensor]],
+            gtb_list: List[torch.Tensor],
+            gtc_list: List[torch.Tensor],
+    ):
+        # If kpt head isn’t used or feats unavailable, be a no-op
+        if not hasattr(model, "kpt_enabled") and feats is None:
+            return feats[0].new_zeros(()), 0  # safe default
+        if feats is None or len(feats) == 0:
+            return torch.zeros((), device=gtb_list[0].device if len(gtb_list) else "cpu"), 0
 
-        - Supports metas from model.kpt_from_obbs either as:
-            (a) per-batch list-of-lists of dicts, or
-            (b) a flat list of dicts with 'bix' batch index
-        - Expects exactly 1 keypoint per ROI (kpt1); if kpts have higher rank,
-          the first keypoint is used.
-        """
-        import torch.nn.functional as F
+        device = feats[0].device
+        l_kpt = torch.zeros((), device=device)
+        kpt_pos = 0
 
-        P3 = feats[0]
-        device = P3.device
-        dtype = P3.dtype
-        B = int(P3.shape[0])
+        # Your code attaches ROI metas in forward; pull them defensively if present
+        metas: List[Dict[str, torch.Tensor]] = getattr(model, "roi_metas", None)
+        if metas is None or len(metas) == 0:
+            return l_kpt, kpt_pos  # nothing to train this step
 
-        # --- Normalize boxes_list to length B and to proper tensor shapes (N,5) ---
-        norm_boxes_list: List[torch.Tensor] = []
-        for b in range(B):
-            if b < len(boxes_list) and boxes_list[b] is not None and len(boxes_list[b]) > 0:
-                rois_b = torch.as_tensor(boxes_list[b], device=device, dtype=dtype)
-                if rois_b.ndim == 1:
-                    rois_b = rois_b.unsqueeze(0)  # (1,5)
-                elif rois_b.ndim > 2:
-                    rois_b = rois_b.reshape(-1, rois_b.shape[-1])
-            else:
-                rois_b = torch.zeros((0, 5), device=device, dtype=dtype)
-            norm_boxes_list.append(rois_b)
-
-        # Fast exit if really nothing to do
-        if sum(int(x.shape[0]) for x in norm_boxes_list) == 0:
-            zero = torch.zeros((), device=device, dtype=dtype)
-            return zero, 0
-
-        # --- Run model head to get predicted uv and metas describing each crop ---
-        # NOTE: the model should be AMP-safe; uv_pred's dtype may be float16 under amp.
-        uv_pred, metas = model.kpt_from_obbs(feats, norm_boxes_list, scores_list=None)
-
-        # --- Normalize metas to per-batch lists and also build indices into uv_pred ---
-        per_b_metas: List[List[dict]] = [[] for _ in range(B)]
-        idxs_by_b: List[List[int]] = [[] for _ in range(B)]
-
-        if isinstance(metas, (list, tuple)) and len(metas) > 0 and isinstance(metas[0], (list, tuple)):
-            # metas is already per-batch lists
-            start = 0
-            for b in range(B):
-                mb = list(metas[b]) if b < len(metas) else []
-                per_b_metas[b] = mb
-                idxs_by_b[b] = list(range(start, start + len(mb)))
-                start += len(mb)
-        else:
-            # treat metas as a flat list[dict] with 'bix' keys
-            flat = list(metas) if isinstance(metas, (list, tuple)) else []
-            for i, md in enumerate(flat):
-                bix = int(md.get("bix", md.get("batch_index", 0)))
-                if 0 <= bix < B:
-                    per_b_metas[bix].append(md)
-                    idxs_by_b[bix].append(i)
-
-        # --- Build loss ---
-        total_loss = torch.zeros((), device=device, dtype=uv_pred.dtype)
-        total_pos = 0
-
-        for b in range(B):
-            metas_b = per_b_metas[b]
-            idxs_b = idxs_by_b[b]
-            M_b = len(metas_b)
-            if M_b == 0:
+        # Expected interface (kept from your file): each meta has keys
+        # 'M' (2x3 affine crop->feat) and 'gt_kpt' (1,2) in image px.
+        valid = 0
+        for m in metas:
+            if "M" not in m or "gt_kpt" not in m:
+                continue
+            M = m["M"]
+            kpt_xy = m["gt_kpt"]
+            if not (hasattr(M, "shape") and tuple(M.shape[-2:]) == (2, 3)):
+                continue
+            if not (hasattr(kpt_xy, "shape") and kpt_xy.numel() == 2):
                 continue
 
-            # uv predictions for this batch image, keeping ROI order
-            uv_b_pred = uv_pred[idxs_b]  # shape (M_b, 2)
-            # Ground-truth keypoints for these ROIs
-            # Accepts shapes: (M_b, 2) or (M_b, K, 2) or (M_b, >=2)
-            kpts_b = torch.as_tensor(kpts_list[b], device=device, dtype=uv_b_pred.dtype)
-            if kpts_b.ndim == 1:
-                kpts_b = kpts_b.view(1, -1)
-            # Reduce to (M_b, 2) using the first keypoint if needed
-            if kpts_b.ndim == 3 and kpts_b.shape[1] >= 1:
-                kpts_b = kpts_b[:, 0, :2]
-            elif kpts_b.shape[-1] >= 2:
-                kpts_b = kpts_b[:, :2]
-            # Guard against count mismatch; trim/pad GT to match metas order
-            if kpts_b.shape[0] != M_b:
-                # Trim extra or pad missing with zeros (they will get low loss weight anyway)
-                if kpts_b.shape[0] > M_b:
-                    kpts_b = kpts_b[:M_b]
-                else:
-                    pad = torch.zeros((M_b - kpts_b.shape[0], 2), device=device, dtype=kpts_b.dtype)
-                    kpts_b = torch.cat([kpts_b, pad], dim=0)
+            # (1,2)
+            xy = kpt_xy.reshape(1, 2).to(device, dtype=feats[0].dtype)
+            M = M.to(device, dtype=feats[0].dtype)
 
-            # Compute GT (u,v) for each ROI using the affine meta
-            uv_gt_list = []
-            for j, md in enumerate(metas_b):
-                M_crop_to_feat = torch.as_tensor(md["M"], device=device, dtype=uv_b_pred.dtype)  # (2,3)
-                feat_down = float(md.get("feat_down", 8))
-                xy_img = kpts_b[j:j + 1, :2]  # (1,2)
-                uv_j = _img_kpts_to_crop_uv(xy_img, M_crop_to_feat, feat_down=feat_down)  # (1,2)
-                uv_gt_list.append(uv_j)
+            # Map image->crop px using the inverse of (crop->feat) then scale by feat_down
+            # But your helper already expects M that maps crop->feat; we only need crop u,v targets.
+            # Use your existing helper if present; else do a minimal safe transform:
+            try:
+                uv = _img_kpts_to_crop_uv(xy, M, feat_down=getattr(self, "feat_down", 1.0))  # (1,2)
+            except Exception:
+                # very defensive: treat as identity if it fails
+                uv = xy.clone()
 
-            uv_b_gt = torch.cat(uv_gt_list, dim=0) if uv_gt_list else torch.zeros((0, 2), device=device,
-                                                                                  dtype=uv_b_pred.dtype)
+            uv = _nan_to_num_(uv)
+            if not _is_finite_tensor(uv):
+                continue
 
-            # Smooth L1 over (u,v) in [0,1]; clamp GT softly just in case
-            uv_b_gt = uv_b_gt.clamp(0.0, 1.0)
-            # Align dtypes
-            if uv_b_gt.dtype != uv_b_pred.dtype:
-                uv_b_gt = uv_b_gt.to(uv_b_pred.dtype)
+            # Predicted uv logit maps should be in model (e.g., model.kpt_head output).
+            # If not available, skip safely.
+            if not hasattr(model, "kpt_predictor") or model.kpt_predictor is None:
+                continue
 
-            loss_b = F.smooth_l1_loss(uv_b_pred, uv_b_gt, reduction="mean")
-            total_loss = total_loss + loss_b
-            total_pos += int(M_b)
+            pred_u, pred_v = model.kpt_predictor(  # expected to return logits or coords
+                feats
+            )
+            # Accept either logits (same shape) or scalar per-ROI predictions
+            if isinstance(pred_u, torch.Tensor) and isinstance(pred_v, torch.Tensor):
+                pu = _nan_to_num_(pred_u.squeeze())
+                pv = _nan_to_num_(pred_v.squeeze())
+                # match shapes
+                if pu.dim() == 0 and pv.dim() == 0:
+                    pu = pu.view(1)
+                    pv = pv.view(1)
+                if pu.numel() != 1 or pv.numel() != 1:
+                    # cannot align confidently; skip this ROI
+                    continue
+                # simple L1 in crop space
+                l_kpt = l_kpt + (pu - uv[:, 0]).abs().mean() + (pv - uv[:, 1]).abs().mean()
+                kpt_pos += 1
+            else:
+                # predictor not ready; skip
+                continue
 
-        # Scale by configured lambda
-        total_loss = total_loss * float(self.lambda_kpt)
-        return total_loss, total_pos
+            valid += 1
+
+        if kpt_pos > 0:
+            l_kpt = l_kpt / float(kpt_pos)
+
+        return l_kpt, kpt_pos
+

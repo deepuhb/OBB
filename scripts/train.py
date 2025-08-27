@@ -6,6 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.data.build import build_dataloaders
@@ -238,7 +239,16 @@ def main():
                                    map_iou_st=0.50, map_iou_ed=0.50, map_iou_step=0.05))
 
     # --- fit ---
-    best = trainer.fit(train_loader, val_loader, evaluator=evaluator, train_sampler=train_sampler)
+    try:
+        best = trainer.fit(train_loader, val_loader, evaluator=evaluator, train_sampler=train_sampler)
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            dist.destroy_process_group()
+
 
     # --- save final bundle on rank-0 ---
     if rank == 0:

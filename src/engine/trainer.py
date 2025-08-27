@@ -240,7 +240,7 @@ class Trainer:
                     outputs = model(imgs)
 
                 # compute loss in fp32 for stability
-                with torch.cuda.amp.autocast(enabled=False):
+                with torch.amp.autocast('cuda', enabled=False):
                     loss, parts = self._call_criterion(criterion, outputs, batch, epoch)
 
                 # NaN / Inf guard
