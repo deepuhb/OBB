@@ -26,7 +26,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch", type=int, default=16, help="per-GPU batch size")
     p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--conf_thres", type=float, default=0.25)
+    p.add_argument("--conf_thres", type=float, default=0.01)
     p.add_argument("--iou_thres", type=float, default=0.5)
     p.add_argument("--max_det", type=int, default=300)
     p.add_argument("--multi_label", action="store_true")

@@ -582,8 +582,12 @@ class TDOBBWKpt1Criterion(nn.Module):
     # --------------------- detection loss ---------------------
     def _loss_det(self, det_maps, feats, batch, model=None, epoch=None):
         """
-        Supports classic (tx,ty,tw,th,ang/obj/cls) and DFL (tx,ty,dflw,dflh,ang/obj/cls).
-        Box regression is on log(w/stride), angle uses 1-cos(delta), objectness uses IoU (warmup to 0.5+0.5*IoU).
+        DFL + single-logit angle, with *narrow* per-level log-size bins and
+        smaller level routing thresholds to avoid collapsing to giant boxes.
+
+        Compatible map keys:
+          classic : tx, ty, tw, th, ang, obj, (cls)
+          DFL     : tx, ty, dflw, dflh, ang, obj, (cls)
         """
         import math
         import torch
@@ -592,56 +596,57 @@ class TDOBBWKpt1Criterion(nn.Module):
         device = det_maps[0].device
         B = det_maps[0].shape[0]
 
-        # split maps into dicts (keeps your key names)
+        # Split output maps per level (keeps your existing key names)
         mp_levels = [self._split_map(dm, li, model=model) for li, dm in enumerate(det_maps)]
         Hs = [int(dm.shape[-2]) for dm in det_maps]
         Ws = [int(dm.shape[-1]) for dm in det_maps]
         strides = tuple(int(s) for s in self.strides)
 
-        # read GT
+        # Read GT
         gtb_list, gtc_list, _ = self._read_targets(batch, B, device)
 
-        # image size (for sane bin ranges if DFL)
+        # Image size (cap for P5)
         if isinstance(batch, dict) and "imgs" in batch and hasattr(batch["imgs"], "shape"):
             Himg = int(batch["imgs"].shape[-2])
             Wimg = int(batch["imgs"].shape[-1])
         else:
-            # safe defaults
-            Himg, Wimg = 640, 640
+            Himg = Wimg = 640
         img_max = float(max(Himg, Wimg))
 
-        # per-level size caps (match your routing: <=low -> P3, <=mid -> P4, else -> P5)
-        low, mid = self.level_boundaries
-        lvl_max_pix = [float(low), float(mid), img_max]
+        # -------- Level routing and DFL range policy (narrower) ----------
+        # Your feedback: use smaller routing thresholds, e.g. (32, 64)
+        low, mid = getattr(self, "level_boundaries", (32.0, 64.0))
+        lvl_cap = [float(low), float(mid), img_max]
 
-        # If the head is DFL, we’ll need per-level log-bins for log(w/stride)
+        # Narrow per-level min/max (in *image pixels*) to stop bins saturating:
+        #   P3: [2,  96],  P4: [4, 192],  P5: [8, 384]   (clipped by img size)
+        min_wh_img = [2.0, 4.0, 8.0]
+        max_wh_img = [min(96.0, img_max), min(192.0, img_max), min(384.0, img_max)]
+
+        # Detect DFL
         reg_max = None
         if model is not None:
-            reg_max = getattr(model, "reg_max", None)
-            if reg_max is None and hasattr(model, "head"):
-                reg_max = getattr(model.head, "reg_max", None)
+            reg_max = getattr(model, "reg_max", None) or getattr(getattr(model, "head", None), "reg_max", None)
         use_dfl = isinstance(reg_max, int) and reg_max > 0
         nb = (reg_max + 1) if use_dfl else None
 
-        # Build per-level log-value bins for DFL (cover [log(1/stride), log(lvl_max/stride)])
-        log_bins_per_level = []
+        # Build per-level *log-size* bins used for both width and height
+        log_bins_per_level = [None, None, None]
         if use_dfl:
             for li, s in enumerate(strides):
-                # widths close to 0px are meaningless; use 1px minimum to avoid -inf logs
-                log_min = math.log(max(1.0, 1.0) / float(s))  # log(1px / stride)
-                log_max = math.log(max(2.0, lvl_max_pix[li]) / float(s))  # log(max_size / stride)
-                # Linearly spaced bins in log domain
+                # convert pixel min/max to *feature-normalized* log-range
+                log_min = math.log(max(min_wh_img[li] / float(s), 1e-6))
+                log_max = math.log(max(max_wh_img[li] / float(s), 1.0))
                 idx = torch.arange(nb, device=device, dtype=torch.float32)
-                log_bins = log_min + (log_max - log_min) * (idx / float(reg_max))
-                log_bins_per_level.append(log_bins)
-        else:
-            log_bins_per_level = [None, None, None]
+                # evenly spaced in log-space
+                log_bins_per_level[li] = log_min + (log_max - log_min) * (idx / float(reg_max))
 
-        # helpers
+        # Helpers
         def _nan2(x, v=0.0):
             return torch.nan_to_num(x, nan=v, posinf=v, neginf=v)
 
-        def _ang_from_logit(z):  # [-pi/2, pi/2)
+        def _ang_from_logit(z):
+            # YOLO-style single logit -> [-pi/2, pi/2)
             return (torch.sigmoid(z) * math.pi) - (math.pi / 2.0)
 
         def _le90(w, h, a):
@@ -696,16 +701,16 @@ class TDOBBWKpt1Criterion(nn.Module):
             _, order = torch.topk(-d, k, largest=False)
             return [(int(yyf[o].item()), int(xxf[o].item())) for o in order]
 
-        # warmup for objectness target
+        # Warmup objectness target
         warm_epochs = 10
         use_warm = (epoch is not None) and (epoch <= warm_epochs)
 
-        # accumulators
+        # Loss accumulators
         l_obj = det_maps[0].new_zeros(())
         l_box = det_maps[0].new_zeros(())
         l_ang = det_maps[0].new_zeros(())
         l_cls = det_maps[0].new_zeros(())
-        l_dfl = det_maps[0].new_zeros(())  # only used if DFL present
+        l_dfl = det_maps[0].new_zeros(())
         pos_cnt = 0
 
         for b in range(B):
@@ -713,15 +718,15 @@ class TDOBBWKpt1Criterion(nn.Module):
             gtc = gtc_list[b] if b < len(gtc_list) else torch.zeros(0, dtype=torch.long, device=device)
 
             if gtb.numel() == 0:
-                # negatives: sample a few obj logits at each level
+                # negs: small random sample per level
                 for li in range(len(mp_levels)):
                     obj_map = mp_levels[li]["obj"][b, 0]  # (H,W)
                     H, W = obj_map.shape
                     if H * W == 0:
                         continue
                     n_neg = min(256, H * W)
-                    idx = torch.randint(0, H * W, (n_neg,), device=device)
-                    neg = _nan2(obj_map.view(-1)[idx])
+                    sel = torch.randint(0, H * W, (n_neg,), device=device)
+                    neg = _nan2(obj_map.view(-1)[sel])
                     l_obj = l_obj + F.binary_cross_entropy_with_logits(neg, torch.zeros_like(neg), reduction="mean")
                 continue
 
@@ -732,106 +737,88 @@ class TDOBBWKpt1Criterion(nn.Module):
                 cx, cy, w, h, ang = gtb[k]
                 w, h, ang = _le90(w, h, ang)
 
-                # route to level by size
+                # route level by size (using smaller boundaries)
                 max_side = float(torch.maximum(w, h))
-                li = self._route_level(max_side)
-                stride = strides[li]
+                li = 0 if max_side <= low else (1 if max_side <= mid else 2)
+                s = float(strides[li])
                 mp = mp_levels[li]
                 H, W = Hs[li], Ws[li]
 
-                # cell coords
-                gx = cx / float(stride)
-                gy = cy / float(stride)
+                # feature-space center
+                gx = cx / s
+                gy = cy / s
                 cells = _closest_cells(gx, gy, H, W, radius=2.5, K=3)
                 if not cells:
                     continue
 
-                # targets in map paramization
-                tx_t = gx - math.floor(float(gx))  # [0,1)
-                ty_t = gy - math.floor(float(gy))
-                tw_t = torch.log((w / float(stride)).clamp(min=1e-6))
-                th_t = torch.log((h / float(stride)).clamp(min=1e-6))
+                # targets in log-space (feature normalized)
+                tw_t = torch.log((w / s).clamp(min=1e-6))
+                th_t = torch.log((h / s).clamp(min=1e-6))
                 ang_t = ang
 
-                # DFL bin helpers for THIS level (if any)
-                if use_dfl and ("dflw" in mp) and ("dflh" in mp):
-                    log_bins = log_bins_per_level[li]  # (nb,)
-                    # normalise continuous target into [0, reg_max] for soft-label DFL
-                    log_min = float(log_bins[0].item())
-                    log_max = float(log_bins[-1].item())
-                    scale = (reg_max) / max(1e-6, (log_max - log_min))
-                    tbin_w = (float(tw_t.item()) - log_min) * scale
-                    tbin_h = (float(th_t.item()) - log_min) * scale
-
                 for (jj, ii) in cells:
-                    # centers
+                    # center offsets
                     tx_p = torch.sigmoid(_nan2(mp["tx"][b, jj, ii]))
                     ty_p = torch.sigmoid(_nan2(mp["ty"][b, jj, ii]))
 
-                    # sizes & size loss
+                    # size loss & decode
                     if use_dfl and ("dflw" in mp) and ("dflh" in mp):
+                        # DFL expected log sizes
+                        log_bins = log_bins_per_level[li]  # (nb,)
                         logits_w = _nan2(mp["dflw"][b, :, jj, ii])
                         logits_h = _nan2(mp["dflh"][b, :, jj, ii])
-                        probs_w = torch.log_softmax(logits_w, dim=0).exp()
-                        probs_h = torch.log_softmax(logits_h, dim=0).exp()
+                        pw = torch.softmax(logits_w, dim=0)
+                        ph = torch.softmax(logits_h, dim=0)
+                        tw_exp = (pw * log_bins).sum()
+                        th_exp = (ph * log_bins).sum()
 
-                        # expected log-width/height
-                        tw_exp = (probs_w * log_bins).sum()
-                        th_exp = (probs_h * log_bins).sum()
-
-                        # regression on expected log-size (stabilizes early training)
+                        # stabilizer on expected value
                         l_box = l_box + F.smooth_l1_loss(tw_exp, tw_t, reduction="mean")
                         l_box = l_box + F.smooth_l1_loss(th_exp, th_t, reduction="mean")
 
-                        # optional DFL soft-label loss (two-bin interpolation)
+                        # soft DFL labels (two-bin)
+                        log_min = float(log_bins[0].item())
+                        log_max = float(log_bins[-1].item())
+                        scale = reg_max / max(1e-6, (log_max - log_min))
+                        tbin_w = (float(tw_t.item()) - log_min) * scale
+                        tbin_h = (float(th_t.item()) - log_min) * scale
                         l_dfl = l_dfl + _dfl_soft_loss(logits_w, torch.tensor(tbin_w, device=device), reg_max)
                         l_dfl = l_dfl + _dfl_soft_loss(logits_h, torch.tensor(tbin_h, device=device), reg_max)
 
-                        # decode for IoU/objectness target
-                        w_p = torch.exp(tw_exp).clamp(min=1.0, max=1e4) * float(stride)
-                        h_p = torch.exp(th_exp).clamp(min=1.0, max=1e4) * float(stride)
+                        # decode sizes to pixels for IoU/objectness target
+                        w_p = torch.exp(tw_exp).clamp(min=min_wh_img[li] / s, max=max_wh_img[li] / s) * s
+                        h_p = torch.exp(th_exp).clamp(min=min_wh_img[li] / s, max=max_wh_img[li] / s) * s
                     else:
-                        # classic tw/th path
+                        # classic path
                         tw_p = _nan2(mp["tw"][b, jj, ii])
                         th_p = _nan2(mp["th"][b, jj, ii])
-
-                        # regression on log-sizes
                         l_box = l_box + F.smooth_l1_loss(tw_p, tw_t, reduction="mean")
                         l_box = l_box + F.smooth_l1_loss(th_p, th_t, reduction="mean")
+                        w_p = torch.exp(tw_p).clamp(min=min_wh_img[li] / s, max=max_wh_img[li] / s) * s
+                        h_p = torch.exp(th_p).clamp(min=min_wh_img[li] / s, max=max_wh_img[li] / s) * s
 
-                        # decode for IoU/objectness target
-                        w_p = torch.exp(tw_p).clamp(min=1.0, max=1e4) * float(stride)
-                        h_p = torch.exp(th_p).clamp(min=1.0, max=1e4) * float(stride)
-
-                    # angle
+                    # angle loss
                     if "ang" in mp:
                         ang_p = _ang_from_logit(_nan2(mp["ang"][b, jj, ii]))
-                    elif ("sin" in mp) and ("cos" in mp):
-                        s = _nan2(mp["sin"][b, jj, ii]);
-                        c = _nan2(mp["cos"][b, jj, ii])
-                        norm = torch.sqrt(torch.clamp(s * s + c * c, min=1e-12))
-                        ang_p = torch.atan2(s / norm, c / norm)
                     else:
                         ang_p = ang_t
-
-                    # canonicalize prediction (LE-90)
+                    # keep canonical
                     if w_p < h_p:
                         w_p, h_p = h_p, w_p
                         ang_p = ang_p + math.pi / 2.0
                     ang_p = (ang_p + math.pi / 2.0) % math.pi - math.pi / 2.0
-
                     l_ang = l_ang + _angle_loss(ang_p, ang_t)
 
-                    # cls (multi-class only)
+                    # class
                     if self.nc > 1 and "cls" in mp:
                         cvec = _nan2(mp["cls"][b, :, jj, ii])
-                        tgt = torch.zeros_like(cvec);
+                        tgt = torch.zeros_like(cvec)
                         tgt[int(gtc[k].item())] = 1.0
                         l_cls = l_cls + F.binary_cross_entropy_with_logits(cvec, tgt)
 
-                    # objectness with warmup
-                    cx_p = (ii + tx_p) * float(stride)
-                    cy_p = (jj + ty_p) * float(stride)
+                    # objectness target from (axis-aligned) IoU
+                    cx_p = (ii + tx_p) * s
+                    cy_p = (jj + ty_p) * s
                     with torch.no_grad():
                         iou = _aabb_iou(cx_p, cy_p, w_p, h_p, cx, cy, w, h)
                         obj_t = (0.5 + 0.5 * iou) if use_warm else iou
@@ -841,7 +828,7 @@ class TDOBBWKpt1Criterion(nn.Module):
 
                     pos_cnt += 1
 
-                # light ring negatives around matched cells
+                # a few ring negatives near GT center
                 obj_map = mp["obj"][b, 0]
                 gi, gj = int(math.floor(float(gx))), int(math.floor(float(gy)))
                 rr = 3
@@ -857,7 +844,7 @@ class TDOBBWKpt1Criterion(nn.Module):
                     l_obj = l_obj + F.binary_cross_entropy_with_logits(obj_neg, torch.zeros_like(obj_neg),
                                                                        reduction="mean")
 
-        # normalise
+        # normalize
         pos = max(1, pos_cnt)
         l_obj = l_obj / pos
         l_box = l_box / pos
@@ -869,7 +856,7 @@ class TDOBBWKpt1Criterion(nn.Module):
                  + self.lambda_box * l_box
                  + self.lambda_ang * l_ang
                  + self.lambda_cls * l_cls
-                 + l_dfl)  # keep DFL weight = 1.0; adjust if you want
+                 + l_dfl)
 
         parts = {
             "obj": float(l_obj.detach()),

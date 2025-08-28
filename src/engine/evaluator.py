@@ -150,7 +150,7 @@ class Evaluator:
                     det_maps,
                     imgs,
                     strides=(8, 16, 32),
-                    score_thr=self.cfg.get("conf_thres", 0.25),  # lenient early threshold
+                    score_thr=self.cfg.get("conf_thres", 0.01),  # lenient early threshold
                     max_det=self.cfg.get("max_det", 300),
                     use_nms=True,
                 )
