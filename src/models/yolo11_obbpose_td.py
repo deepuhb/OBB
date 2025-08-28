@@ -148,9 +148,9 @@ class YOLO11_OBBPOSE_TD(nn.Module):
             # log(min/stride) .. log(max/stride); keep modest to avoid collapse on small datasets
             # Here we cover approx [1px..128px] per level by default.
             head.dfl_log_minmax = (
-                (math.log(1.0 / strides[0]), math.log(128.0 / strides[0])),
-                (math.log(1.0 / strides[1]), math.log(128.0 / strides[1])),
-                (math.log(1.0 / strides[2]), math.log(128.0 / strides[2])),
+                (math.log(2 / 8), math.log(96 / 8)),
+                (math.log(2 / 16), math.log(96 / 16)),
+                (math.log(2 / 32), math.log(96 / 32)),
             )
         except Exception:
             pass
