@@ -1,139 +1,191 @@
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Train YOLO11 OBB+KPT (DFL-only)
-- Model: YOLO11_OBBPOSE_TD
-- Loss:  TDOBBWKpt1Criterion (DFL-only, single-logit angle)
-- Evaluator: Evaluator (expects cfg dict)
-This matches the current signatures under src/* as uploaded.
-"""
-
-import os
+# scripts/train.py
+from __future__ import annotations
 import argparse
+import os
+import time
+from typing import Tuple
+
 import torch
 import torch.distributed as dist
+from torch.utils.data import DataLoader
 
+# ---- only this util module (as you requested) ----
+from utils.distrib import init as ddp_init, is_main_process, barrier, cleanup
+
+# ---- project imports (keep these as in your repo) ----
 from src.models.yolo11_obbpose_td import YOLO11_OBBPOSE_TD
 from src.models.losses.td_obb_kpt1_loss import TDOBBWKpt1Criterion
 from src.engine.trainer import Trainer
 from src.engine.evaluator import Evaluator
-from src.utils.ddp import init_distributed_mode, cleanup_distributed
-from src.utils.general import set_seed
+
+# If your repo has a function to create loaders, import it here.
+# I keep the import very narrow and optional to avoid hard assumptions.
+def _import_builders():
+    """
+    Tries a few common places for your loader builders without assuming utils.general exists.
+    Adjust one line below to match your repo if needed.
+    """
+    # Example: src.data.dataset.build_dataloaders(train_bs, val_bs, workers, ...)
+    try:
+        from src.data.dataset import build_dataloaders   # <- change here if your path/name differs
+        return build_dataloaders
+    except Exception as e:
+        raise ImportError(
+            "Could not import your dataloader builder. Please adjust the import inside "
+            "train.py:_import_builders() to the actual location in your repo."
+        ) from e
 
 
 def parse_args():
-    ap = argparse.ArgumentParser("Train YOLO11 OBB+KPT (DFL-only)")
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--batch", type=int, default=32, help="total batch per GPU")
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--imgsz", type=int, default=768)
-    ap.add_argument("--classes", type=int, default=1)
-    ap.add_argument("--width", type=float, default=1.0)
-    ap.add_argument("--lr0", type=float, default=5e-3)
-    ap.add_argument("--lrf", type=float, default=0.01)
-    ap.add_argument("--momentum", type=float, default=0.937)
-    ap.add_argument("--warmup_epochs", type=float, default=3.0)
-    # Loss weights aligned with TDOBBWKpt1Criterion
-    ap.add_argument("--lambda_obj", type=float, default=1.0)
-    ap.add_argument("--lambda_box", type=float, default=5.0)
-    ap.add_argument("--lambda_dfl", type=float, default=0.5)
-    ap.add_argument("--lambda_ang", type=float, default=0.25)
-    ap.add_argument("--lambda_cls", type=float, default=0.5)
-    ap.add_argument("--lambda_kpt", type=float, default=1.0)
-    ap.add_argument("--neg_obj_ratio", type=float, default=1.0)
-    # Eval / decode
-    ap.add_argument("--conf_thres", type=float, default=0.25)
-    ap.add_argument("--iou_thres", type=float, default=0.50)
-    ap.add_argument("--max_det", type=int, default=300)
-    ap.add_argument("--use_nms", action="store_true", default=True)
-    ap.add_argument("--save_dir", type=str, default="./runs/exp")
-    ap.add_argument("--eval_interval", type=int, default=1)
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--world_size", type=int, default=int(os.environ.get("WORLD_SIZE", 1)))
-    ap.add_argument("--rank", type=int, default=int(os.environ.get("RANK", 0)))
-    ap.add_argument("--dist_url", type=str, default="env://")
-    return ap.parse_args()
+    p = argparse.ArgumentParser("YOLO11 OBB+Kpt training (DFL-only)")
+    # model
+    p.add_argument("--classes", type=int, required=True, help="number of detection classes")
+    p.add_argument("--width", type=float, default=1.0, help="model width multiplier")
+    # data
+    p.add_argument("--train", type=str, required=True, help="train set descriptor / path")
+    p.add_argument("--val", type=str, required=True, help="val set descriptor / path")
+    p.add_argument("--imgsz", type=int, default=768, help="train/eval image size")
+    p.add_argument("--workers", type=int, default=4)
+    # optimization
+    p.add_argument("--epochs", type=int, default=300)
+    p.add_argument("--batch", type=int, default=32, help="per-GPU batch size")
+    p.add_argument("--accum", type=int, default=1, help="grad accumulation steps")
+    p.add_argument("--lr0", type=float, default=5e-3)
+    p.add_argument("--lrf", type=float, default=1e-2)
+    p.add_argument("--momentum", type=float, default=0.937)
+    p.add_argument("--warmup_epochs", type=float, default=3.0)
+    # loss weights (kept in sync with current TDOBBWKpt1Criterion)
+    p.add_argument("--lambda_box", type=float, default=7.5)
+    p.add_argument("--lambda_obj", type=float, default=3.0)
+    p.add_argument("--lambda_ang", type=float, default=1.0)
+    p.add_argument("--lambda_cls", type=float, default=1.0)
+    p.add_argument("--lambda_kpt", type=float, default=2.0)
+    # misc
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--save_dir", type=str, default="runs/exp")
+    p.add_argument("--sync_bn", action="store_true", help="convert BN to SyncBN in DDP")
+    p.add_argument("--local_rank", type=int, default=-1, help="for DDP (torchrun sets this)")
+    return p.parse_args()
 
 
-def build_model(num_classes: int, width: float, device: torch.device):
+def set_seed(seed: int):
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    import random, numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def build_model(num_classes: int, width: float, device: torch.device) -> YOLO11_OBBPOSE_TD:
     model = YOLO11_OBBPOSE_TD(num_classes=num_classes, width=width).to(device)
     return model
 
 
-def make_criterion(args, device: torch.device):
+def make_criterion(args, model: YOLO11_OBBPOSE_TD, device: torch.device) -> TDOBBWKpt1Criterion:
+    # IMPORTANT: do not pass 'lambda_dfl' here (your current file doesn't accept it)
+    # Also pass 'strides' explicitly to match your current loss constructor.
+    strides = tuple(int(s) for s in getattr(model.head, "strides", (8, 16, 32)))
     crit = TDOBBWKpt1Criterion(
         num_classes=args.classes,
-        lambda_obj=args.lambda_obj,
+        strides=strides,
         lambda_box=args.lambda_box,
-        lambda_dfl=args.lambda_dfl,
+        lambda_obj=args.lambda_obj,
         lambda_ang=args.lambda_ang,
         lambda_cls=args.lambda_cls,
         lambda_kpt=args.lambda_kpt,
-        neg_obj_ratio=args.neg_obj_ratio,
-        eps=1e-7,
-    )
-    return crit.to(device)
+    ).to(device)
+    return crit
 
 
-def make_evaluator(args):
-    cfg = dict(
-        interval=args.eval_interval,
-        warmup_noeval=0,
-        select="mAP50",
-        mode="max",
-        score_thresh=args.conf_thres,
-        iou_thresh=args.iou_thres,
-        max_det=args.max_det,
-        use_nms=args.use_nms,
-    )
-    evaluator = Evaluator(cfg=cfg, names=None, logger=None, params=None)
-    return evaluator
+def make_evaluator(args) -> Evaluator:
+    # Your previous crash showed Evaluator.__init__ didn’t accept 'cfg'.
+    # So create it with no kwargs (works with the evaluator you sent).
+    return Evaluator()
+
+
+def ddp_wrap(model: torch.nn.Module, args, device: torch.device):
+    if dist.is_available() and dist.is_initialized():
+        if args.sync_bn:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            output_device=device.index if device.type == "cuda" else None,
+            find_unused_parameters=False,
+            static_graph=False,
+        )
+    return model
 
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
 
-    init_distributed_mode(args.rank, args.world_size, args.dist_url)
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.cuda.set_device(local_rank)
+    # --- DDP init (only using utils.distrib) ---
+    rank, world_size, device = ddp_init()
+    if is_main_process():
+        os.makedirs(args.save_dir, exist_ok=True)
+        print(f"[DDP] world={world_size} | per_gpu_batch={args.batch} | accum_steps={args.accum}")
+        print(f"[OPTIM] SGD  lr0={args.lr0}  lrf={args.lrf}  warmup_epochs={args.warmup_epochs}")
 
+    set_seed(args.seed + (rank if rank is not None else 0))
+
+    # --- Model ---
     model = build_model(args.classes, args.width, device)
-    criterion = make_criterion(args, device)
+    if is_main_process():
+        # these prints match your earlier logs
+        tot = sum(p.numel() for p in model.parameters())
+        print(f"[SCHEMA TRAIN] sig=explicit-pan v2 (DFL-only) params={tot}")
+        if hasattr(model.head, "strides"):
+            print(f"[SCHEMA TRAIN] backbone_out=({', '.join(str(c) for c in model.backbone_out)}) neck_ch_out={model.neck_ch_out}" if hasattr(model, 'backbone_out') else "")
+    model = ddp_wrap(model, args, device)
+
+    # --- Criterion & Evaluator ---
+    criterion = make_criterion(args, model.module if hasattr(model, "module") else model, device)
     evaluator = make_evaluator(args)
 
-    trainer = Trainer(
-        model=model,
-        optimizer_cfg=dict(lr0=args.lr0, lrf=args.lrf, momentum=args.momentum, warmup_epochs=args.warmup_epochs),
-        save_dir=args.save_dir,
-        ddp_world_size=args.world_size,
-    )
-
-    # Build dataloaders via your project's helper
-    from src.data.build import build_dataloaders
-
+    # --- DataLoaders (import builder from your repo) ---
+    build_dataloaders = _import_builders()
     train_loader, val_loader, train_sampler = build_dataloaders(
+        train=args.train,
+        val=args.val,
         imgsz=args.imgsz,
         batch_size=args.batch,
         workers=args.workers,
-        world_size=args.world_size,
-        rank=args.rank,
+        world_size=world_size,
+        rank=rank,
+        pin_memory=True,
     )
 
-    best = trainer.fit(train_loader, val_loader, evaluator=evaluator, train_sampler=train_sampler, criterion=criterion)
-    if dist.is_initialized():
-        if dist.get_rank() == 0:
-            print(f"[DONE] best {evaluator.select} = {best:.6f}")
-    else:
-        print(f"[DONE] best {evaluator.select} = {best:.6f}")
+    # --- Trainer ---
+    trainer = Trainer(
+        model=model,
+        criterion=criterion,
+        optimizer=None,                # let Trainer build it from args/params if your Trainer supports that,
+        # otherwise replace with torch.optim.SGD([...], lr=args.lr0, momentum=args.momentum, nesterov=True)
+        save_dir=args.save_dir,
+        epochs=args.epochs,
+        lr0=args.lr0,
+        lrf=args.lrf,
+        momentum=args.momentum,
+        warmup_epochs=args.warmup_epochs,
+        grad_accum=args.accum,
+        device=device,
+        rank=rank,
+        world_size=world_size,
+    )
 
-    cleanup_distributed()
+    best = trainer.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        evaluator=evaluator,
+        train_sampler=train_sampler,
+    )
+
+    if is_main_process():
+        print(f"[DONE] best={best}")
+    cleanup()
 
 
 if __name__ == "__main__":
