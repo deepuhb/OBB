@@ -6,13 +6,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
-# --- Require MMCV rotated IoU --------------------------------------------------
-try:
-    from mmcv.ops import box_iou_rotated as mmcv_box_iou_rotated  # type: ignore
-    _MMCV_OK = True
-except Exception:
-    _MMCV_OK = False
-
 
 class Evaluator:
     """
@@ -20,8 +13,7 @@ class Evaluator:
       • runs ONLY on rank-0,
       • uses the model's decode_obb_from_pyramids(det_maps, imgs, ...),
       • computes mAP over IoU thresholds 0.50:0.95:0.05,
-      • uses MMCV's rotated IoU (angles in **degrees**; we convert from radians).
-    Unnecessary fallbacks were removed.
+      • uses MMCV's rotated IoU (angles expected in **radians** from the model, converted to degrees).
     """
 
     def __init__(
@@ -34,6 +26,7 @@ class Evaluator:
         self.log = logger or logging.getLogger("evaluator")
         self.names = names or []
 
+        # Decoder & AP grid defaults
         self.cfg: Dict[str, Any] = dict(
             conf_thres=0.25,
             iou_thres=0.70,   # decoder/NMS IoU
@@ -73,11 +66,6 @@ class Evaluator:
             float(self.cfg["map_iou_st"]), float(self.cfg["map_iou_ed"]) + 1e-9, float(self.cfg["map_iou_step"])
         ).round(2)
 
-        backend = "mmcv.ops.box_iou_rotated" if _MMCV_OK else "UNAVAILABLE"
-        print(f"[EVAL] IoU backend: {backend}")
-        if not _MMCV_OK:
-            raise RuntimeError("MMCV with CUDA ops is required for rotated IoU.")
-
         self._printed_images = 0
 
     @torch.no_grad()
@@ -89,6 +77,15 @@ class Evaluator:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
                 return {"mAP50": 0.0, "mAP": 0.0, "pred_per_img": 0.0, "images": 0}
+
+        # Lazy import MMCV **here** (after CUDA device is set) to avoid init issues
+        try:
+            from mmcv.ops import box_iou_rotated as mmcv_box_iou_rotated  # type: ignore
+            print("[EVAL] IoU backend: mmcv.ops.box_iou_rotated")
+        except Exception as e:
+            raise RuntimeError(
+                f"MMCV rotated IoU is required but could not be imported: {e}"
+            )
 
         model_eval = model.module if hasattr(model, "module") else model
         model_eval.eval()

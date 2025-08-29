@@ -222,10 +222,17 @@ def main() -> None:
     model = YOLO11OBBPOSETD(num_classes=args.num_classes, reg_max=args.reg_max, base_ch=args.base_ch).to(device)
     # Wrap in DistributedDataParallel if needed
     if distributed:
+        # Enable unused parameter detection so that DDP does not error when
+        # parts of the model (e.g. keypoint or class heads) do not receive
+        # gradients on a particular rank.  Without this flag, PyTorch will
+        # raise an error if it expects all parameters to be reduced every
+        # iteration.  Setting ``find_unused_parameters=True`` tells DDP to
+        # gracefully handle such cases.
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[args.local_rank] if device.type == 'cuda' else None,
             output_device=args.local_rank if device.type == 'cuda' else None,
+            find_unused_parameters=True,
         )
     # Create loss criterion
     criterion = TDOBBWKpt1Criterion(

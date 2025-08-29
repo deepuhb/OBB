@@ -46,7 +46,7 @@ def get_args() -> argparse.Namespace:
 
     # eval controls
     p.add_argument('--eval_interval', type=int, default=1)
-    p.add_argument('--eval_conf', type=float, default=0.1)
+    p.add_argument('--eval_conf', type=float, default=0.25)
     p.add_argument('--eval_max_det', type=int, default=100)
     p.add_argument('--log_interval', type=int, default=50)
 
@@ -154,8 +154,7 @@ def main() -> None:
             model,
             device_ids=[args.local_rank] if device.type == 'cuda' else None,
             output_device=args.local_rank if device.type == 'cuda' else None,
-            find_unused_parameters=True,
-            static_graph=False,# faster
+            find_unused_parameters=False,   # faster
             gradient_as_bucket_view=False,  # avoid grad stride mismatch warnings
         )
 
@@ -239,17 +238,6 @@ def main() -> None:
                 det_maps, kpt_maps = model(images)
                 loss, loss_dict = criterion(det_maps, kpt_maps, targets_list)
 
-            # --- Keep all branches in the graph every step (no-op numerically) ---
-            try:
-                # If kpt branch happens to be unused this iteration, make it “used”
-                if isinstance(kpt_maps, torch.Tensor):
-                    loss = loss + 0.0 * kpt_maps.mean()
-                elif isinstance(kpt_maps, (list, tuple)):
-                    if len(kpt_maps):
-                        loss = loss + 0.0 * sum([t.mean() for t in kpt_maps if t is not None])
-            except Exception:
-                pass
-
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
@@ -287,6 +275,3 @@ def main() -> None:
         dist.destroy_process_group()
     if args.rank == 0:
         print("Training complete.")
-
-if __name__ == '__main__':
-    main()

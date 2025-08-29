@@ -20,7 +20,7 @@ from typing import Tuple, List
 import torch
 import torch.nn as nn
 
-from .heads.obbpose_head import OBBPoseHead
+from src.models.heads.obbpose_head import OBBPoseHead
 
 import torch.nn.functional as F
 
@@ -116,3 +116,11 @@ class YOLO11OBBPOSETD(nn.Module):
         p3, p4, p5 = self.neck(p3, p4, p5)
         det_maps, kpt_maps = self.head([p3, p4, p5])
         return det_maps, kpt_maps
+
+    # inside class YOLO11OBBPOSETD
+    @torch.no_grad()
+    # in src/models/yolo11_obbpose_td.py  (class YOLO11OBBPOSETD)
+    def decode_obb_from_pyramids(self, det_maps, imgs, **kwargs):
+        """Thin proxy to the head's decoder. Required so callers can do model.decode_..."""
+        return self.head.decode_obb_from_pyramids(det_maps, imgs, **kwargs)
+

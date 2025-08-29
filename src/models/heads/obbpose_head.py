@@ -14,7 +14,10 @@ from __future__ import annotations
 from typing import List, Tuple, Optional
 import math
 import torch
+from torchvision.ops import nms
 import torch.nn as nn
+
+from mmcv.ops import nms_rotated as mmcv_nms_rotated
 
 
 class OBBPoseHead(nn.Module):
@@ -189,9 +192,9 @@ class OBBPoseHead(nn.Module):
         imgs: torch.Tensor,
         *,
         strides: Tuple[int, int, int] = (8, 16, 32),
-        score_thr: float = 0.01,
+        score_thr: float = 0.25,
         iou_thres: float = 0.5,
-        max_det: int = 300,
+        max_det: int = 100,
         use_nms: bool = True,
         multi_label: bool = False,
         **kwargs,
@@ -233,13 +236,34 @@ class OBBPoseHead(nn.Module):
 
                 # flatten spatial dims
                 N = H * W
-                obj_prob = obj.sigmoid().view(-1)
-                # select indices above threshold or fallback topk
-                keep = (obj_prob > score_thr).nonzero(as_tuple=False).squeeze(1)
+                obj_prob = obj.sigmoid().view(-1)  # [N]
+
+                # --- combine objectness with class prob (single-class -> falls back to obj only) ---
+                if (cls is not None) and (cls.numel() > 0):
+                    cp = cls.sigmoid()
+                    # normalize to [N, C] no matter the incoming layout
+                    if cp.dim() == 3:  # [C, H, W]
+                        cp = cp.permute(1, 2, 0).reshape(-1, cp.shape[0])  # -> [N, C]
+                    else:  # e.g. [H, W, C] or [N, C]
+                        cp = cp.reshape(-1, cp.shape[-1])  # -> [N, C]
+                    cls_prob = cp.max(dim=1).values  # [N]
+                    conf = obj_prob * cls_prob  # [N]
+                else:
+                    conf = obj_prob  # [N]
+
+                # --- strictly respect score_thr; if none pass, contribute no boxes from this level ---
+                keep = (conf > score_thr).nonzero(as_tuple=False).squeeze(1)  # [K]
                 if keep.numel() == 0:
-                    # fallback to highest‑confidence detections per level
-                    topk = min(200, N)
-                    _, keep = obj_prob.topk(topk, largest=True, sorted=False)
+                    continue  # we're inside the per-level loop (e.g., p3/p4/p5)
+
+                # --- pre-NMS top-K to bound compute/junk early in training ---
+                PRE_NMS_TOPK = 500  # tune to 1000/500 if needed
+                if keep.numel() > PRE_NMS_TOPK:
+                    _, topi = conf.index_select(0, keep).topk(PRE_NMS_TOPK, largest=True, sorted=False)
+                    keep = keep[topi]
+
+                # keep per-location scores for this level; use these downstream as detection scores
+                scores = conf.index_select(0, keep)  # [K]
 
                 # compute grid indices
                 iy = (keep // W).to(tx.dtype)
@@ -267,7 +291,7 @@ class OBBPoseHead(nn.Module):
                 # decode class and score
                 obj_k = obj_prob.index_select(0, keep)
                 if cls is None or cls.shape[0] == 0:
-                    scores = obj_k
+                    scores = scores
                     labels = torch.zeros_like(scores, dtype=torch.long, device=device)
                 elif multi_label:
                     cls_b = cls.sigmoid().view(self.num_classes, N).index_select(1, keep)
@@ -306,7 +330,6 @@ class OBBPoseHead(nn.Module):
                 if use_nms and boxes.numel() > 0:
                     # Use mmcv.rotated NMS in radian space; fallback to axis‑aligned NMS if unavailable.
                     try:
-                        from mmcv.ops import nms_rotated as mmcv_nms_rotated
                         # mmcv expects angles in radians and returns kept detections and indices.
                         # Note: we pass clockwise=False to match the dataset's CCW angle convention.
                         dets, keep_idx = mmcv_nms_rotated(boxes, scores, iou_thres, labels=None, clockwise=False)
@@ -319,7 +342,7 @@ class OBBPoseHead(nn.Module):
                         y1 = boxes[:, 1] - boxes[:, 3] * 0.5
                         x2 = boxes[:, 0] + boxes[:, 2] * 0.5
                         y2 = boxes[:, 1] + boxes[:, 3] * 0.5
-                        from torchvision.ops import nms
+
                         abox = torch.stack([x1, y1, x2, y2], dim=1)
                         keep_idx = nms(abox, scores, iou_thres)
                         boxes = boxes.index_select(0, keep_idx)

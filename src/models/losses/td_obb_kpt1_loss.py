@@ -174,6 +174,15 @@ class TDOBBWKpt1Criterion(nn.Module):
         l_ang = torch.tensor(0.0, device=device)
         l_dfl = torch.tensor(0.0, device=device)
         l_kpt = torch.tensor(0.0, device=device)
+
+        # --- Ensure kpt head participates on every rank/step (DDP friendly) ---
+        # Even if there are no GT keypoints on this rank, depend (with zero weight)
+        # on kpt_maps so DDP sees the kpt head as used and doesn't error.
+        if self.use_kpt:
+            for km in kpt_maps:
+                l_kpt = l_kpt + km.mean() * 0.0
+        # ----------------------------------------------------------------------
+
         # accumulate IoU penalty across positive samples when enabled
         l_iou = torch.tensor(0.0, device=device)
         eps = 1e-6
@@ -358,8 +367,13 @@ class TDOBBWKpt1Criterion(nn.Module):
                         if self.num_classes > 0:
                             if clsp is not None and clsp.numel() > 0 and labels is not None:
                                 target_cls = torch.zeros(self.num_classes, device=device)
-                                target_cls[int(labels[gi].item())] = 1.0
+                                ci = int(labels[gi].item())
+                                if ci < 0 or ci >= self.num_classes:
+                                    # defensive clamp; also worth checking your dataset/num_classes config
+                                    ci = max(0, min(ci, self.num_classes - 1))
+                                target_cls[ci] = 1.0
                                 l_cls = l_cls + F.binary_cross_entropy_with_logits(clsp, target_cls)
+
                         # keypoint loss
                         if self.use_kpt and kpts is not None and kpts.shape[0] > gi:
                             # decode keypoint from keypoint map at same cell
@@ -398,20 +412,28 @@ class TDOBBWKpt1Criterion(nn.Module):
                             cls[neg_cls_mask], torch.zeros_like(cls[neg_cls_mask])
                         )
 
-        # normalise losses by number of positives to stabilise training
-        pos_count = max(1.0, l_obj_pos.detach().item())  # use objectness pos count as proxy
+        # -------- normalise losses by true number of positive cells ----------
+        # Count how many objectness positives we marked across levels
+        num_pos = 0
+        for m in pos_obj_masks:
+            # boolean mask has shape (B,1,H,W)
+            if m is not None:
+                num_pos += int(m.sum().item())
+        pos_count = float(max(1, num_pos))
+
         # sum and weight components, including optional IoU penalty
         loss = (
-            self.lambda_box * l_box
-            + self.lambda_ang * l_ang
-            + self.lambda_dfl * l_dfl
-            + self.lambda_obj * (l_obj_pos + l_obj_neg)
-            + self.lambda_cls * l_cls
+                self.lambda_box * l_box
+                + self.lambda_ang * l_ang
+                + self.lambda_dfl * l_dfl
+                + self.lambda_obj * (l_obj_pos + l_obj_neg)
+                + self.lambda_cls * l_cls
         )
         if self.lambda_iou > 0.0:
             loss = loss + self.lambda_iou * l_iou
         if self.use_kpt:
             loss = loss + self.lambda_kpt * l_kpt
+
         # divide by pos_count to roughly normalise magnitude
         loss = loss / pos_count
         loss_dict = {
