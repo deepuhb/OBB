@@ -43,7 +43,6 @@ from __future__ import annotations
 import argparse
 import os
 from types import SimpleNamespace
-from typing import Dict
 
 import torch
 import torch.distributed as dist
