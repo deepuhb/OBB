@@ -32,7 +32,8 @@ class ConvBNAct(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
         self.bn = nn.BatchNorm2d(out_ch)
-        self.act = nn.SiLU(inplace=True)
+        # Avoid in‑place activation to prevent autograd errors.
+        self.act = nn.SiLU(inplace=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(self.conv(x)))

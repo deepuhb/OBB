@@ -58,31 +58,49 @@ class OBBPoseHead(nn.Module):
 
         # P3 detection head
         self.det3 = nn.Sequential(
-            nn.Conv2d(c3, c3, 3, 1, 1), nn.BatchNorm2d(c3), nn.SiLU(inplace=True),
+            nn.Conv2d(c3, c3, 3, 1, 1),
+            nn.BatchNorm2d(c3),
+            # Avoid in‑place activation to prevent autograd errors.
+            nn.SiLU(),
             nn.Conv2d(c3, det_out, 1, 1, 0)
         )
         # P4 detection head
         self.det4 = nn.Sequential(
-            nn.Conv2d(c4, c4, 3, 1, 1), nn.BatchNorm2d(c4), nn.SiLU(inplace=True),
+            nn.Conv2d(c4, c4, 3, 1, 1),
+            nn.BatchNorm2d(c4),
+            # Avoid in‑place activation to prevent autograd errors.
+            nn.SiLU(),
             nn.Conv2d(c4, det_out, 1, 1, 0)
         )
         # P5 detection head
         self.det5 = nn.Sequential(
-            nn.Conv2d(c5, c5, 3, 1, 1), nn.BatchNorm2d(c5), nn.SiLU(inplace=True),
+            nn.Conv2d(c5, c5, 3, 1, 1),
+            nn.BatchNorm2d(c5),
+            # Avoid in‑place activation to prevent autograd errors.
+            nn.SiLU(),
             nn.Conv2d(c5, det_out, 1, 1, 0)
         )
 
         # Tiny keypoint heads (unused in most setups but left for extensibility)
         self.kp3 = nn.Sequential(
-            nn.Conv2d(c3, c3, 3, 1, 1), nn.BatchNorm2d(c3), nn.SiLU(inplace=True),
+            nn.Conv2d(c3, c3, 3, 1, 1),
+            nn.BatchNorm2d(c3),
+            # Avoid in‑place activation to prevent autograd errors.
+            nn.SiLU(),
             nn.Conv2d(c3, kpt_out, 1, 1, 0)
         )
         self.kp4 = nn.Sequential(
-            nn.Conv2d(c4, c4, 3, 1, 1), nn.BatchNorm2d(c4), nn.SiLU(inplace=True),
+            nn.Conv2d(c4, c4, 3, 1, 1),
+            nn.BatchNorm2d(c4),
+            # Avoid in‑place activation to prevent autograd errors.
+            nn.SiLU(),
             nn.Conv2d(c4, kpt_out, 1, 1, 0)
         )
         self.kp5 = nn.Sequential(
-            nn.Conv2d(c5, c5, 3, 1, 1), nn.BatchNorm2d(c5), nn.SiLU(inplace=True),
+            nn.Conv2d(c5, c5, 3, 1, 1),
+            nn.BatchNorm2d(c5),
+            # Avoid in‑place activation to prevent autograd errors.
+            nn.SiLU(),
             nn.Conv2d(c5, kpt_out, 1, 1, 0)
         )
 
@@ -286,17 +304,17 @@ class OBBPoseHead(nn.Module):
                 labels = torch.cat(labels_all, dim=0)
                 # NMS if requested
                 if use_nms and boxes.numel() > 0:
-                    # convert to degrees for mmcv
-                    rb = boxes.clone()
-                    rb[:, 4] = rb[:, 4] * (180.0 / math.pi)
+                    # Use mmcv.rotated NMS in radian space; fallback to axis‑aligned NMS if unavailable.
                     try:
                         from mmcv.ops import nms_rotated as mmcv_nms_rotated
-                        dets, keep_idx = mmcv_nms_rotated(rb, scores, iou_thres, score_thr)
+                        # mmcv expects angles in radians and returns kept detections and indices.
+                        # Note: we pass clockwise=False to match the dataset's CCW angle convention.
+                        dets, keep_idx = mmcv_nms_rotated(boxes, scores, iou_thres, labels=None, clockwise=False)
                         boxes = boxes.index_select(0, keep_idx)
                         scores = scores.index_select(0, keep_idx)
                         labels = labels.index_select(0, keep_idx)
                     except Exception:
-                        # fallback to AABB NMS
+                        # fallback to AABB NMS using torchvision
                         x1 = boxes[:, 0] - boxes[:, 2] * 0.5
                         y1 = boxes[:, 1] - boxes[:, 3] * 0.5
                         x2 = boxes[:, 0] + boxes[:, 2] * 0.5

@@ -25,6 +25,16 @@ from __future__ import annotations
 
 from typing import List, Tuple, Dict, Optional
 import math
+
+# Attempt to import mmcv for rotated IoU.  If unavailable, fallback to None and
+# fall back to axis‑aligned IoU for the optional penalty.  The rotated IoU
+# implementation in mmcv expects boxes in (xc, yc, w, h, angle_deg) format and
+# returns IoU values per pair.  If mmcv cannot be imported, the IoU penalty
+# will use the axis‑aligned approximation defined later in the loss.
+try:
+    from mmcv.ops import box_iou_rotated as mmcv_box_iou_rotated  # type: ignore
+except Exception:
+    mmcv_box_iou_rotated = None
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -178,9 +188,16 @@ class TDOBBWKpt1Criterion(nn.Module):
             grid_cache.append((xx.float(), yy.float()))
 
         # iterate over levels and split predictions
-        # For negative loss we accumulate BCE over entire map; for positive we override cells assigned later
+        # For negative loss we accumulate BCE over the entire map; for positives we
+        # mark assigned cells using boolean masks.  ``neg_obj_masks`` and
+        # ``neg_cls_masks`` hold references to the raw logits for objectness and
+        # classification, but we no longer modify them in place.  Instead we
+        # record positive cell locations in ``pos_obj_masks`` and ``pos_cls_masks``.
         neg_obj_masks: List[torch.Tensor] = []
         neg_cls_masks: List[torch.Tensor] = []
+        # boolean masks indicating which cells are positive for objectness/class
+        pos_obj_masks: List[torch.Tensor] = []
+        pos_cls_masks: List[Optional[torch.Tensor]] = []
         for level, dm in enumerate(det_maps):
             B, C, H, W = dm.shape
             # channel offsets
@@ -192,12 +209,22 @@ class TDOBBWKpt1Criterion(nn.Module):
             ang = dm[:, idx:idx + 1]; idx += 1
             obj = dm[:, idx:idx + 1]; idx += 1
             cls = dm[:, idx:] if C > idx else None
-            # for all negatives: objectness and classification targets are zero
+            # For negative loss we will penalise all unassigned cells in ``obj``
+            # and ``cls``; store these tensors for later.  We will not modify
+            # them in place.
             neg_obj_masks.append(obj)
             if cls is not None and cls.shape[1] > 0:
                 neg_cls_masks.append(cls)
             else:
-                neg_cls_masks.append(torch.zeros_like(obj))
+                # create a dummy tensor with the same shape as obj for consistent indexing
+                neg_cls_masks.append(obj.new_zeros((obj.shape[0], 0, obj.shape[2], obj.shape[3])))
+            # initialise boolean masks for positive assignments: shape matches obj
+            pos_obj_masks.append(torch.zeros_like(obj, dtype=torch.bool))
+            # classification positive mask matches cls shape if classes exist
+            if cls is not None and cls.shape[1] > 0:
+                pos_cls_masks.append(torch.zeros_like(cls, dtype=torch.bool))
+            else:
+                pos_cls_masks.append(None)
 
         # now assign ground truth boxes to levels and cells
         # We'll create masks for positive cells and gather predicted values
@@ -288,24 +315,43 @@ class TDOBBWKpt1Criterion(nn.Module):
                             l_dfl_w = -((1.0 - w_rem) * lw[w_bin] + (w_rem) * lw[w_next])
                             l_dfl_h = -((1.0 - h_rem) * lh[h_bin] + (h_rem) * lh[h_next])
                             l_dfl = l_dfl + l_dfl_w + l_dfl_h
-                        # optional IoU penalty (AABB IoU) on predicted vs ground truth boxes
+                        # optional IoU penalty on predicted vs ground truth boxes.  When mmcv is
+                        # available we compute rotated IoU; otherwise fallback to axis‑aligned IoU.
                         if self.lambda_iou > 0.0:
-                            # compute AABB IoU: predicted centre and size (after canonicalisation)
-                            px1 = cx_pred - 0.5 * pw_c
-                            py1 = cy_pred - 0.5 * ph_c
-                            px2 = cx_pred + 0.5 * pw_c
-                            py2 = cy_pred + 0.5 * ph_c
-                            gx1 = cx_gt - 0.5 * w_gt
-                            gy1 = cy_gt - 0.5 * h_gt
-                            gx2 = cx_gt + 0.5 * w_gt
-                            gy2 = cy_gt + 0.5 * h_gt
-                            inter_w = torch.clamp_min(torch.min(px2, gx2) - torch.max(px1, gx1), 0.0)
-                            inter_h = torch.clamp_min(torch.min(py2, gy2) - torch.max(py1, gy1), 0.0)
-                            inter_area = inter_w * inter_h
-                            union_area = pw_c * ph_c + w_gt * h_gt - inter_area + 1e-9
-                            iou = inter_area / union_area
-                            # accumulate 1 - IoU (lower is better)
-                            l_iou = l_iou + (1.0 - iou)
+                            if mmcv_box_iou_rotated is not None:
+                                pred_box = torch.stack([
+                                    cx_pred,
+                                    cy_pred,
+                                    pw_c,
+                                    ph_c,
+                                    ang_c * (180.0 / math.pi),
+                                ]).view(1, 5)
+                                gt_box = torch.stack([
+                                    cx_gt,
+                                    cy_gt,
+                                    w_gt,
+                                    h_gt,
+                                    ang_gt * (180.0 / math.pi),
+                                ]).view(1, 5)
+                                # mmcv_box_iou_rotated may not propagate gradients; compute under no_grad
+                                with torch.no_grad():
+                                    iou_rot = mmcv_box_iou_rotated(pred_box, gt_box, aligned=True)[0][0]
+                                l_iou = l_iou + (1.0 - iou_rot)
+                            else:
+                                px1 = cx_pred - 0.5 * pw_c
+                                py1 = cy_pred - 0.5 * ph_c
+                                px2 = cx_pred + 0.5 * pw_c
+                                py2 = cy_pred + 0.5 * ph_c
+                                gx1 = cx_gt - 0.5 * w_gt
+                                gy1 = cy_gt - 0.5 * h_gt
+                                gx2 = cx_gt + 0.5 * w_gt
+                                gy2 = cy_gt + 0.5 * h_gt
+                                inter_w = torch.clamp_min(torch.min(px2, gx2) - torch.max(px1, gx1), 0.0)
+                                inter_h = torch.clamp_min(torch.min(py2, gy2) - torch.max(py1, gy1), 0.0)
+                                inter_area = inter_w * inter_h
+                                union_area = pw_c * ph_c + w_gt * h_gt - inter_area + 1e-9
+                                iou = inter_area / union_area
+                                l_iou = l_iou + (1.0 - iou)
                         # positive objectness
                         l_obj_pos = l_obj_pos + F.binary_cross_entropy_with_logits(objp, torch.tensor(1.0, device=device))
                         # positive classification (multi‑label BCE with single positive class)
@@ -325,24 +371,32 @@ class TDOBBWKpt1Criterion(nn.Module):
                             kx_gt, ky_gt = kpts[gi]
                             l_kpt = l_kpt + F.smooth_l1_loss(kx_pred, kx_gt, reduction='mean')
                             l_kpt = l_kpt + F.smooth_l1_loss(ky_pred, ky_gt, reduction='mean')
-                        # mark this cell as processed for negative loss by setting obj to None
-                        # to avoid counting it as negative later we will zero out its logits in neg losses
-                        neg_obj_masks[lvl][b, 0, y_idx, x_idx] = torch.nan  # sentinel
-                        if neg_cls_masks[lvl].numel() > 0:
-                            neg_cls_masks[lvl][b, :, y_idx, x_idx] = torch.nan
+                        # record this cell as positive for masking in the negative‑loss pass.  We do not
+                        # mutate the detection maps here; instead we set the boolean masks so that
+                        # negative objectness/classification losses skip these locations.
+                        pos_obj_masks[lvl][b, 0, y_idx, x_idx] = True
+                        if pos_cls_masks[lvl] is not None and self.num_classes > 0:
+                            pos_cls_masks[lvl][b, :, y_idx, x_idx] = True
 
         # compute negative objectness and classification losses for all unassigned cells
         for lvl, dm in enumerate(det_maps):
             obj = neg_obj_masks[lvl]
             cls = neg_cls_masks[lvl]
-            # ignore NaNs (assigned positives)
-            valid_mask = ~torch.isnan(obj)
-            if valid_mask.any():
-                l_obj_neg = l_obj_neg + F.binary_cross_entropy_with_logits(obj[valid_mask], torch.zeros_like(obj[valid_mask]))
+            # cells not marked as positive are negatives for objectness
+            neg_obj_mask = ~pos_obj_masks[lvl]
+            if neg_obj_mask.any():
+                l_obj_neg = l_obj_neg + F.binary_cross_entropy_with_logits(
+                    obj[neg_obj_mask], torch.zeros_like(obj[neg_obj_mask])
+                )
+            # classification negatives: only compute when classes exist
             if self.num_classes > 0 and cls.numel() > 0:
-                valid_mask_cls = ~torch.isnan(cls)
-                if valid_mask_cls.any():
-                    l_cls = l_cls + F.binary_cross_entropy_with_logits(cls[valid_mask_cls], torch.zeros_like(cls[valid_mask_cls]))
+                pos_cls_mask = pos_cls_masks[lvl]
+                if pos_cls_mask is not None:
+                    neg_cls_mask = ~pos_cls_mask
+                    if neg_cls_mask.any():
+                        l_cls = l_cls + F.binary_cross_entropy_with_logits(
+                            cls[neg_cls_mask], torch.zeros_like(cls[neg_cls_mask])
+                        )
 
         # normalise losses by number of positives to stabilise training
         pos_count = max(1.0, l_obj_pos.detach().item())  # use objectness pos count as proxy
